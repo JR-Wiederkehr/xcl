@@ -505,11 +505,16 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
             let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None)?;
             list.Close()?;
+            let _ = list.SetName(windows::core::w!("xcl sparse upload list"));
+            let _ = alloc.SetName(windows::core::w!("xcl sparse upload allocator"));
             slots.push(UploadSlot { alloc, list, fence_val: 0 });
         }
         let rb_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
         let rb_list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &rb_alloc, None)?;
         rb_list.Close()?;
+        let _ = rb_list.SetName(windows::core::w!("xcl sparse readback list"));
+        let _ = rb_alloc.SetName(windows::core::w!("xcl sparse readback allocator"));
+        let _ = queue.SetName(windows::core::w!("xcl sparse queue"));
         Ok(State {
             dev: dev.clone(),
             queue,
@@ -768,6 +773,9 @@ impl State {
         }
         let _ = self.fence.SetEventOnCompletion(target, self.event);
         windows::Win32::System::Threading::WaitForSingleObject(self.event, 5000);
+        if self.fence.GetCompletedValue() < target {
+            crate::xlog_warn!("sparse: the queue has not reached fence value {target} after 5 s (at {})", self.fence.GetCompletedValue());
+        }
     }
 
     #[inline]
@@ -1171,6 +1179,11 @@ pub unsafe fn free(p: usize) -> bool {
 /// for that queue: its next tile mapping, unmapping or upload then comes after the title's work
 /// that is in flight – the one-way ordering the windows have otherwise (title queues wait for
 /// the sparse queue, not the other way round, except for readbacks).
+/// The queue tile mappings go out on, once there is one.
+pub fn queue() -> Option<ID3D12CommandQueue> {
+    STATE.lock().unwrap().as_ref().map(|s| s.queue.clone())
+}
+
 pub fn sync_every_submit() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("XCL_SPARSE_SYNC").is_ok_and(|v| v.trim() == "1"))
