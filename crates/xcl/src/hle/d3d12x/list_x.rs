@@ -55,7 +55,9 @@ const TOP_TIMESTAMPS: u32 = 0xC;
 /// fills larger than this are not done (one pattern buffer per value, up to this size)
 const MAX_FILL: u64 = 256 << 20;
 /// Bounded wait timeout for Wait32BitValueX / Wait64BitValueX so an unsatisfied wait never hangs.
-const WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+// (2 s upstream; a retail title's world frames had several such waits each, and its watchdog
+// ended it after 30 s without a frame: a wait that is not met in 0.3 s is not met by waiting)
+const WAIT_TIMEOUT: Duration = Duration::from_millis(300);
 /// Cap on tracked per-list written UMA ranges (for same-list write-then-wait detection).
 const MAX_WRITTEN_RANGES: usize = 256;
 
@@ -912,14 +914,27 @@ unsafe fn wait_all(waits: &[PendingWait]) {
     static TIMEOUTS: AtomicU64 = AtomicU64::new(0);
     static OUT_OF_ORDER: AtomicU64 = AtomicU64::new(0);
     for w in waits {
-        if !w.is_satisfied() && writer_unsubmitted(w.va) {
+        // (the write may be recorded on another thread while this one waits: looked at again
+        // on every turn, not only before the wait)
+        let start = Instant::now();
+        let mut ok = w.is_satisfied();
+        let mut out_of_order = false;
+        while !ok && start.elapsed() < WAIT_TIMEOUT {
+            if writer_unsubmitted(w.va) {
+                out_of_order = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_micros(200));
+            ok = w.is_satisfied();
+        }
+        if out_of_order {
             let n = OUT_OF_ORDER.fetch_add(1, Ordering::Relaxed) + 1;
             if n.is_power_of_two() {
                 crate::xlog_info!("D3D12.X: {n} waits so far for a value whose write is in a list not submitted yet ({:#x}) – not waited for", w.va);
             }
             continue;
         }
-        if !w.wait_until_satisfied(WAIT_TIMEOUT) && once(&TIMEOUTS, 40) {
+        if !ok && once(&TIMEOUTS, 40) {
             crate::xlog_warn!(
                 "D3D12.X: Wait{}BitValueX timed out after {} ms at {:#x} (op {}, want {:#x}, mask {:#x}; memory holds {:x?})",
                 w.width * 8,

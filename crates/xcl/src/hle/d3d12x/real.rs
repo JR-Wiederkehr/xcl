@@ -3296,7 +3296,7 @@ struct Slots {
     most: usize,
 }
 
-/// Big driver compiles at once: one for every 16 GB of memory, 1 – 8 (`XCL_BIG_COMPILES`: this
+/// Big driver compiles at once: two with 64 GB of memory or more, else one (`XCL_BIG_COMPILES`: this
 /// many). One at a time held a retail title's world back: ~100 compute programs of 8 – 27 s each
 /// in an NVIDIA driver when it loads; `wait_for_commit` still keeps each within the commit left.
 fn big_compiles_at_once() -> usize {
@@ -3311,7 +3311,7 @@ fn big_compiles_at_once() -> usize {
         if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
             return 1;
         }
-        ((m.ullTotalPhys >> 30) as usize / 16).clamp(1, 8)
+        ((m.ullTotalPhys >> 30) as usize / 32).clamp(1, 2)
     })
 }
 
