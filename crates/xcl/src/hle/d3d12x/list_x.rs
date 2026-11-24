@@ -750,7 +750,7 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
             }
         }
         super::sync_trace::list_reset(key, alloc, "create");
-        super::alloc_pool::created_on(key, alloc);
+        super::alloc_pool::created_on(key, alloc, ty.0);
         m.insert(key, ListState { allocator: alloc, list_type: Some(ty), bound_pso: pso, ..Default::default() });
         old
     };
@@ -3641,7 +3641,8 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
     // transfer its allocations until the driver accepts the new recording.
     let ext = *(this as *const usize);
     let resolved = super::pso_async::resolve_for_bind(pso);
-    let pc_alloc = super::alloc_pool::for_list(this as usize, alloc, list_type(this).0);
+    let ty = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize))).and_then(|s| s.list_type).map_or(-1, |t| t.0);
+    let pc_alloc = super::alloc_pool::for_list(this as usize, alloc, ty);
     let hr = pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(this, PC_RESET)(this, pc_alloc, resolved);
     real::preserve_vtable(this, ext);
     if hr < 0 {

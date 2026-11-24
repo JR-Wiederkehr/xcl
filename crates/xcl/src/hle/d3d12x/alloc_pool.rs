@@ -79,7 +79,9 @@ pub fn for_list(list: usize, alloc: usize, ty: i32) -> usize {
     }
     let mut g = STATE.lock().unwrap();
     let s = g.get_or_insert_with(State::default);
-    s.types.insert(alloc, ty);
+    if ty >= 0 {
+        s.types.insert(alloc, ty);
+    }
     let backing = s.cur.get(&alloc).copied().unwrap_or(alloc);
     move_list(s, list, backing);
     backing
@@ -94,12 +96,14 @@ pub fn current(alloc: usize) -> usize {
 }
 
 /// `list` was made recording on the PC allocator `raw` itself (CreateCommandList).
-pub fn created_on(list: usize, raw: usize) {
+pub fn created_on(list: usize, raw: usize, ty: i32) {
     if !enabled() || raw == 0 {
         return;
     }
     let mut g = STATE.lock().unwrap();
-    move_list(g.get_or_insert_with(State::default), list, raw);
+    let s = g.get_or_insert_with(State::default);
+    s.types.entry(raw).or_insert(ty);
+    move_list(s, list, raw);
 }
 
 /// `lists` were just submitted to `queue`.
@@ -174,8 +178,12 @@ pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
             let mut dev: Option<ID3D12Device> = None;
             this.GetDevice(&mut dev).ok()?;
             let made: ID3D12CommandAllocator = dev?.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE(ty)).ok()?;
+            let raw = made.into_raw();
+            if !super::real::is_adopted(raw) {
+                super::real::adopt(raw, super::real::Kind::CommandAllocator);
+            }
             s.made += 1;
-            made.into_raw() as usize
+            raw as usize
         }
     };
     s.aside.entry(a).or_default().push(c);
