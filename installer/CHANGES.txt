@@ -1,33 +1,32 @@
-XCL - modified build 11
+XCL - modified build 12
 ======================
 
 This is NOT an official XCL release. It is XCL (https://github.com/ivall/xcl, GPL-2.0-only)
-built from upstream commit 2997c9a (2026-11-24) plus the changes listed below. The complete
-source of this build is at https://github.com/theaustinayers/xcl (tag v0.1.0-mod.11, branch
+built from upstream commit f4ce27c (2026-11-24) plus the changes listed below. The complete
+source of this build is at https://github.com/theaustinayers/xcl (tag v0.1.0-mod.12, branch
 modified-build). The licence is in LICENSE.txt, third-party notices in THIRD_PARTY.md.
 
-What changed since build 10
+What changed since build 11
 ---------------------------
-- The tested game gets past its loading screen for the first time: the title card of its
-  opening is shown. It is not playable: the picture stands still there and has wrong colours
-  (many draws are still left out), and the game ends some seconds later.
-- The driver's compile of a compute pipeline is kept on disk (upstream pull request #634):
-  on an NVIDIA GPU the larger ones took 5 - 27 s each in every run; from the second run on
-  they are made from the kept file (XCL_PSO_DISK_CACHE=0 turns that off).
-- Pipelines are built ahead of their first use, while the game loads: first the ones an
-  earlier run used (kept in used-pipelines.txt beside the shader cache), then the other
-  compute pipelines; on threads of the lowest priority (XCL_PSO_PRELOAD=0 turns that off).
-  The first runs fill these two caches: each run gets further than the one before.
-- Several big driver compiles at once: one for every 16 GB of memory, 1 - 8
-  (XCL_BIG_COMPILES=n sets it). One at a time held the game's world back.
-- A wait for a pipeline that is still being built is short (0.1 s) and, once one ran out,
-  no other is waited for in the next 2 s: a frame that used hundreds of new pipelines took
-  over 30 s and the game's watchdog ended it.
-- A GPU wait for a value whose write is in a command list not submitted yet is not waited
-  for on the CPU (2 s each, several a frame). A stopgap: the lists then run in the order
-  they were submitted, not the order the console would give them.
-- Open upstream pull request #435 (Cattn; merged upstream since) - a texture's layout tables
-  are a few bytes instead of 256 KB.
+- The tested game's opening title card is drawn with its right colours, and the crash that
+  ended every run 2 - 8 s after its loading screen did not come back in two runs. It is still
+  not playable: a few frames are shown, then the picture stands still and the game ends about
+  40 s later.
+- Why: waits for pipelines that are still being built now share an allowance of time (1.5 s,
+  refilled by 0.5 s a second). Before, one pipeline that missed its 100 ms stopped all waits
+  for 2 s, a frame's other new pipelines were left out on the spot, and the game read what
+  their dispatches would have computed.
+- Built on upstream's current main: its faster texture uploads and detiling (60 frames a
+  second on the loading screen here, the game's world reached after about 80 s instead of
+  130), its kept driver compiles (#634, #636) and pipelines built ahead (#690), release builds
+  with line tables (xcl.pdb).
+- XCL_SHORT_MOVIES=1 (upstream pull request #681, taken as it is): the game's videos end
+  after their first frame - the world is reached after about 60 s.
+- A copy the game asks for out of memory it has reserved and not written yet is carried out
+  (what is there when the list is submitted, else zeros) instead of being left out; on top of
+  upstream pull request #473, taken as it is.
+- Two big driver compiles at once at most (eight stopped the driver for everything else).
+- XCL_SPARSE_SYNC=1 is an experiment (off by default) and can stop the game: leave it off.
 
 What this build has that upstream does not
 ------------------------------------------

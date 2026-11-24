@@ -43,10 +43,11 @@ XCL is a research project and this is a snapshot of it. Please read this before 
 
 - **What upstream reports as working** (see the table further down): a few retail titles are
   listed as playable. Those claims are upstream's; they were not re-tested with this build.
-- **Large, new games: do not expect them to be playable.** With build 11 the game this build
+- **Large, new games: do not expect them to be playable.** With build 12 the game this build
   was tested against gets **through its menus, plays its intro video and shows its loading
   screen, and gets past it to the title card of its opening** on an RTX 5090. It stops there
-  (the picture stands still, with wrong colours, and the game ends some seconds later):
+  (the card is drawn with its right colours, a few frames are shown, then the picture stands
+  still and the game ends about 40 s later):
   nothing playable has been reached. The video plays at about its real speed, with sound. Still open:
   the console's texture compression (BCPack) is decoded for BC1 only; pipelines that take the
   NVIDIA driver long to compile are skipped until they are ready; compute writes to depth
