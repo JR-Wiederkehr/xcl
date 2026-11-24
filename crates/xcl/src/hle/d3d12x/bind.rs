@@ -917,6 +917,28 @@ mod tests {
         assert!(cpu_rect_expansion(with_gs));
     }
 
+    /// An ExecuteIndirect whose bound pipeline is still being built is skipped (its stand-in
+    /// with XCL's ABI root signature on the list is the debug layer's 953 and a hung GPU);
+    /// a built or failed one goes to the PC call. The gate `execute_indirect` uses.
+    #[test]
+    fn execute_indirect_with_a_pipeline_still_building_is_skipped() {
+        let (building, built, failed) = (0x7E57_6001usize, 0x7E57_6002usize, 0x7E57_6003usize);
+        // lazy submits: no worker starts them, so the states stay under the test's control
+        pso_async::submit_lazy(building, false, Box::new(|| 0x1234));
+        pso_async::submit_lazy(built, false, Box::new(|| 0x1235));
+        pso_async::submit_lazy(failed, false, Box::new(|| 0));
+        assert!(pso_async::is_pending(building));
+        assert_eq!(pso_async::resolve_wait(built), 0x1235);
+        assert_eq!(pso_async::resolve_wait(failed), failed);
+        assert!(!pso_async::is_pending(built) && !pso_async::is_pending(failed));
+        // never resolved: still pending (the skip case), then forgotten
+        assert!(pso_async::is_pending(building));
+        pso_async::released(building);
+        pso_async::released(built);
+        pso_async::released(failed);
+        assert!(!pso_async::is_pending(building));
+    }
+
     /// Minimal RTS0 v2 root signature blob with one 4-constant parameter.
     fn test_rts0_blob() -> Vec<u8> {
         let words: [u32; 12] = [
