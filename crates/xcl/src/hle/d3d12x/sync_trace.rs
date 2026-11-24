@@ -33,6 +33,10 @@ struct State {
     fences: HashMap<usize, (ID3D12Fence, u64)>,
     reports: u32,
     start: Option<Instant>,
+    /// queue → what XCL put on it since its last traced submit (waits for other queues)
+    ops: HashMap<usize, Vec<String>>,
+    /// queue → its traced submits the GPU is not past: (number, when, the ops before it)
+    pending: HashMap<usize, VecDeque<(u64, Instant, String)>>,
 }
 
 unsafe impl Send for State {}
@@ -139,6 +143,14 @@ pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void], why: &str) {
         let _ = q.Signal(&*f, *v);
         (f.GetCompletedValue(), *v)
     };
+    {
+        let before = s.ops.remove(&key).unwrap_or_default().join("; ");
+        let p = s.pending.entry(key).or_default();
+        while p.front().is_some_and(|x| x.0 <= done) {
+            p.pop_front();
+        }
+        p.push_back((next, Instant::now(), format!("[{why}, {} lists] after: {}", lists.len(), if before.is_empty() { "nothing" } else { &before })));
+    }
     for &list in lists {
         let list = list as usize;
         let known = s.lists.contains_key(&list);
@@ -169,4 +181,36 @@ pub fn queue_progress() -> Vec<(usize, u64, u64)> {
     let g = STATE.lock().unwrap();
     let Some(s) = g.as_ref() else { return Vec::new() };
     s.fences.iter().map(|(&q, (f, v))| (q, *v, unsafe { f.GetCompletedValue() })).collect()
+}
+
+/// XCL put `what` on `queue` (a wait for another queue, mostly): the next traced submit on it
+/// stands behind that.
+pub fn queue_op(queue: usize, what: String) {
+    if !enabled() {
+        return;
+    }
+    let mut g = STATE.lock().unwrap();
+    let s = g.get_or_insert_with(State::default);
+    let v = s.ops.entry(queue).or_default();
+    if v.len() < 12 {
+        v.push(what);
+    }
+}
+
+/// For each queue behind: (queue, its oldest unfinished traced submit, for how many ms, what
+/// XCL put on the queue before it).
+pub fn oldest_pending() -> Vec<(usize, u64, u128, String)> {
+    let mut g = STATE.lock().unwrap();
+    let Some(s) = g.as_mut() else { return Vec::new() };
+    let mut out = Vec::new();
+    for (&q, p) in s.pending.iter_mut() {
+        let done = s.fences.get(&q).map(|(f, _)| unsafe { f.GetCompletedValue() }).unwrap_or(u64::MAX);
+        while p.front().is_some_and(|x| x.0 <= done) {
+            p.pop_front();
+        }
+        if let Some((n, at, what)) = p.front() {
+            out.push((q, *n, at.elapsed().as_millis(), what.clone()));
+        }
+    }
+    out
 }

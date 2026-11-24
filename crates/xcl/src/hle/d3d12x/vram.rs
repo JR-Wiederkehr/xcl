@@ -600,6 +600,7 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
     let Some(Some(pages)) = g.get_mut(&(dev.as_raw() as usize)) else { return };
     let key = queue.as_raw() as usize;
     if pages.waited.get(&key).copied().unwrap_or(0) < pages.value {
+        super::sync_trace::queue_op(queue.as_raw() as usize, format!("Wait(page-mapping queue >= {})", pages.value));
         let _ = queue.Wait(&pages.fence, pages.value);
         pages.waited.insert(key, pages.value);
     }

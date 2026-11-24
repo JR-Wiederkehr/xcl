@@ -238,6 +238,8 @@ struct State {
     rb_alloc: ID3D12CommandAllocator,
     rb_list: ID3D12GraphicsCommandList,
     rb_last_fence: u64,
+    /// the title queue the tile-mapping queue last waited for: (queue, readback value, when)
+    rb_waits_for: Option<(usize, u64, std::time::Instant)>,
     /// the fence value each title queue last waited for
     waited: FxHashMap<usize, u64>,
     /// `mapped` as sorted (start, end) runs (None: to be made again)
@@ -543,6 +545,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             rb_alloc,
             rb_list,
             rb_last_fence: 0,
+            rb_waits_for: None,
             waited: FxHashMap::default(),
             runs: None,
             scratch_runs: Vec::new(),
@@ -1179,6 +1182,23 @@ pub unsafe fn free(p: usize) -> bool {
 /// for that queue: its next tile mapping, unmapping or upload then comes after the title's work
 /// that is in flight – the one-way ordering the windows have otherwise (title queues wait for
 /// the sparse queue, not the other way round, except for readbacks).
+/// The tile-mapping queue for the activity log: its fence against what was signalled, and the
+/// title queue it was last made to wait for (a readback), if that wait still stands.
+pub fn progress() -> Option<String> {
+    let g = STATE.try_lock().ok()?;
+    let s = g.as_ref()?;
+    let done = unsafe { s.fence.GetCompletedValue() };
+    let rb = unsafe { s.rb_fence.GetCompletedValue() };
+    let wait = match s.rb_waits_for {
+        Some((q, v, at)) if rb < v => format!("; WAITS for title queue {q:#x} to reach readback {v} (at {rb}) for {} ms", at.elapsed().as_millis()),
+        _ => String::new(),
+    };
+    if done >= s.value && wait.is_empty() {
+        return None;
+    }
+    Some(format!("{done}/{}{}{wait}", s.value, if done < s.value { format!(" BEHIND {}", s.value - done) } else { String::new() }))
+}
+
 /// The queue tile mappings go out on, once there is one.
 pub fn queue() -> Option<ID3D12CommandQueue> {
     STATE.lock().unwrap().as_ref().map(|s| s.queue.clone())
@@ -1249,6 +1269,7 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
     let v = s.rb_value;
     if queue.Signal(&s.rb_fence, v).is_ok() {
         let _ = s.queue.Wait(&s.rb_fence, v);
+        s.rb_waits_for = Some((queue.as_raw() as usize, v, std::time::Instant::now()));
     }
     s.readback_ranges(&merged);
 }
@@ -1484,6 +1505,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     s.scratch_runs = dirty_runs;
     let q = queue.as_raw() as usize;
     if s.value > 0 && s.waited.get(&q).copied().unwrap_or(0) < s.value {
+        super::sync_trace::queue_op(q, format!("Wait(tile-mapping queue >= {}; it is at {})", s.value, s.fence.GetCompletedValue()));
         let _ = queue.Wait(&s.fence, s.value);
         s.waited.insert(q, s.value);
     }
@@ -1761,6 +1783,8 @@ mod tests {
                 rb_alloc,
                 rb_list,
                 rb_last_fence: 0,
+            rb_waits_for: None,
+                rb_waits_for: None,
                 waited: FxHashMap::default(),
                 runs: None,
                 scratch_runs: Vec::new(),

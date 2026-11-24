@@ -546,6 +546,8 @@ unsafe fn restore_bindings(this: *mut c_void, b: &Bindings, ty: D3D12_COMMAND_LI
 
 #[derive(Default)]
 struct ListState {
+    /// this recording's waits (1 / 2: of a value it wrote itself) and 64-bit writes (0), in the order recorded
+    sync_ops: Vec<(u8, u64, u64)>,
     allocator: usize,
     list_type: Option<D3D12_COMMAND_LIST_TYPE>,
     last_queue: Option<usize>,
@@ -1437,6 +1439,7 @@ fn wake_sync_watchdog() {
                 unsafe {
                     let _ = fence.Signal(val);
                 }
+                sync_event(format!("WATCHDOG released {va:#x}>={val:#x} for q{} on the CPU", queue_id(waiter_q)));
                 let wq = queue_id(waiter_q);
                 let pq = prod_q.map(queue_id);
                 crate::xlog_warn!(
@@ -1500,6 +1503,7 @@ fn note_write64_recorded(list: *mut c_void, va: u64, value: u64) {
         let mut g = LISTS.lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(list as usize).or_default();
         s.push_write64_signal(va, value);
+        s.sync_ops.push((0, va, value));
         (s.list_type, s.last_queue)
     };
     let rescue: Option<(ID3D12Fence, u64, u64)> = {
@@ -1637,6 +1641,15 @@ unsafe fn signal_write64_pairs(queue: *mut c_void, pairs: &[(u64, u64)]) {
                 }
             }
         };
+        sync_event(format!(
+            "q{} signal {va:#x}={val:#x} {}",
+            queue_id(sig_q),
+            match &action {
+                SignalAction::Skip => "skipped",
+                SignalAction::GpuSignal => "on the GPU queue",
+                SignalAction::CpuCycleBreak(_) => "ON THE CPU (cycle break)",
+            }
+        ));
         match action {
             SignalAction::Skip => {}
             SignalAction::GpuSignal => {
@@ -1687,6 +1700,54 @@ pub(super) unsafe fn signal_write64_fences(queue: *mut c_void, lists: &[*mut c_v
     signal_write64_pairs(queue, &pairs);
 }
 
+/// the last sync events on all queues, in the order XCL put them there (sync tracing)
+static SYNC_EVENTS: Mutex<std::collections::VecDeque<String>> = Mutex::new(std::collections::VecDeque::new());
+static SYNC_EVENTS_DUMPED: Mutex<Option<Instant>> = Mutex::new(None);
+
+fn sync_event(e: String) {
+    if !super::sync_trace::enabled() {
+        return;
+    }
+    static START: OnceLock<Instant> = OnceLock::new();
+    let t = START.get_or_init(Instant::now).elapsed().as_secs_f64();
+    let mut g = SYNC_EVENTS.lock().unwrap();
+    if g.len() == 400 {
+        g.pop_front();
+    }
+    g.push_back(format!("+{t:.3} {e}"));
+}
+
+/// `lists` go to `queue` now: each with its recorded waits and 64-bit writes in order.
+pub(super) fn sync_exec_event(queue: *mut c_void, lists: &[*mut c_void], why: &str) {
+    if !super::sync_trace::enabled() {
+        return;
+    }
+    let parts: Vec<String> = {
+        let g = LISTS.lock().unwrap();
+        lists
+            .iter()
+            .map(|&l| {
+                let ops = g.as_ref().and_then(|m| m.get(&(l as usize))).map(|s| {
+                    s.sync_ops
+                        .iter()
+                        .map(|&(k, va, v)| match k {
+                            0 => format!("write {:#x}={v:#x}", va & 0xfff),
+                            1 => format!("WAIT {:#x}>={v:#x}", va & 0xfff),
+                            _ => format!("wait-own {:#x}>={v:#x}", va & 0xfff),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                });
+                format!("L{:x}[{}]", (l as usize) & 0xf_ffff, ops.unwrap_or_default())
+            })
+            .collect()
+    };
+    if parts.iter().all(|p| p.ends_with("[]")) {
+        return;
+    }
+    sync_event(format!("q{} run [{why}] {}", queue_id(queue as usize), parts.join(" ")));
+}
+
 /// The wait bridge as it stands, for the activity log: every queue's traced submits against
 /// what the GPU is past, and every cell with a GPU wait armed – what the waiter wants, the
 /// cell fence's completed value, what was submitted and recorded, and what the title's own
@@ -1701,6 +1762,18 @@ pub fn sync_dump() -> Vec<String> {
     qs.sort();
     if !qs.is_empty() {
         out.push(format!("queues (GPU done/submitted): {}", qs.join(", ")));
+    }
+    let mut old: Vec<String> = super::sync_trace::oldest_pending()
+        .into_iter()
+        .filter(|x| x.2 >= 300)
+        .map(|(q, n, ms, what)| format!("q{} submit #{n} unfinished for {ms} ms {what}", queue_id(q)))
+        .collect();
+    old.sort();
+    for o in old {
+        out.push(format!("behind: {o}"));
+    }
+    if let Some(sp) = super::sparse::progress() {
+        out.push(format!("tile-mapping queue: {sp}"));
     }
     let g = SYNC_GRAPH.lock().unwrap();
     let Some(graph) = g.as_ref() else { return out };
@@ -1727,8 +1800,21 @@ pub fn sync_dump() -> Vec<String> {
         ));
     }
     cells.sort();
+    let stuck = graph.cells.values().any(|c| c.armed_waits.iter().any(|aw| aw.armed_at.elapsed().as_millis() >= 1500));
     for c in cells.into_iter().take(8) {
         out.push(format!("wait cell {c}"));
+    }
+    drop(g);
+    // a wait that stands: the stream that led to it, at most every 6 s
+    if stuck {
+        let mut d = SYNC_EVENTS_DUMPED.lock().unwrap();
+        if d.is_none_or(|t| t.elapsed().as_secs() >= 6) {
+            *d = Some(Instant::now());
+            let ev = SYNC_EVENTS.lock().unwrap();
+            for e in ev.iter().rev().take(90).rev() {
+                out.push(format!("stream {e}"));
+            }
+        }
     }
     out
 }
@@ -1841,6 +1927,7 @@ unsafe fn try_gpu_wait(queue: *mut c_void, w: &PendingWait, list_writes: &[(u64,
         (pre_ok.0, pre_ok.1, pre_ok.2, wait_seq)
     };
 
+    super::sync_trace::queue_op(queue as usize, format!("Wait(cell {:#x} >= {:#x})", w.va & 0xfffff, w.value));
     if let Err(e) = q.Wait(&fence, w.value) {
         let mut g = SYNC_GRAPH.lock().unwrap();
         if let Some(cell) = g.as_mut().and_then(|gr| gr.cells.get_mut(&w.va)) {
@@ -1881,7 +1968,21 @@ unsafe fn wait_all_on(queue: *mut c_void, waits: &[PendingWait], list_writes: &[
         if w.is_satisfied() {
             continue;
         }
-        match try_gpu_wait(queue, w, list_writes) {
+        let outcome = try_gpu_wait(queue, w, list_writes);
+        sync_event(format!(
+            "q{} wait {:#x}>={:#x}{} -> {} (title memory {:x?})",
+            queue_id(queue as usize),
+            w.va,
+            w.value,
+            if w.after_write64 { " after-w64" } else { "" },
+            match outcome {
+                GpuWaitOutcome::Handled => "handled (GPU wait or already ordered)",
+                GpuWaitOutcome::CycleSkip => "SKIPPED (cycle)",
+                GpuWaitOutcome::FallbackCpu => "CPU wait",
+            },
+            w.read_value()
+        ));
+        match outcome {
             GpuWaitOutcome::Handled | GpuWaitOutcome::CycleSkip => continue,
             GpuWaitOutcome::FallbackCpu => {}
         }
@@ -2598,6 +2699,8 @@ unsafe fn wait_memory(list: *mut c_void, va: u64, width: u8, comparison: u32, va
     let need_split = {
         let mut g = LISTS.lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(list as usize).or_default();
+        let own = s.has_prior_write(va, n);
+        s.sync_ops.push((if own { 2 } else { 1 }, va, value));
         if s.has_prior_write(va, n) {
             return;
         }
@@ -2924,6 +3027,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         if !prior.is_empty() {
             execute_with_waits_on(q_raw, prior, |chunk| {
                 exec(q_raw, chunk.len() as u32, chunk.as_ptr());
+                sync_exec_event(q_raw, chunk, "kickoff-prior");
                 super::sync_trace::executed(q_raw, chunk, "kickoff-prior");
                 super::alloc_pool::executed(q_raw, chunk);
                 signal_write64_fences(q_raw, chunk);
@@ -2943,6 +3047,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
 
     let one = [this];
     exec(q_raw, 1, one.as_ptr());
+    sync_exec_event(q_raw, &one, "kickoff");
     super::sync_trace::executed(q_raw, &one, "kickoff");
     super::alloc_pool::executed(q_raw, &one);
     signal_write64_pairs(q_raw, &write64_signals);
@@ -3548,6 +3653,7 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
         let mut g = LISTS.lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(this as usize).or_default();
         s.allocator = alloc;
+        s.sync_ops.clear();
         s.bound_pso = pso;
         s.depth_bias = None;
         s.native_bias = DepthBias::ZERO;
