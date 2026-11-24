@@ -913,6 +913,7 @@ fn writer_unsubmitted(va: u64) -> bool {
 }
 
 unsafe fn wait_all(waits: &[PendingWait]) {
+    let _t = crate::prof::scope(crate::prof::Cat::WaitValues);
     static TIMEOUTS: AtomicU64 = AtomicU64::new(0);
     static OUT_OF_ORDER: AtomicU64 = AtomicU64::new(0);
     for w in waits {

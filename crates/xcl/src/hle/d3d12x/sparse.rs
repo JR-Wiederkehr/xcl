@@ -1394,6 +1394,7 @@ pub fn note_watch(t: std::time::Duration, pages: usize) {
 /// pages from the write-watch, sorted) and the reused tiles are copied asynchronously into video
 /// memory, and `queue` GPU-waits for that and for new tile mappings.
 pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: usize) {
+    let _t = crate::prof::scope(crate::prof::Cat::SparseBefore);
     let t0 = std::time::Instant::now();
     let mut g = STATE.lock().unwrap();
     let Some(s) = g.as_mut() else { return };

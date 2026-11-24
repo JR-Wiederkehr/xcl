@@ -40,8 +40,13 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 [p, e, d, x, f[0], f[1], f[2], f[3], r, b >> 20, fail]
             };
             let mut last = snap();
+            let mut last_prof = crate::prof::snapshot();
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(2));
+                let prof = crate::prof::snapshot();
+                let parts: Vec<String> = (0..prof.len()).filter(|&i| prof[i].1 != last_prof[i].1).map(|i| format!("{} {} ms/{}", crate::prof::NAMES[i], prof[i].0 - last_prof[i].0, prof[i].1 - last_prof[i].1)).collect();
+                crate::xlog_info!("xcl time (2 s): {}", parts.join(", "));
+                last_prof = prof;
                 let now = snap();
                 let d: Vec<u64> = now.iter().zip(last).map(|(a, b)| a - b).collect();
                 crate::xlog_info!(

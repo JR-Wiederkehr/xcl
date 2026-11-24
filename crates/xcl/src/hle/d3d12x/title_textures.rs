@@ -655,6 +655,7 @@ pub(super) fn is_own_work() -> bool {
 /// Before the title's GPU work: textures whose memory the CPU wrote since the last look are
 /// uploaded again.
 pub(super) unsafe fn refresh(queue: *mut c_void) {
+    let _t = crate::prof::scope(crate::prof::Cat::Refresh);
     // the uploads' own ExecuteCommandLists come back here
     if BUSY.with(|b| b.get()) {
         return;
@@ -689,7 +690,11 @@ unsafe fn refresh_once(queue: *mut c_void) {
     if !sparse && TEXTURES_LEN.load(Ordering::Relaxed) == 0 {
         return;
     }
-    recheck_gpu_view_sources();
+    {
+        let _t = crate::prof::scope(crate::prof::Cat::Recheck);
+        recheck_gpu_view_sources();
+    }
+    let _watch = crate::prof::scope(crate::prof::Cat::Watch);
     let watch_t0 = std::time::Instant::now();
     let mut page = 0x1000u32;
     let ranges = cached_watch_ranges(u);
@@ -709,6 +714,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
         dirty.len()
     });
     super::sparse::note_watch(watch_t0.elapsed(), dirty_len);
+    drop(_watch);
     if super::present::trace_frame() {
         // every 600th look: what the CPU's view of a few textures holds now (does the title's
         // data reach the address at all, and is the texture still kept in step?)
@@ -751,6 +757,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
     }
     // textures made since the last submit and those with a written page; a reference each
     // while they are uploaded
+    let _pick = crate::prof::scope(crate::prof::Cat::Pick);
     let todo: Vec<(ID3D12Resource, Upload)> = DIRTY_BUF.with(|dcell| {
         let dirty = dcell.borrow();
         let mut t = TEXTURES.lock().unwrap();
@@ -776,6 +783,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
             })
             .collect()
     });
+    drop(_pick);
     upload_all(todo);
 }
 
@@ -798,6 +806,7 @@ fn same_as_last_upload(res: usize, h: u64) -> bool {
 /// A 64-bit hash of `b` for "the same bytes as before" (four lanes of multiply-rotate over
 /// 8-byte words: gigabytes a second; not for anything adversarial).
 fn content_hash(b: &[u8]) -> u64 {
+    let _t = crate::prof::scope(crate::prof::Cat::Hash);
     const K: u64 = 0x9E37_79B9_7F4A_7C15;
     let mut h = [K, K.rotate_left(17), K.rotate_left(31), K.rotate_left(47)];
     let mut chunks = b.chunks_exact(32);
@@ -819,6 +828,7 @@ const BATCH_BYTES: usize = 256 << 20;
 
 /// The uploads `todo`, in batches of up to `BATCH_BYTES` (one list and one wait each).
 unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
+    let _t = crate::prof::scope(crate::prof::Cat::UploadAll);
     static N: AtomicU64 = AtomicU64::new(0);
     let warn = |e: &str| {
         if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -827,6 +837,24 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
     };
     let mut todo = todo.into_iter().peekable();
     while todo.peek().is_some() {
+        // The share of the submitting thread's time uploads may take is used up: what is left
+        // waits for a later submit (`upload_share`).
+        if !upload_share::left() {
+            let mut t = TEXTURES.lock().unwrap();
+            let mut put_off = 0u64;
+            for (r, _) in todo {
+                if let Some(e) = t.by_res.get_mut(&(r.as_raw() as usize)) {
+                    if !e.pending {
+                        e.pending = true;
+                        PENDING.fetch_add(1, Ordering::Relaxed);
+                        put_off += 1;
+                    }
+                }
+            }
+            upload_share::put_off(put_off);
+            return;
+        }
+        let batch_t0 = std::time::Instant::now();
         let mut picked = Vec::new();
         let mut bytes = 0usize;
         let mut device = 0usize;
@@ -881,6 +909,64 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
                 UPLOADS.fetch_add(batch.len() as u64, Ordering::Relaxed);
             }
             Err(e) => warn(&e),
+        }
+        upload_share::took(batch_t0.elapsed());
+    }
+}
+
+/// The share of the submitting thread's time that title texture uploads may take.
+///
+/// `refresh` runs in every `ExecuteCommandLists` of the title, and uploads what the title wrote
+/// since the last one: hashed, detiled and copied before the submit goes on. While a retail
+/// title streams its world behind its loading screen that was 1.0 – 2.0 s of every 2 s on the
+/// thread that submits its frames (up to 123 ms a submit), and the screen stood still: 0 – 9
+/// frames in 2 s. Uploads now take `XCL_TEXTURE_UPLOAD_SHARE` percent of that thread's time at
+/// most (default 35; 100: no limit, as before) – from an allowance of `POOL_MS`, refilled at
+/// that rate – and a texture that does not fit waits for a later submit, still marked as to be
+/// uploaded. A texture is then drawn with what it held before for some frames; the title's
+/// frames go on.
+mod upload_share {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, OnceLock};
+
+    /// the most the allowance holds: a batch may overdraw it, the next ones wait it out
+    const POOL_MS: f64 = 12.0;
+    /// (milliseconds left, when it was last refilled)
+    static POOL: Mutex<Option<(f64, std::time::Instant)>> = Mutex::new(None);
+    static PUT_OFF: AtomicU64 = AtomicU64::new(0);
+
+    fn share() -> f64 {
+        static S: OnceLock<f64> = OnceLock::new();
+        *S.get_or_init(|| std::env::var("XCL_TEXTURE_UPLOAD_SHARE").ok().and_then(|v| v.trim().parse::<f64>().ok()).filter(|p| (1.0..=100.0).contains(p)).unwrap_or(35.0) / 100.0)
+    }
+
+    /// Is there time left for another batch?
+    pub fn left() -> bool {
+        let share = share();
+        if share >= 1.0 {
+            return true;
+        }
+        let mut g = POOL.lock().unwrap();
+        let now = std::time::Instant::now();
+        let (ms, at) = g.get_or_insert((POOL_MS, now));
+        *ms = (*ms + now.duration_since(*at).as_secs_f64() * 1000.0 * share).min(POOL_MS);
+        *at = now;
+        *ms > 0.0
+    }
+
+    pub fn took(t: std::time::Duration) {
+        if let Some((ms, _)) = POOL.lock().unwrap().as_mut() {
+            *ms -= t.as_secs_f64() * 1000.0;
+        }
+    }
+
+    pub fn put_off(n: u64) {
+        if n == 0 {
+            return;
+        }
+        let before = PUT_OFF.fetch_add(n, Ordering::Relaxed);
+        if before == 0 || (before + n).next_power_of_two() != before.next_power_of_two() {
+            crate::xlog_info!("title textures: {} uploads put off to a later submit so far (XCL_TEXTURE_UPLOAD_SHARE)", before + n);
         }
     }
 }

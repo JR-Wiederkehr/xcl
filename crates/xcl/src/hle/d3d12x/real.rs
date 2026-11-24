@@ -5040,6 +5040,7 @@ unsafe extern "system" fn fence_signal(this: *mut c_void, value: u64) -> HRESULT
 }
 
 unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lists: *const *mut c_void) {
+    let _t = crate::prof::scope(crate::prof::Cat::Execute);
     type F = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ExecuteCommandLists")));
     if n == 0 || lists.is_null() {

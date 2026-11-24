@@ -1275,6 +1275,7 @@ unsafe extern "system" fn queue_release(p: *mut c_void) -> u32 {
 }
 
 unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) {
+    let _t = crate::prof::scope(crate::prof::Cat::DsEnqueue);
     let q = queue(p);
     if q.closed.load(Ordering::Acquire) || req.is_null() {
         return;
@@ -1357,6 +1358,7 @@ unsafe extern "system" fn queue_enqueue_signal(p: *mut c_void, fence: *mut c_voi
 }
 
 unsafe extern "system" fn queue_submit(p: *mut c_void) {
+    let _t = crate::prof::scope(crate::prof::Cat::DsSubmit);
     let q = queue(p);
     if !q.closed.load(Ordering::Acquire) {
         q.submit();

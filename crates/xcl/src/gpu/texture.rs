@@ -255,6 +255,7 @@ impl Uploader {
 /// order). A failure of one is returned with its index; the others still run. The texels go
 /// through the queue's kept upload buffer (`Uploader`).
 pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items: &[(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)]) -> Result<Vec<(usize, String)>, String> {
+    let _t = crate::prof::scope(crate::prof::Cat::UploadBatch);
     if items.is_empty() {
         return Ok(Vec::new());
     }

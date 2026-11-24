@@ -310,6 +310,7 @@ pub fn resolve(pso: usize) -> usize {
 /// watchdog ended it – and the driver never got to cache the pipeline, so every run stopped
 /// there. With a limit the pipeline is not built on the title's thread either.
 pub fn resolve_wait(pso: usize) -> usize {
+    let _t = crate::prof::scope(crate::prof::Cat::ResolveWait);
     let Some(p) = entry(pso) else { return pso };
     p.note_use();
     static LIMIT: OnceLock<u64> = OnceLock::new();

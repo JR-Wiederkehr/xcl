@@ -180,6 +180,7 @@ impl Layout {
 
     /// tiled → linear rows (`w << elem_log2` bytes each); bytes past the end of `src` read as 0
     pub fn detile(&self, src: &[u8], w: usize, h: usize) -> Vec<u8> {
+        let _t = crate::prof::scope(crate::prof::Cat::Detile);
         let e = 1usize << self.elem_log2;
         let mut out = vec![0u8; w * h * e];
         for y in 0..h {
@@ -365,6 +366,7 @@ impl Chain {
     /// level `i` of a 3D texture (`mem` = all its slices) → its depth slices of linear rows;
     /// bytes past the end of `mem` read as 0
     pub fn detile_volume(&self, mem: &[u8], i: usize) -> Vec<u8> {
+        let _t = crate::prof::scope(crate::prof::Cat::Detile);
         let l = self.levels[i];
         let e = 1usize << self.layout.elem_log2;
         let mut out = vec![0u8; l.width * l.height * l.depth * e];
@@ -398,6 +400,7 @@ impl Chain {
     /// level `i` of array slice `slice` (`src` = the slice's bytes) → linear rows of elements;
     /// bytes past the end of `src` read as 0
     pub fn detile_level(&self, src: &[u8], i: usize, slice: usize) -> Vec<u8> {
+        let _t = crate::prof::scope(crate::prof::Cat::Detile);
         let l = self.levels[i];
         let t = &self.layout;
         let e = 1usize << t.elem_log2;
