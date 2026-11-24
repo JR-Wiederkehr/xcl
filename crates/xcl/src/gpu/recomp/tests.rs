@@ -6023,9 +6023,8 @@ fn gpu_split_wave64_waves_diverge() {
         let cs = CsInterface { threads: dims, user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 3 };
         let t = translate(&p, &on_gpu(Options { mode: Mode::Compute(cs), wave64: true, ..Default::default() })).unwrap();
         assert!(t.complete(), "{:?}", t.unsupported_why);
-        if runner::split_wave64() && std::env::var_os("XCL_WAVE64_SPIN").is_none() {
-            let spin = if threads > 64 { "#define XCL_X_SPIN 1" } else { "#define XCL_X_SPIN 0" };
-            assert!(t.hlsl.contains("[WaveSize(32)]") && t.hlsl.contains(spin), "{dims:?}");
+        if runner::split_wave64() && std::env::var("XCL_WAVE64_SPIN").map_or(true, |v| v.trim() != "0") {
+            assert!(t.hlsl.contains("[WaveSize(32)]") && t.hlsl.contains("#define XCL_X_SPIN 1"), "{dims:?}");
         }
         let dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
         let base = 0x100usize;
@@ -7328,6 +7327,96 @@ fn fspx_compute_user_sgprs_from_rsrc2() {
         super::pso::compute_user_sgprs(&blob)
     });
     assert_eq!(counts, [Some(4), Some(8)]);
+}
+
+/// Verifies early-exit-safe, bounded `xcl_s_barrier()` on real multi-warp compute shaders:
+/// 1. All 4 hardware wave32s in `numthreads(128, 1, 1)` exchange LDS values across two back-to-back
+///    `s_barrier` generations (both split-wave64 and native wave32).
+/// 2. Upper console wave (`tid >= 64`) takes an early `s_endpgm` while the lower console wave
+///    (`tid 0..63`, 2 hardware wave32s) executes two `s_barrier`s and exchanges LDS across its
+///    surviving warps — legal on RDNA2, would permanently deadlock `bar.sync 0` on NVIDIA.
+#[test]
+fn gpu_safe_s_barrier_multi_warp_and_early_endpgm() {
+    if !gpu_ready() {
+        return;
+    }
+    use super::{dxc, CsInterface};
+
+    // Shader 1: 4 hardware wave32s, 2 consecutive s_barrier generations exchanging across waves
+    // using disjoint LDS banks (bank 0: 0..512, bank 1: 512..1024) so there is no WAR data race.
+    let p_all = prog(&[
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 130), ("VSRC1", 0)], None),           // v1 = tid * 4 (bank 0)
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 9), ("SRC0", 255), ("VSRC1", 1)], Some(512)),       // v9 = 512 + tid * 4 (bank 1)
+        ("V_XOR_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 192), ("VSRC1", 0)], None),               // v2 = tid ^ 64
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 130), ("VSRC1", 2)], None),           // v2 = (tid ^ 64) * 4 (bank 0)
+        ("V_XOR_B32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 160), ("VSRC1", 0)], None),               // v3 = tid ^ 32
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 130), ("VSRC1", 3)], None),           // v3 = (tid ^ 32) * 4
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 255), ("VSRC1", 3)], Some(512)),       // v3 = 512 + (tid ^ 32) * 4 (bank 1)
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 255), ("VSRC1", 0)], Some(0x100)),
+        ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 6)], None),
+        ("S_BARRIER", "ENC_SOPP", &[], None),
+        ("DS_READ_B32", "ENC_DS", &[("VDST", 4), ("ADDR", 2)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 129), ("VSRC1", 4)], None),            // +1
+        ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 9), ("DATA0", 4)], None),
+        ("S_BARRIER", "ENC_SOPP", &[], None),
+        ("DS_READ_B32", "ENC_DS", &[("VDST", 5), ("ADDR", 3)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 7), ("SRC0", 0), ("VSRC1", 1)], None),              // s0 + tid*4
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 8), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 7), ("DATA", 5), ("SADDR", 0x7D)], None),
+    ]);
+
+    let cs = CsInterface { threads: [128, 1, 1], user_sgprs: 2, tgid: [false, false, false], tg_size: false, tid_components: 1 };
+    let base = 0x100usize;
+    let mut io = vec![0u32; 128];
+    io[0] = base as u32;
+    for wave64 in [true, false] {
+        let t = translate(&p_all, &on_gpu(Options { mode: Mode::Compute(cs.clone()), wave64, ..Default::default() })).unwrap();
+        assert!(t.complete(), "wave64={wave64}: {:?}", t.unsupported_why);
+        if std::env::var("XCL_SAFE_BARRIER").map_or(true, |v| v.trim() != "0") {
+            assert!(t.hlsl.contains("xcl_s_barrier();"), "wave64={wave64}: expected xcl_s_barrier()");
+        }
+        let dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        let out = runner::dispatch(&dxil, [1, 1, 1], &io, &vec![0u32; (base + 128 * 4) / 4]).unwrap();
+        for tid in 0..128usize {
+            let want = ((tid ^ 96) + 0x101) as u32;
+            assert_eq!(out[(base + tid * 4) / 4], want, "wave64={wave64} tid={tid}: 2-gen xcl_s_barrier LDS exchange");
+        }
+    }
+
+    // Shader 2: upper console wave (tid >= 64) exits early via `s_endpgm` before 2 `s_barrier`s;
+    // lower console wave (tid 0..63, 2 hardware wave32s) synchronizes and exchanges LDS across halves.
+    let p_early = prog(&[
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V)], None),                    // s10 = first tid in wave
+        ("S_CMP_GE_U32", "ENC_SOPC", &[("SSRC0", 10), ("SSRC1", 192)], None),                       // scc = (s10 >= 64)
+        ("S_CBRANCH_SCC0", "ENC_SOPP", &[("SIMM16", 1)], None),                                     // skip s_endpgm if < 64
+        ("S_ENDPGM", "ENC_SOPP", &[], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 130), ("VSRC1", 0)], None),           // v1 = tid * 4 (bank 0)
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 9), ("SRC0", 255), ("VSRC1", 1)], Some(512)),       // v9 = 512 + tid * 4 (bank 1)
+        ("V_XOR_B32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 160), ("VSRC1", 0)], None),               // v3 = tid ^ 32
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 130), ("VSRC1", 3)], None),           // v3 = (tid ^ 32) * 4 (bank 0)
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 255), ("VSRC1", 3)], Some(512)),       // v2 = 512 + (tid ^ 32) * 4 (bank 1)
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 255), ("VSRC1", 0)], Some(0x200)),
+        ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 6)], None),
+        ("S_BARRIER", "ENC_SOPP", &[], None),
+        ("DS_READ_B32", "ENC_DS", &[("VDST", 4), ("ADDR", 3)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 135), ("VSRC1", 4)], None),            // +7
+        ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 9), ("DATA0", 4)], None),
+        ("S_BARRIER", "ENC_SOPP", &[], None),
+        ("DS_READ_B32", "ENC_DS", &[("VDST", 5), ("ADDR", 2)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 7), ("SRC0", 0), ("VSRC1", 1)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 8), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 7), ("DATA", 5), ("SADDR", 0x7D)], None),
+    ]);
+    let t = translate(&p_early, &on_gpu(Options { mode: Mode::Compute(cs), wave64: true, ..Default::default() })).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    let dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+    let out = runner::dispatch(&dxil, [2, 1, 1], &io, &vec![0u32; (base + 128 * 4) / 4]).unwrap();
+    for tid in 0..64usize {
+        assert_eq!(out[(base + tid * 4) / 4], (tid + 0x207) as u32, "tid={tid}: surviving warps must pass 2 s_barriers after upper wave early s_endpgm");
+    }
+    for tid in 64..128usize {
+        assert_eq!(out[(base + tid * 4) / 4], 0, "tid={tid}: exited wave must not store");
+    }
 }
 
 /// `XCL_SAMPLE_FSPX=<folder>`: every `*.bin` there that is an FSPX (driver) compute container –
