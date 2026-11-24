@@ -198,6 +198,19 @@ pub unsafe extern "system" fn set_frame_interval_x(_this: *mut std::ffi::c_void,
         crate::xlog_warn!("D3D12.X: SetFrameIntervalX({len_us} µs) – not an interval of this display");
         return E_INVALIDARG;
     }
+    // `XCL_FPS=n` (30 – 240): the frame clock runs at n a second whatever interval the title
+    // asks for (a title made for 30 frames a second on the console sets 33 333 µs). The title
+    // is not told: one that steps its world once a frame runs faster with it.
+    static FPS: OnceLock<Option<u32>> = OnceLock::new();
+    let asked = len_us;
+    let len_us = match *FPS.get_or_init(|| std::env::var("XCL_FPS").ok().and_then(|v| v.trim().parse::<u32>().ok()).filter(|n| (30..=240).contains(n))) {
+        Some(n) if len_us != 0 => 1_000_000 / n,
+        _ => len_us,
+    };
+    if len_us != asked {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| crate::xlog_info!("D3D12.X: XCL_FPS – the frame clock runs at {} µs, not the {asked} µs the title set", len_us));
+    }
     with(|c| {
         if c.interval_us != len_us {
             c.kinds[0].scheduled = false;
