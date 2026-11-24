@@ -7,8 +7,7 @@ version = "0.1.0"
 edition = "2021"
 license = "GPL-2.0-only"
 
-# Line tables in release: crash lines give addresses as `module+0x...`, and xcl.pdb (next to xcl.exe in
-# target\release) turns those into files and lines. Code generation is unchanged. (Upstream pull request
-# #600, Kaairim.)
+# Keep full symbols in optimized alpha builds so release-only crashes can be
+# resolved to functions, files, and lines without a separate diagnostic build.
 [profile.release]
-debug = "line-tables-only"
+debug = 2
