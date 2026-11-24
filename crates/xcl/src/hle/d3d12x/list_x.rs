@@ -1069,13 +1069,52 @@ pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, 
         return warn(&N, W, format_args!("size {size:#x} is not a non-zero multiple of 4"));
     }
     let Some((d, doff)) = real::uma_window_buffer(dst as usize, size as usize) else {
+        // The title's own memory on both sides (a retail title: 16 KiB from its heap into a
+        // table of its own, while it starts; left out, the table kept what was there and the
+        // title read pointers out of it later): no GPU buffer to copy into, so the CPU stores
+        // what the source holds now once the queue has got to this list – as an immediate write
+        // into such memory is done.
+        let (src_uma, src_ok, dst_ok) = (
+            real::uma_window_buffer(src as usize, size as usize).is_some(),
+            crate::gpu::shader::readable(src as usize, size as usize),
+            super::cpu_writes::writable(dst as usize, size as usize),
+        );
+        if !src_uma && src_ok && dst_ok {
+            let words = std::slice::from_raw_parts(src as *const u32, size as usize / 4).to_vec();
+            LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(this as usize).or_default().cpu_writes.push(super::cpu_writes::Write::Immediate(dst as usize, words));
+            static CPU: AtomicU64 = AtomicU64::new(0);
+            let n = CPU.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                crate::xlog_info!("D3D12.X: {n} CopyMemoryToMemoryX between memory outside unified memory so far – done by the CPU ({src:#x} → {dst:#x}, {size:#x} bytes)");
+            }
+            return;
+        }
         note_gpu_write("CopyMemoryToMemoryX", dst as usize, size);
         return warn(&N, W, format_args!("{src:#x} → {dst:#x} ({size:#x} bytes) is not in unified memory"));
     };
     let Some((s, soff)) = real::uma_window_buffer(src as usize, size as usize) else {
+        // (the title's memory may be lazy pages nothing has touched yet: committed, as a kernel
+        // call that reads it would)
+        crate::hle::kernelx::lazy::ensure(src as usize, size as usize);
+        // Not readable now. Memory the title has reserved and not written yet (a title texture's
+        // address before its first texel: reserved, committed at its first write) reads as zeros
+        // on the console, and may be written before the list is submitted: the copy is recorded,
+        // and `fill_uploads` takes what is there then – zeros (a fresh upload buffer) when it is
+        // still untouched. Left out, the destination kept what it held before: a retail title
+        // copies 16 KiB out of such a texture into a table of its own while it starts.
         if !crate::gpu::shader::readable(src as usize, size as usize) {
-            note_gpu_write("CopyMemoryToMemoryX", dst as usize, size);
-            return warn(&N, W, format_args!("{src:#x} → {dst:#x} ({size:#x} bytes) is not in unified memory"));
+            use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_RESERVE};
+            let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            let reserved = VirtualQuery(src as *const c_void, &mut m, std::mem::size_of_val(&m)) != 0 && m.State == MEM_RESERVE && m.BaseAddress as usize + m.RegionSize >= src as usize + size as usize;
+            if !reserved {
+                note_gpu_write("CopyMemoryToMemoryX", dst as usize, size);
+                return warn(&N, W, format_args!("{src:#x} → {dst:#x} ({size:#x} bytes) is not in unified memory"));
+            }
+            static ZEROS: AtomicU64 = AtomicU64::new(0);
+            let n = ZEROS.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                crate::xlog_info!("D3D12.X: {n} CopyMemoryToMemoryX so far out of memory the title has reserved and not written yet ({src:#x} → {dst:#x}, {size:#x} bytes) – what is there at submission, else zeros");
+            }
         }
         let Some((buf, mapped)) = create_mapped_upload(this, size) else {
             note_gpu_write("CopyMemoryToMemoryX", dst as usize, size);

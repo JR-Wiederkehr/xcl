@@ -1529,6 +1529,16 @@ pub(super) fn title_address(res: usize) -> Option<usize> {
     console_buffer(res).map(|b| b.0).or_else(|| TITLE_ADDRESS.lock().unwrap().as_ref().and_then(|m| m.get(&res).copied()))
 }
 
+/// (diagnostic) The GPU-owned resource placed at or below `va` in the title's memory, described.
+pub(super) unsafe fn describe_title_resource_at(va: usize) -> String {
+    let near = TITLE_ADDRESS.lock().unwrap().as_ref().and_then(|m| m.iter().filter(|(_, &a)| a <= va).max_by_key(|(_, &a)| a).map(|(&r, &a)| (r, a)));
+    let Some((res, at)) = near else { return "no GPU-owned resource placed below it".into() };
+    let raw = res as *mut c_void;
+    let Some(r) = ID3D12Resource::from_raw_borrowed(&raw) else { return format!("resource {res:#x} at {at:#x}") };
+    let d = r.GetDesc();
+    format!("nearest GPU-owned resource {res:#x} placed at {at:#x} ({:#x} below): dimension {}, {}x{}x{}, {} mips, format {}, {} samples, flags {:#x}", va - at, d.Dimension.0, d.Width, d.Height, d.DepthOrArraySize, d.MipLevels, d.Format.0, d.SampleDesc.Count, d.Flags.0)
+}
+
 pub(super) fn note_title_address(res: usize, va: usize) {
     TITLE_ADDRESS.lock().unwrap().get_or_insert_with(HashMap::new).insert(res, va);
 }
