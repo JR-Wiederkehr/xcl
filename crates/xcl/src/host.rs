@@ -46,6 +46,12 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 let prof = crate::prof::snapshot();
                 let parts: Vec<String> = (0..prof.len()).filter(|&i| prof[i].1 != last_prof[i].1).map(|i| format!("{} {} ms/{}", crate::prof::NAMES[i], prof[i].0 - last_prof[i].0, prof[i].1 - last_prof[i].1)).collect();
                 crate::xlog_info!("xcl time (2 s): {}", parts.join(", "));
+                for line in crate::hle::d3d12x::list_x::sync_dump() {
+                    crate::xlog_info!("sync (2 s): {line}");
+                }
+                if let Some(line) = crate::hle::d3d12x::alloc_pool::stats() {
+                    crate::xlog_info!("allocators (2 s): {line}");
+                }
                 last_prof = prof;
                 let now = snap();
                 let d: Vec<u64> = now.iter().zip(last).map(|(a, b)| a - b).collect();

@@ -9,6 +9,7 @@
 
 #![allow(non_snake_case)]
 
+pub mod alloc_pool;
 pub mod bind;
 pub mod console_heap;
 pub mod console_list;
@@ -26,6 +27,7 @@ pub mod present;
 pub mod pso_async;
 pub mod real;
 pub mod sparse;
+mod sync_trace;
 pub mod title_list;
 pub mod title_textures;
 pub mod vram;

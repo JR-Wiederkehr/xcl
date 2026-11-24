@@ -747,6 +747,8 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
                 WRITE64_SIGNAL_LISTS.fetch_sub(1, Ordering::AcqRel);
             }
         }
+        super::sync_trace::list_reset(key, alloc, "create");
+        super::alloc_pool::created_on(key, alloc);
         m.insert(key, ListState { allocator: alloc, list_type: Some(ty), bound_pso: pso, ..Default::default() });
         old
     };
@@ -1685,6 +1687,52 @@ pub(super) unsafe fn signal_write64_fences(queue: *mut c_void, lists: &[*mut c_v
     signal_write64_pairs(queue, &pairs);
 }
 
+/// The wait bridge as it stands, for the activity log: every queue's traced submits against
+/// what the GPU is past, and every cell with a GPU wait armed – what the waiter wants, the
+/// cell fence's completed value, what was submitted and recorded, and what the title's own
+/// memory holds at the cell (the value the title itself reads).
+pub fn sync_dump() -> Vec<String> {
+    let mut out = Vec::new();
+    let mut qs: Vec<String> = super::sync_trace::queue_progress()
+        .into_iter()
+        .map(|(q, sub, done)| (queue_id(q), sub, done))
+        .map(|(id, sub, done)| if done >= sub { format!("q{id} {sub}") } else { format!("q{id} {done}/{sub} BEHIND {}", sub - done) })
+        .collect();
+    qs.sort();
+    if !qs.is_empty() {
+        out.push(format!("queues (GPU done/submitted): {}", qs.join(", ")));
+    }
+    let g = SYNC_GRAPH.lock().unwrap();
+    let Some(graph) = g.as_ref() else { return out };
+    let mut cells: Vec<String> = Vec::new();
+    for (&va, cell) in graph.cells.iter() {
+        if cell.armed_waits.is_empty() {
+            continue;
+        }
+        let completed = cell.fence.as_ref().map(|f| unsafe { f.GetCompletedValue() }).unwrap_or(0);
+        let mem = if crate::gpu::shader::readable(va as usize, 8) { format!("{:#x}", unsafe { *(va as *const u64) }) } else { "unreadable".into() };
+        let waits: Vec<String> = cell
+            .armed_waits
+            .iter()
+            .map(|aw| format!("q{} wants {:#x} for {} ms{}", queue_id(aw.waiting_queue), aw.val, aw.armed_at.elapsed().as_millis(), if aw.after_write64 { " (after w64)" } else { "" }))
+            .collect();
+        cells.push(format!(
+            "{va:#x}: fence at {completed:#x}, submitted {:#x} by {}, recorded {:#x}, cpu-signalled {:#x}, title memory {mem}; {} signals in flight; waits: {}",
+            cell.submitted_max,
+            cell.submitted_queue.map(|q| format!("q{}", queue_id(q))).unwrap_or_else(|| "CPU".into()),
+            cell.recorded_max,
+            cell.cpu_signaled_max,
+            cell.submitted_signals.len(),
+            waits.join("; ")
+        ));
+    }
+    cells.sort();
+    for c in cells.into_iter().take(8) {
+        out.push(format!("wait cell {c}"));
+    }
+    out
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GpuWaitOutcome {
     /// Satisfied on GPU (via `queue.Wait` or same-queue FIFO order) — no CPU wait needed.
@@ -2397,16 +2445,22 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
     let mut next_pc: Option<*mut c_void> = None;
     if let Some(spare) = super::title_list::pop_spare(wrapper) {
         let ext_spare = *(spare as *const usize);
-        let reset_hr = pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(spare, PC_RESET)(spare, alloc, init_pso);
+        let pc_alloc = super::alloc_pool::for_list(spare as usize, alloc, ty.0);
+        let reset_hr = pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(spare, PC_RESET)(spare, pc_alloc, init_pso);
         real::preserve_vtable(spare, ext_spare);
         if reset_hr >= 0 {
+            super::sync_trace::list_reset(spare as usize, pc_alloc, "split-spare");
             next_pc = Some(spare);
         }
     }
     let next_pc = match next_pc {
         Some(p) => p,
-        None => match real::create_raw_pc_command_list(dev.as_raw(), ty, alloc, init_pso) {
-            Some(p) => p,
+        None => match real::create_raw_pc_command_list(dev.as_raw(), ty, super::alloc_pool::current(alloc), init_pso) {
+            Some(p) => {
+                let pc_alloc = super::alloc_pool::for_list(p as usize, alloc, ty.0);
+                super::sync_trace::list_reset(p as usize, pc_alloc, "split-new");
+                p
+            }
             None => {
                 static CREATE_ERR: AtomicU64 = AtomicU64::new(0);
                 warn(&CREATE_ERR, "Wait64 mid-list split", format_args!("CreateCommandList failed"));
@@ -2870,6 +2924,8 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         if !prior.is_empty() {
             execute_with_waits_on(q_raw, prior, |chunk| {
                 exec(q_raw, chunk.len() as u32, chunk.as_ptr());
+                super::sync_trace::executed(q_raw, chunk, "kickoff-prior");
+                super::alloc_pool::executed(q_raw, chunk);
                 signal_write64_fences(q_raw, chunk);
                 readback_sparse_writes(q_raw, chunk);
                 cpu_writes_after(q_raw, chunk);
@@ -2887,6 +2943,8 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
 
     let one = [this];
     exec(q_raw, 1, one.as_ptr());
+    super::sync_trace::executed(q_raw, &one, "kickoff");
+    super::alloc_pool::executed(q_raw, &one);
     signal_write64_pairs(q_raw, &write64_signals);
     // what ran is in the textures' states; the list records anew after its Reset below
     super::title_textures::submitted(&one);
@@ -2936,8 +2994,12 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
 
     let ext_closed = *(target as *const usize);
     let init_pso = super::pso_async::resolve_for_bind(bound_pso);
-    let reset_hr = pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(target, PC_RESET)(target, alloc, init_pso);
+    let pc_alloc = super::alloc_pool::for_list(target as usize, alloc, list_type(target).0);
+    let reset_hr = pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(target, PC_RESET)(target, pc_alloc, init_pso);
     real::preserve_vtable(target, ext_closed);
+    if reset_hr >= 0 {
+        super::sync_trace::list_reset(target as usize, pc_alloc, "kickoff-resume");
+    }
     if reset_hr < 0 {
         return warn(&ERR, "KickoffX", format_args!("Reset after kickoff failed ({reset_hr:#x})"));
     }
@@ -3474,11 +3536,13 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
     // transfer its allocations until the driver accepts the new recording.
     let ext = *(this as *const usize);
     let resolved = super::pso_async::resolve_for_bind(pso);
-    let hr = pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(this, PC_RESET)(this, alloc, resolved);
+    let pc_alloc = super::alloc_pool::for_list(this as usize, alloc, list_type(this).0);
+    let hr = pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(this, PC_RESET)(this, pc_alloc, resolved);
     real::preserve_vtable(this, ext);
     if hr < 0 {
         return hr;
     }
+    super::sync_trace::list_reset(this as usize, pc_alloc, "title-reset");
 
     let is_bundle = {
         let mut g = LISTS.lock().unwrap();
