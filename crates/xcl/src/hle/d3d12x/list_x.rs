@@ -954,6 +954,11 @@ unsafe fn wait_all(waits: &[PendingWait]) {
 /// Copy any GPU memory writes into sparse VRAM windows recorded by `lists` back into their
 /// CPU view after `queue.ExecuteCommandLists` so CPU reads and `Wait32/64BitValueX` see them.
 pub(super) unsafe fn readback_sparse_writes(queue: *mut c_void, lists: &[*mut c_void]) {
+    if super::sparse::sync_every_submit() && !queue.is_null() {
+        if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) {
+            super::sparse::sync_after_execute(q);
+        }
+    }
     if SPARSE_WRITE_LISTS.load(Ordering::Acquire) == 0 || queue.is_null() || lists.is_empty() {
         return;
     }

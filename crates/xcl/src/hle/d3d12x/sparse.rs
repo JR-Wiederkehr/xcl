@@ -1167,6 +1167,50 @@ pub unsafe fn free(p: usize) -> bool {
 /// After `queue.ExecuteCommandLists`: copy GPU-written sparse ranges (e.g. `Write32/64`,
 /// `FillMemoryWith32BitValueX`, `CopyMemoryToMemoryX`) back to their CPU view so CPU reads
 /// and spin-waits see the GPU writes without clobbering `sent` hashes.
+/// (experiment, `XCL_SPARSE_SYNC=1`) After every submit of a title queue the sparse queue waits
+/// for that queue: its next tile mapping, unmapping or upload then comes after the title's work
+/// that is in flight – the one-way ordering the windows have otherwise (title queues wait for
+/// the sparse queue, not the other way round, except for readbacks).
+pub fn sync_every_submit() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_SPARSE_SYNC").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// One fence a title queue, each with its own count: a fence signalled from several queues
+/// can go back (the later value's queue finishing first), and a wait for the higher value that
+/// begins after that never ends – with the title's next submit waiting for the sparse queue in
+/// turn (seen: both stood still, 28 s, then the title's watchdog).
+static SYNC_FENCES: Mutex<Option<std::collections::HashMap<usize, (ID3D12Fence, u64)>>> = Mutex::new(None);
+
+pub unsafe fn sync_after_execute(queue: &ID3D12CommandQueue) {
+    let sparse_queue = {
+        let g = STATE.lock().unwrap();
+        let Some(s) = g.as_ref() else { return };
+        s.queue.clone()
+    };
+    let key = queue.as_raw() as usize;
+    let mut g = SYNC_FENCES.lock().unwrap();
+    let m = g.get_or_insert_with(std::collections::HashMap::new);
+    if !m.contains_key(&key) {
+        let mut dev: Option<ID3D12Device> = None;
+        if queue.GetDevice(&mut dev).is_err() {
+            return;
+        }
+        let Some(dev) = dev else { return };
+        let Ok(f) = dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) else { return };
+        m.insert(key, (f, 0));
+    }
+    let (fence, value) = m.get_mut(&key).unwrap();
+    *value += 1;
+    if queue.Signal(&*fence, *value).is_ok() {
+        let _ = sparse_queue.Wait(&*fence, *value);
+    }
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+        crate::xlog_info!("sparse: XCL_SPARSE_SYNC=1 – the sparse queue waits for a title queue after each of its submits (a fence a queue)");
+    }
+}
+
 pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usize, usize)]) {
     if ranges.is_empty() {
         return;

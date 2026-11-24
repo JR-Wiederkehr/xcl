@@ -327,13 +327,19 @@ pub fn resolve_wait(pso: usize) -> usize {
         if !p.sent.swap(true, Ordering::AcqRel) {
             let _ = queue().lock().unwrap().send(p.clone());
         }
-        let ms = if p.waited.swap(true, Ordering::AcqRel) || !may_wait() { 0 } else { limit };
+        // (a pipeline is waited for once – when there was something left to wait with)
+        let ms = match wait_allowance(limit) {
+            0 => 0,
+            _ if p.waited.swap(true, Ordering::AcqRel) => 0,
+            ms => ms,
+        };
+        let t0 = std::time::Instant::now();
         let done = p.done.lock().unwrap();
         let (done, _) = p.cv.wait_timeout_while(done, std::time::Duration::from_millis(ms), |d| !*d).unwrap();
+        if ms > 0 {
+            waited(t0.elapsed());
+        }
         if !*done {
-            if ms > 0 {
-                waited_in_vain();
-            }
             static N: AtomicUsize = AtomicUsize::new(0);
             let n = N.fetch_add(1, Ordering::Relaxed) + 1;
             if n.is_power_of_two() {
@@ -347,23 +353,32 @@ pub fn resolve_wait(pso: usize) -> usize {
     }
 }
 
-/// The waits above are for one pipeline that is nearly done. When a title's frame uses hundreds
-/// of pipelines for the first time (a retail title's first frame of its world), a wait for each
-/// is tens of seconds on its render thread with nothing presented, and its watchdog ends it: a
-/// wait that ran out stops all waits for `QUIET_MS`.
-const QUIET_MS: u64 = 2000;
-static LAST_VAIN_WAIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The waits above are for a pipeline that is nearly done, and a title's frame may use hundreds
+/// for the first time (a retail title's first frames of its world): a wait of the full limit
+/// for each is tens of seconds on its render thread with nothing presented, and its watchdog
+/// ends it – while no wait at all skips draws and dispatches whose pipelines would have been
+/// there in a few milliseconds (their blobs are on disk), and what those dispatches compute is
+/// missing when the title reads it. So the waits share an allowance of time: `WAIT_POOL_MS` at
+/// most, refilled by `WAIT_REFILL_MS` a second; each wait takes what it used.
+const WAIT_POOL_MS: i64 = 1500;
+const WAIT_REFILL_MS: i64 = 500;
+/// (milliseconds left, time of the last refill in ms)
+static WAIT_POOL: Mutex<(i64, u64)> = Mutex::new((WAIT_POOL_MS, 0));
 
-fn now_ms() -> u64 {
-    (crate::log::uptime() * 1000.0) as u64 + QUIET_MS + 1
+/// How long a wait may take now: up to `limit` ms, 0 when the allowance is used up.
+fn wait_allowance(limit: u64) -> u64 {
+    let now = (crate::log::uptime() * 1000.0) as u64;
+    let mut g = WAIT_POOL.lock().unwrap();
+    let add = (now.saturating_sub(g.1) as i64).saturating_mul(WAIT_REFILL_MS) / 1000;
+    if add > 0 {
+        g.0 = (g.0 + add).min(WAIT_POOL_MS);
+        g.1 = now;
+    }
+    g.0.clamp(0, limit as i64) as u64
 }
 
-fn may_wait() -> bool {
-    now_ms().saturating_sub(LAST_VAIN_WAIT.load(Ordering::Relaxed)) > QUIET_MS
-}
-
-fn waited_in_vain() {
-    LAST_VAIN_WAIT.store(now_ms(), Ordering::Relaxed);
+fn waited(took: std::time::Duration) {
+    WAIT_POOL.lock().unwrap().0 -= took.as_millis() as i64;
 }
 
 /// For a draw: the real pipeline if it is built, else the stand-in (which draws nothing) – after
@@ -384,12 +399,16 @@ pub fn resolve_for_draw(pso: usize) -> usize {
     }
     static WAIT: OnceLock<u64> = OnceLock::new();
     let ms = *WAIT.get_or_init(|| std::env::var("XCL_PSO_DRAW_WAIT_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(250));
-    if ms > 0 && !p.draw_waited.swap(true, Ordering::AcqRel) && may_wait() {
+    let ms = match wait_allowance(ms) {
+        0 => 0,
+        _ if p.draw_waited.swap(true, Ordering::AcqRel) => 0,
+        ms => ms,
+    };
+    if ms > 0 {
+        let t0 = std::time::Instant::now();
         let done = p.done.lock().unwrap();
-        let (done, _) = p.cv.wait_timeout_while(done, std::time::Duration::from_millis(ms), |d| !*d).unwrap();
-        if !*done {
-            waited_in_vain();
-        }
+        let _ = p.cv.wait_timeout_while(done, std::time::Duration::from_millis(ms), |d| !*d).unwrap();
+        waited(t0.elapsed());
     }
     match p.real.load(Ordering::Acquire) {
         0 => {
