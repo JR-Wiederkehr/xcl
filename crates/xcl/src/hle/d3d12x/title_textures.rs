@@ -1538,8 +1538,21 @@ fn unchanged_skip() -> bool {
     *ON.get_or_init(|| std::env::var("XCL_TEXTURE_SKIP_UNCHANGED").map_or(true, |v| v.trim() != "0"))
 }
 
-/// bytes of the textures in one batch at most
-const BATCH_BYTES: usize = 256 << 20;
+/// bytes and textures of one batch at most: a batch's upload buffer is kept at its size, and each GPU
+/// copy list stays short enough for the 2 s a driver gives one, when thousands of small textures
+/// stream at once
+const BATCH_BYTES: usize = 32 << 20;
+const BATCH_ITEMS: usize = 256;
+
+/// Whether another upload `(next_dev, next_bytes)` still fits in the current batch of
+/// `picked_count` textures totalling `picked_bytes` on `batch_dev`. An empty batch always takes
+/// its first upload (even if larger than `BATCH_BYTES`) so progress is guaranteed.
+fn batch_fits(picked_count: usize, picked_bytes: usize, batch_dev: usize, next_dev: usize, next_bytes: usize) -> bool {
+    picked_count == 0
+        || (picked_count < BATCH_ITEMS
+            && next_dev == batch_dev
+            && picked_bytes.saturating_add(next_bytes) <= BATCH_BYTES)
+}
 
 struct QueueUploads {
     fence: ID3D12Fence,
@@ -1700,7 +1713,7 @@ fn all_hot(src: usize, size: usize) -> bool {
 }
 
 /// What changed of the textures `todo` (written pages: `dirty`, sorted) goes up, in batches of up to
-/// `BATCH_BYTES` (one list each).
+/// `BATCH_BYTES` and `BATCH_ITEMS` (one list each).
 unsafe fn upload_all(todo: Vec<Due>, dirty: &[usize], page: usize, title: Option<&ID3D12CommandQueue>) {
     static N: AtomicU64 = AtomicU64::new(0);
     let warn = |e: &str| {
@@ -1766,7 +1779,7 @@ unsafe fn upload_all(todo: Vec<Due>, dirty: &[usize], page: usize, title: Option
     while todo.peek().is_some() {
         let (mut items, mut known): (Vec<texture_upload::Item>, Vec<texture_upload::Known>) = (Vec::new(), Vec::new());
         let (mut bytes, mut device) = (0usize, 0usize);
-        while let Some((d, changed, n)) = todo.next_if(|(d, _, n)| items.is_empty() || (bytes + n <= BATCH_BYTES && d.device == device)) {
+        while let Some((d, changed, n)) = todo.next_if(|(d, _, n)| batch_fits(items.len(), bytes, device, d.device, *n)) {
             device = d.device;
             bytes += n;
             if changed.is_none() {
@@ -3106,8 +3119,24 @@ pub(super) mod tests {
                     if !placed {
                         println!("{label}: not reserved on this adapter (committed instead)");
                     }
-                } else if !is_3d || opts.TiledResourcesTier.0 >= D3D12_TILED_RESOURCES_TIER_3.0 {
+                } else if (!is_3d || opts.TiledResourcesTier.0 >= D3D12_TILED_RESOURCES_TIER_3.0)
+                    && !(is_3d
+                        && xg::Texture::new(&d)
+                            .unwrap()
+                            .texels()
+                            .is_some_and(|s| s.first_tail < s.chain.levels.len()))
+                {
                     assert!(placed, "{label} should use shared vram::Pages");
+                } else if is_3d
+                    && xg::Texture::new(&d)
+                        .unwrap()
+                        .texels()
+                        .is_some_and(|s| s.first_tail < s.chain.levels.len())
+                {
+                    assert!(
+                        !placed,
+                        "{label} has an XG packed mip tail; use the committed detile/upload path"
+                    );
                 }
                 write_tiled(base, &d, 0x71);
                 refresh(queue.as_raw());
@@ -3201,5 +3230,25 @@ pub(super) mod tests {
             mutator.join().unwrap();
             VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
         }
+    }
+
+    #[test]
+    fn batch_fits_caps_items_bytes_and_device() {
+        // Empty batch always accepts its first upload, even when larger than BATCH_BYTES.
+        assert!(batch_fits(0, 0, 0, 1, BATCH_BYTES + 4096));
+        // Once an oversized texture is in the batch, the next upload starts a new batch.
+        assert!(!batch_fits(1, BATCH_BYTES + 4096, 1, 1, 4096));
+
+        // Many tiny textures split at BATCH_ITEMS even when well below BATCH_BYTES.
+        assert!(batch_fits(BATCH_ITEMS - 1, (BATCH_ITEMS - 1) * 4096, 1, 1, 4096));
+        assert!(!batch_fits(BATCH_ITEMS, BATCH_ITEMS * 4096, 1, 1, 4096));
+
+        // Byte cap accepts exact BATCH_BYTES, splits past it, and does not overflow.
+        assert!(batch_fits(1, BATCH_BYTES - 4096, 1, 1, 4096));
+        assert!(!batch_fits(1, BATCH_BYTES - 4096, 1, 1, 4097));
+        assert!(!batch_fits(1, usize::MAX - 10, 1, 1, 100));
+
+        // Different device always starts a new batch.
+        assert!(!batch_fits(1, 4096, 1, 2, 4096));
     }
 }

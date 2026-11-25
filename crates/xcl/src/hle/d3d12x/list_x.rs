@@ -1633,8 +1633,7 @@ pub(super) unsafe fn break_cycles_before_title_signal(sig_q: usize, title_fence:
 }
 
 fn wake_sync_watchdog() {
-    let pair = SYNC_WATCHDOG_WAKE.get_or_init(|| {
-        let pair = (Mutex::new(()), Condvar::new());
+    let pair = sync_watchdog_pair(&SYNC_WATCHDOG_WAKE, || {
         let _ = std::thread::Builder::new().name("xcl-sync-watchdog".into()).spawn(|| loop {
             let (lock, cv) = SYNC_WATCHDOG_WAKE.get().unwrap();
             let guard = lock.lock().unwrap();
@@ -1751,9 +1750,22 @@ fn wake_sync_watchdog() {
                 }
             }
         });
-        pair
     });
     pair.1.notify_one();
+}
+
+/// The watchdog's wake pair. The first call makes it and then starts the thread with `spawn`:
+/// the thread may run before `spawn` returns, and it needs the pair first.
+fn sync_watchdog_pair(wake: &OnceLock<(Mutex<()>, Condvar)>, spawn: impl FnOnce()) -> &(Mutex<()>, Condvar) {
+    let mut first = false;
+    let pair = wake.get_or_init(|| {
+        first = true;
+        (Mutex::new(()), Condvar::new())
+    });
+    if first {
+        spawn();
+    }
+    pair
 }
 
 unsafe fn queue_device_and_type(queue: *mut c_void) -> Option<(ID3D12Device, usize, D3D12_COMMAND_LIST_TYPE)> {
@@ -3919,7 +3931,7 @@ pub(super) unsafe extern "system" fn ia_set_vertex_buffers_x(this: *mut c_void, 
                     let data = (title != 0 && crate::gpu::shader::readable(title as usize, n)).then(|| std::slice::from_raw_parts(title as *const u8, n).iter().filter(|&&b| b != 0).count());
                     let win = crate::gpu::uma::get().and_then(|u| u.window_of(title as usize).map(|w| (w, u.window(w), u.is_sparse(title as usize))));
                     let mut mbi: windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
-                    let q = windows_sys::Win32::System::Memory::VirtualQuery(title as *const c_void, &mut mbi, std::mem::size_of_val(&mbi));
+                    let q = crate::hle::kernelx::VirtualQuery(title as *const c_void, &mut mbi, std::mem::size_of_val(&mbi));
                     crate::xlog_info!(
                         "frame trace: vertex buffer #{i} slot {}: title {title:#x} → PC {:#x}, {} bytes, stride {}; non-zero in the first {n} bytes (CPU view): {data:?}; window (index, (base, size), sparse) {win:x?}; memory state {:#x} protect {:#x} (query {q})",
                         start + k as u32,
@@ -6010,6 +6022,17 @@ mod tests {
             assert_eq!(cpu_comp, 0x1122_3344_0000_0677, "COMPUTE WriteBufferImmediate must be visible to CPU (gpu={gpu_comp:#x})");
             assert_eq!(cpu_copy, 0xCAFE_BABE_DEAD_BEEF, "DIRECT CopyBufferRegion must be visible to CPU (gpu={gpu_copy:#x})");
         }
+    }
+
+    #[test]
+    fn sync_watchdog_pair_is_set_before_the_thread_starts() {
+        static WAKE: OnceLock<(Mutex<()>, Condvar)> = OnceLock::new();
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            // the thread runs its first line before the spawn returns
+            sync_watchdog_pair(&WAKE, || seen.push(std::thread::spawn(|| WAKE.get().is_some()).join().unwrap()));
+        }
+        assert_eq!(seen, [true]);
     }
 
     /// Submitting a DIRECT list with `Wait64BitValueX(va, >=, 0x677)` BEFORE submitting the

@@ -682,8 +682,19 @@ unsafe impl Send for Job {}
 static FREE: Mutex<Vec<Job>> = Mutex::new(Vec::new());
 /// the smallest upload buffer made, and the most bytes of them kept
 const BUFFER_MIN: u64 = 1 << 20;
-/// buffers up to this size are powers of two (few sizes, so one fits again)
-const POWERS_TO: u64 = 64 << 20;
+
+/// The size of the buffer made for `bytes`: up to 64 MiB a power of two (few sizes, so one fits
+/// again), then the next 16 MiB.
+fn capacity(bytes: u64) -> Option<u64> {
+    const LARGE: u64 = 64 << 20;
+    const STEP: u64 = 16 << 20;
+    if bytes <= LARGE {
+        Some(bytes.max(BUFFER_MIN).next_power_of_two())
+    } else {
+        bytes.checked_next_multiple_of(STEP)
+    }
+}
+
 const FREE_BYTES: u64 = 512 << 20;
 
 /// A job whose buffer takes `bytes` bytes.
@@ -697,7 +708,7 @@ unsafe fn take(dev: &ID3D12Device, bytes: u64) -> Result<Job, String> {
         }
     }
     let e = |x: windows::core::Error| format!("texture upload: {x}");
-    let cap = if bytes <= POWERS_TO { bytes.max(BUFFER_MIN).next_power_of_two() } else { bytes.next_multiple_of(POWERS_TO / 4) };
+    let cap = capacity(bytes).ok_or("texture upload buffer size overflow")?;
     let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
     let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(e)?;
     list.Close().map_err(e)?;
@@ -1126,6 +1137,17 @@ mod tests {
             }
             assert!(!sent(&known, None, &at(own, &fo, 10), 0));
         }
+    }
+
+    #[test]
+    fn large_buffers_grow_in_steps_of_sixteen_mib() {
+        let mib = 1 << 20;
+        assert_eq!(capacity(1), Some(mib));
+        assert_eq!(capacity(33 * mib), Some(64 * mib));
+        assert_eq!(capacity(64 * mib + 1), Some(80 * mib));
+        assert_eq!(capacity(138_713_408), Some(144 * mib));
+        assert_eq!(capacity(256 * mib + 1), Some(272 * mib));
+        assert_eq!(capacity(u64::MAX), None);
     }
 
     /// A page the title decommits while it is read (or that never was committed) reads as zeros.
