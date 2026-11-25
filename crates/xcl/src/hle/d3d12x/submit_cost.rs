@@ -76,6 +76,12 @@ pub(super) fn textures_uploaded(textures: usize, bytes: usize, took: Duration) {
 /// A whole submit (from the hook's entry) is done.
 pub(super) fn done(t0: Instant) {
     add(TOTAL, t0.elapsed());
+    // `XCL_LOOK_STATS=2`: the title's submits for `api_cost` (and the thread that makes them),
+    // not XCL's own ones inside a submit or a present: those are in that one's time
+    if super::look_stats::deep() && !super::title_textures::is_own_work() && !super::present::presenting() {
+        crate::hle::api_cost::note_submitter();
+        crate::hle::api_cost::add(crate::hle::api_cost::Call::Submit, t0.elapsed());
+    }
     let n = SUM[N].fetch_add(1, Ordering::Relaxed) + 1;
     if n % 1024 != 0 {
         return;

@@ -336,6 +336,8 @@ pub(super) struct Pair {
 
 /// Before the PC call of an op of console code on `list` (`pso`: its pipeline as bound).
 pub(super) unsafe fn begin(list: *mut c_void, pso: usize, kind: Kind, size: [u32; 3]) -> Option<Pair> {
+    // (every draw and dispatch with a translated pipeline comes by here: the ring of the last ones)
+    super::watch::note(pso, kind as u8 + 1, size);
     if !on() || list.is_null() {
         return None;
     }

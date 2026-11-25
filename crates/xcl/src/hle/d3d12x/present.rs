@@ -17,12 +17,15 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering};
-use std::sync::{Mutex, Once};
+use std::mem::ManuallyDrop;
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
+use std::sync::{Mutex, Once, OnceLock};
 use std::time::{Duration, Instant};
 
-use windows::core::{Interface, HSTRING, PCWSTR};
+use windows::core::{Interface, HSTRING, PCSTR, PCWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Direct3D::{D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob};
+use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
@@ -49,6 +52,8 @@ static PRESENTX_LOCK: Mutex<()> = Mutex::new(());
 /// command queue #30 PresentX(planeCount, planes, parameters): plane 0's first resource is
 /// the frame; S_OK always (a console present does not fail for the title).
 pub unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, planes: *const u8, _params: *const u8) -> i32 {
+    // (`XCL_LOOK_STATS=2`: a frame's time on the thread that submits, added up)
+    let _cost = super::look_stats::deep().then(|| crate::hle::api_cost::time(crate::hle::api_cost::Call::Present));
     if plane_count == 0 || planes.is_null() || !crate::gpu::shader::readable(planes as usize, 0x18) {
         return 0;
     }
@@ -61,8 +66,58 @@ pub unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, pl
     0
 }
 
+const PLANE_STRIDE: usize = 0x48;
+const MAX_PLANES: usize = 8;
+
+/// Read `(resource, pSourceRect)` pairs from `PresentX`'s `D3D12XBOX_PRESENT_PLANE_PARAMETERS` array.
+unsafe fn extract_planes(plane_count: u32, planes: *const u8) -> Vec<(usize, Option<[i32; 4]>)> {
+    let mut out = Vec::new();
+    for i in 0..(plane_count as usize).min(MAX_PLANES) {
+        let plane = planes.add(i * PLANE_STRIDE);
+        if !crate::gpu::shader::readable(plane as usize, 0x18) {
+            break;
+        }
+        let count = (plane.add(8) as *const u32).read_unaligned();
+        let list = (plane.add(0x10) as *const usize).read_unaligned();
+        if count == 0 || !crate::gpu::shader::readable(list, 8) {
+            continue;
+        }
+        let res = (list as *const usize).read_unaligned();
+        if res == 0 {
+            continue;
+        }
+        let source_rect = if crate::gpu::shader::readable(plane as usize, 0x20) {
+            let rect_ptr = (plane.add(0x18) as *const usize).read_unaligned();
+            if rect_ptr != 0 && crate::gpu::shader::readable(rect_ptr, 16) {
+                Some([
+                    (rect_ptr as *const i32).read_unaligned(),
+                    ((rect_ptr + 4) as *const i32).read_unaligned(),
+                    ((rect_ptr + 8) as *const i32).read_unaligned(),
+                    ((rect_ptr + 12) as *const i32).read_unaligned(),
+                ])
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        out.push((res, source_rect));
+    }
+    out
+}
+
+fn source_uv_rect(rect: Option<[i32; 4]>, w: u32, h: u32) -> [f32; 4] {
+    if let Some([l, t, r, b]) = rect {
+        if w > 0 && h > 0 && l >= 0 && t >= 0 && r > l && b > t && r <= w as i32 && b <= h as i32 {
+            return [l as f32 / w as f32, t as f32 / h as f32, r as f32 / w as f32, b as f32 / h as f32];
+        }
+    }
+    [0.0, 0.0, 1.0, 1.0]
+}
+
 unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u8) {
     let frames = BOUNDARIES.fetch_add(1, Ordering::Relaxed) + 1;
+    super::targets::frame_end();
     if frames % 300 == 0 {
         // the title's frame rate, for comparing runs (every 300 frames)
         static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
@@ -80,26 +135,24 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
         // plane over the game's): logged with the planes' raw words
         static LAST: AtomicU64 = AtomicU64::new(1);
         if LAST.swap(plane_count as u64, Ordering::Relaxed) != plane_count as u64 {
-            let n = 8 * plane_count as usize;
+            let n = (PLANE_STRIDE / 8) * plane_count as usize;
             let words: Vec<u64> = if crate::gpu::shader::readable(planes as usize, 8 * n) { (0..n).map(|k| (planes as *const u64).add(k).read_unaligned()).collect() } else { Vec::new() };
             crate::xlog_info!("D3D12.X: PresentX now with {plane_count} plane(s): {words:x?}");
         }
     }
-    let count = (planes.add(8) as *const u32).read_unaligned();
-    let list = (planes.add(0x10) as *const usize).read_unaligned();
-    if count == 0 || !crate::gpu::shader::readable(list, 8) || !enabled() {
-        return;
-    }
-    let res = (list as *const usize).read_unaligned();
-    if res == 0 {
+    let extracted = extract_planes(plane_count, planes);
+    if extracted.is_empty() || !enabled() {
         return;
     }
     {
         let mut p = PRESENTED.lock().unwrap();
-        if !p.contains(&res) {
-            p.push(res);
+        for &(res, _) in &extracted {
+            if !p.contains(&res) {
+                p.push(res);
+            }
         }
     }
+    let res = extracted[0].0;
     if trace_frame() {
         super::list_x::dump_pending_geometry();
     }
@@ -125,7 +178,7 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
             crate::xlog_info!("frame trace: PresentX #{n} of {res:#x} {:?} – rt binds {}, UAV views {}, copy destination {}, clears {}; most used: {}", d, u[0], u[1], u[2], u[3], busiest.join("; "));
         }
     }
-    present_now(Duration::ZERO, Some((queue as usize, res)));
+    present_now(Duration::ZERO, Some((queue as usize, extracted)));
 }
 
 thread_local! {
@@ -200,6 +253,15 @@ pub fn is_presented(res: usize) -> bool {
 /// the resource an RTV handle names (render-target binds)
 pub fn rtv_resource(handle: usize) -> Option<usize> {
     RTVS.lock().unwrap().as_ref()?.get(&handle).copied()
+}
+
+/// The resource `r` while a view still names it (AddRef'd), for `XCL_DUMP_TARGETS`.
+pub(super) unsafe fn view_resource(r: usize) -> Option<ID3D12Resource> {
+    let g = RTVS.lock().unwrap();
+    if !g.as_ref()?.values().any(|&v| v == r) {
+        return None;
+    }
+    ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).cloned()
 }
 
 /// The resource bound as render target 0 on `list` (`XCL_TRACE_FRAME`).
@@ -305,6 +367,7 @@ pub fn on_queue_console_method(_info: &StubInfo, _caller: usize) {
     }
     BOUNDARIES.fetch_add(1, Ordering::Relaxed);
     LAST_BOUNDARY_MS.store(now_ms(), Ordering::Relaxed);
+    let _cost = super::look_stats::deep().then(|| crate::hle::api_cost::time(crate::hle::api_cost::Call::Present));
     unsafe { present_now(Duration::from_millis(4), None) };
 }
 
@@ -524,6 +587,322 @@ fn ensure_window() -> Option<HWND> {
 // presenter
 // ---------------------------------------------------------------------------------------
 
+/// Number of in-flight present command allocators (`XCL_PRESENT_SYNC=1` drops to 1).
+const PRESENT_SLOTS: usize = 2;
+/// Swap chain buffer count (triple buffered so frame N copies into a free buffer while frame N-1
+/// finishes on the GPU and an earlier buffer scans out).
+const SWAP_BUFFERS: u32 = 3;
+
+/// Pipelined fence ring tracking which submitted present fence owns each command-allocator slot.
+/// With `slots == 2`, presenting frame `N` waits only for frame `N - 2` (overlapping CPU/GPU work
+/// across frames `N - 1` and `N`), while resize, queue switch, and `XCL_FRAME_DUMP` readbacks
+/// drain all slots cleanly.
+struct PresentRing {
+    slot_fences: Vec<u64>,
+    cur: usize,
+    recorded_value: u64,
+}
+
+impl PresentRing {
+    fn new(slots: usize) -> Self {
+        Self { slot_fences: vec![0; slots.max(1)], cur: 0, recorded_value: 0 }
+    }
+
+    /// Observe `presenter_value` (`Presenter.value`) before starting the next present.
+    /// If a new submission occurred since our last call (`presenter_value > recorded_value`),
+    /// attaches `presenter_value` to the previous slot, rotates to the next slot, and returns
+    /// `(slot_to_use, fence_to_wait, rotated_from_prev)`.
+    fn begin_present(&mut self, presenter_value: u64) -> (usize, u64, Option<usize>) {
+        if presenter_value > self.recorded_value {
+            let prev = self.cur;
+            self.slot_fences[prev] = presenter_value;
+            self.recorded_value = presenter_value;
+            let next = (prev + 1) % self.slot_fences.len();
+            self.cur = next;
+            let rotated = (next != prev).then_some(prev);
+            return (next, self.slot_fences[next], rotated);
+        }
+        (self.cur, self.slot_fences[self.cur], None)
+    }
+
+    fn mark_slot_reusable(&mut self, slot: usize) {
+        self.slot_fences[slot] = 0;
+    }
+
+    /// Mark all slots idle after draining up to `drained_value` (resize / queue switch / dump).
+    fn mark_all_drained(&mut self, drained_value: u64) {
+        self.slot_fences.fill(0);
+        if drained_value > self.recorded_value {
+            self.recorded_value = drained_value;
+        }
+    }
+}
+
+fn present_slot_count() -> usize {
+    if std::env::var("XCL_PRESENT_SYNC").is_ok_and(|v| v.trim() == "1") {
+        1
+    } else {
+        PRESENT_SLOTS
+    }
+}
+
+unsafe fn prepare_pipelined_slot(p: &mut Presenter, is_present_x: bool) -> Result<(), FenceError> {
+    let (slot, wait_val, rotated) = p.ring.begin_present(p.value);
+    if let Some(prev) = rotated {
+        p.slot_sources[prev] = std::mem::take(&mut p.copy_sources);
+        // If frame N-1 had an XCL_FRAME_DUMP wait timeout, keep its readback buffers alive on
+        // slot `prev` until that slot's fence completes (preventing GPU UAF).
+        p.slot_dumps[prev] = std::mem::take(&mut p.dumps);
+        if let Some(spare) = p.spare_alloc.as_mut() {
+            std::mem::swap(&mut p.alloc, spare);
+        }
+    }
+    if wait_val > 0 {
+        let timeout_ms = if is_present_x { 2000 } else { 100 };
+        fence::wait(&p.fence, wait_val, &p.dev, Some(p.event), timeout_ms)?;
+        p.ring.mark_slot_reusable(slot);
+        p.slot_sources[slot].clear();
+        p.slot_dumps[slot].clear();
+    }
+    Ok(())
+}
+
+fn mark_pipe_drained(p: &mut Presenter) {
+    p.ring.mark_all_drained(p.value);
+    for s in &mut p.slot_sources {
+        s.clear();
+    }
+    for d in &mut p.slot_dumps {
+        d.clear();
+    }
+}
+
+fn compile_fx(src: &str, target: &str) -> Option<Vec<u8>> {
+    unsafe {
+        let mut blob: Option<ID3DBlob> = None;
+        let t = format!("{target}\0");
+        let r = D3DCompile(
+            src.as_ptr() as *const c_void,
+            src.len(),
+            PCSTR::null(),
+            None,
+            None,
+            PCSTR(b"main\0".as_ptr()),
+            PCSTR(t.as_ptr()),
+            0,
+            0,
+            &mut blob,
+            None,
+        );
+        match (r, blob) {
+            (Ok(()), Some(b)) => Some(std::slice::from_raw_parts(b.GetBufferPointer() as *const u8, b.GetBufferSize()).to_vec()),
+            _ => None,
+        }
+    }
+}
+
+fn compositor_shaders() -> Option<&'static (Vec<u8>, Vec<u8>)> {
+    static S: OnceLock<Option<(Vec<u8>, Vec<u8>)>> = OnceLock::new();
+    S.get_or_init(|| {
+        let vs = compile_fx(
+            "cbuffer Rect : register(b0) { float4 uv_rect; };\n\
+             struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n\
+             VSOut main(uint id : SV_VertexID) {\n\
+                 float2 p = float2((id & 1) ? 3.0 : -1.0, (id & 2) ? -3.0 : 1.0);\n\
+                 float2 t = float2((id & 1) ? 2.0 : 0.0, (id & 2) ? 2.0 : 0.0);\n\
+                 VSOut o;\n\
+                 o.pos = float4(p, 0.0, 1.0);\n\
+                 o.uv = lerp(uv_rect.xy, uv_rect.zw, t);\n\
+                 return o;\n\
+             }",
+            "vs_5_0",
+        )?;
+        let ps = compile_fx(
+            "Texture2D tex : register(t0);\n\
+             SamplerState smp : register(s0);\n\
+             float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {\n\
+                 return tex.Sample(smp, uv);\n\
+             }",
+            "ps_5_0",
+        )?;
+        Some((vs, ps))
+    })
+    .as_ref()
+}
+
+struct Compositor {
+    root_sig: ID3D12RootSignature,
+    psos: HashMap<i32, (ID3D12PipelineState, ID3D12PipelineState)>,
+    rtv_heap: ID3D12DescriptorHeap,
+    srv_heap: ID3D12DescriptorHeap,
+    srv_inc: u32,
+}
+
+impl Compositor {
+    unsafe fn new(dev: &ID3D12Device) -> Option<Self> {
+        let range = D3D12_DESCRIPTOR_RANGE {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+            NumDescriptors: 1,
+            BaseShaderRegister: 0,
+            RegisterSpace: 0,
+            OffsetInDescriptorsFromTableStart: 0,
+        };
+        let params = [
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: 0, Num32BitValues: 4 },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_VERTEX,
+            },
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE { NumDescriptorRanges: 1, pDescriptorRanges: &range },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+            },
+        ];
+        let sampler = D3D12_STATIC_SAMPLER_DESC {
+            Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+            AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            MaxLOD: f32::MAX,
+            ShaderRegister: 0,
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+            ..Default::default()
+        };
+        let rs_desc = D3D12_ROOT_SIGNATURE_DESC {
+            NumParameters: params.len() as u32,
+            pParameters: params.as_ptr(),
+            NumStaticSamplers: 1,
+            pStaticSamplers: &sampler,
+            Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
+        };
+        let mut ser: Option<ID3DBlob> = None;
+        D3D12SerializeRootSignature(&rs_desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut ser, None).ok()?;
+        let ser = ser?;
+        let root_sig: ID3D12RootSignature = dev
+            .CreateRootSignature(0, std::slice::from_raw_parts(ser.GetBufferPointer() as *const u8, ser.GetBufferSize()))
+            .ok()?;
+        let rtv_heap: ID3D12DescriptorHeap = dev
+            .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV, NumDescriptors: 1, ..Default::default() })
+            .ok()?;
+        let srv_heap: ID3D12DescriptorHeap = dev
+            .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                // a set per present in flight: the GPU still reads the last one's
+                NumDescriptors: (MAX_PLANES * PRESENT_SLOTS) as u32,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                ..Default::default()
+            })
+            .ok()?;
+        let srv_inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        Some(Self { root_sig, psos: HashMap::new(), rtv_heap, srv_heap, srv_inc })
+    }
+
+    unsafe fn psos_for(&mut self, dev: &ID3D12Device, fmt: DXGI_FORMAT) -> Option<(ID3D12PipelineState, ID3D12PipelineState)> {
+        if let Some(pair) = self.psos.get(&fmt.0) {
+            return Some(pair.clone());
+        }
+        let (vs, ps) = compositor_shaders()?;
+        let make_pso = |blend: bool| -> Option<ID3D12PipelineState> {
+            let mut pd = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                pRootSignature: ManuallyDrop::new(Some(self.root_sig.clone())),
+                VS: D3D12_SHADER_BYTECODE { pShaderBytecode: vs.as_ptr() as _, BytecodeLength: vs.len() },
+                PS: D3D12_SHADER_BYTECODE { pShaderBytecode: ps.as_ptr() as _, BytecodeLength: ps.len() },
+                SampleMask: u32::MAX,
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                NumRenderTargets: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                ..Default::default()
+            };
+            pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+            pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+            pd.RasterizerState.DepthClipEnable = false.into();
+            pd.DepthStencilState.DepthEnable = false.into();
+            pd.DepthStencilState.StencilEnable = false.into();
+            pd.RTVFormats[0] = fmt;
+            let rt = &mut pd.BlendState.RenderTarget[0];
+            rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
+            if blend {
+                rt.BlendEnable = true.into();
+                rt.SrcBlend = D3D12_BLEND_ONE;
+                rt.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+                rt.BlendOp = D3D12_BLEND_OP_ADD;
+                rt.SrcBlendAlpha = D3D12_BLEND_ONE;
+                rt.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+                rt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+            } else {
+                rt.BlendEnable = false.into();
+            }
+            dev.CreateGraphicsPipelineState(&pd).ok()
+        };
+        let pair = (make_pso(false)?, make_pso(true)?);
+        self.psos.insert(fmt.0, pair.clone());
+        Some(pair)
+    }
+
+    unsafe fn record(
+        &mut self,
+        dev: &ID3D12Device,
+        list: &ID3D12GraphicsCommandList,
+        dst: &ID3D12Resource,
+        dst_w: u32,
+        dst_h: u32,
+        dst_fmt: DXGI_FORMAT,
+        planes: &[(ID3D12Resource, D3D12_RESOURCE_DESC, [f32; 4])],
+        slot: usize,
+    ) -> bool {
+        let first = slot % PRESENT_SLOTS * MAX_PLANES;
+        let Some((opaque_pso, blend_pso)) = self.psos_for(dev, dst_fmt) else { return false };
+        let rtv_cpu = self.rtv_heap.GetCPUDescriptorHandleForHeapStart();
+        let rtv_desc = D3D12_RENDER_TARGET_VIEW_DESC {
+            Format: dst_fmt,
+            ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        dev.CreateRenderTargetView(dst, Some(&rtv_desc), rtv_cpu);
+        let srv_cpu_base = self.srv_heap.GetCPUDescriptorHandleForHeapStart();
+        for (i, (res, desc, _)) in planes.iter().take(MAX_PLANES).enumerate() {
+            let mut srv_cpu = srv_cpu_base;
+            srv_cpu.ptr += (first + i) * self.srv_inc as usize;
+            let mut srv_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: swap_format(desc.Format).unwrap_or(desc.Format),
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                ..Default::default()
+            };
+            srv_desc.Anonymous.Texture2D.MipLevels = 1;
+            dev.CreateShaderResourceView(res, Some(&srv_desc), srv_cpu);
+        }
+        list.OMSetRenderTargets(1, Some(&rtv_cpu), false, None);
+        list.RSSetViewports(&[D3D12_VIEWPORT {
+            TopLeftX: 0.0,
+            TopLeftY: 0.0,
+            Width: dst_w as f32,
+            Height: dst_h as f32,
+            MinDepth: 0.0,
+            MaxDepth: 1.0,
+        }]);
+        list.RSSetScissorRects(&[RECT { left: 0, top: 0, right: dst_w as i32, bottom: dst_h as i32 }]);
+        list.SetGraphicsRootSignature(&self.root_sig);
+        list.SetDescriptorHeaps(&[Some(self.srv_heap.clone())]);
+        list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        let srv_gpu_base = self.srv_heap.GetGPUDescriptorHandleForHeapStart();
+        for (i, (_, _, uv_rect)) in planes.iter().take(MAX_PLANES).enumerate() {
+            list.SetPipelineState(if i == 0 { &opaque_pso } else { &blend_pso });
+            list.SetGraphicsRoot32BitConstants(0, 4, uv_rect.as_ptr() as *const c_void, 0);
+            let mut gpu = srv_gpu_base;
+            gpu.ptr += ((first + i) as u64) * (self.srv_inc as u64);
+            list.SetGraphicsRootDescriptorTable(1, gpu);
+            list.DrawInstanced(3, 1, 0, 0);
+        }
+        true
+    }
+}
+
 struct Presenter {
     queue: usize,
     dev: ID3D12Device,
@@ -532,9 +911,14 @@ struct Presenter {
     h: u32,
     fmt: DXGI_FORMAT,
     alloc: ID3D12CommandAllocator,
+    spare_alloc: Option<ID3D12CommandAllocator>,
+    ring: PresentRing,
+    slot_sources: Vec<Vec<ID3D12Resource>>,
+    slot_dumps: Vec<Vec<FrameDump>>,
     list: ID3D12GraphicsCommandList,
     fence: ID3D12Fence,
-    copy_source: Option<ID3D12Resource>,
+    copy_sources: Vec<ID3D12Resource>,
+    compositor: Option<Compositor>,
     dumps: Vec<FrameDump>,
     disabled: bool,
     value: u64,
@@ -573,23 +957,41 @@ unsafe fn new_presenter(queue: usize) -> Option<Presenter> {
     let dev_raw = super::real::device_raw();
     let dev = ID3D12Device::from_raw_borrowed(&dev_raw)?;
     let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).ok()?;
+    let spare_alloc = if present_slot_count() > 1 {
+        dev.CreateCommandAllocator::<ID3D12CommandAllocator>(D3D12_COMMAND_LIST_TYPE_DIRECT).ok()
+    } else {
+        None
+    };
+    let actual_slots = if spare_alloc.is_some() { 2 } else { 1 };
     let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).ok()?;
     list.Close().ok()?;
     let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
     let event = CreateEventW(None, false, false, None).ok()?;
     Some(Presenter {
-        queue, dev: dev.clone(), sc: None, w: 0, h: 0, fmt: DXGI_FORMAT_UNKNOWN, alloc, list, fence,
-        copy_source: None, dumps: Vec::new(), disabled: false, value: 0, event,
+        queue, dev: dev.clone(), sc: None, w: 0, h: 0, fmt: DXGI_FORMAT_UNKNOWN,
+        alloc, spare_alloc, ring: PresentRing::new(actual_slots),
+        slot_sources: vec![Vec::new(); actual_slots], slot_dumps: (0..actual_slots).map(|_| Vec::new()).collect(),
+        list, fence,
+        copy_sources: Vec::new(), compositor: None, dumps: Vec::new(), disabled: false, value: 0, event,
         last: Instant::now() - Duration::from_secs(1),
     })
 }
 
 unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: DXGI_FORMAT) -> bool {
-    if let Some(sc) = &p.sc {
+    if let Some(sc) = p.sc.clone() {
         if p.w == w && p.h == h && p.fmt == fmt {
             return true;
         }
-        if sc.ResizeBuffers(2, w, h, fmt, DXGI_SWAP_CHAIN_FLAG(0)).is_ok() {
+        // Drain every in-flight present before ResizeBuffers so no GPU copy references old buffers.
+        if p.value > 0 {
+            if let Err(e) = fence::wait(&p.fence, p.value, &p.dev, Some(p.event), 2000) {
+                p.disabled = matches!(&e, FenceError::Removed(_));
+                crate::xlog_error!("present: drain before resize: {e}");
+                return false;
+            }
+            mark_pipe_drained(p);
+        }
+        if sc.ResizeBuffers(SWAP_BUFFERS, w, h, fmt, DXGI_SWAP_CHAIN_FLAG(0)).is_ok() {
             p.w = w;
             p.h = h;
             p.fmt = fmt;
@@ -607,7 +1009,7 @@ unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: D
         Format: fmt,
         SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
         BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-        BufferCount: 2,
+        BufferCount: SWAP_BUFFERS,
         Scaling: DXGI_SCALING_STRETCH,
         SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
         AlphaMode: DXGI_ALPHA_MODE_IGNORE,
@@ -630,7 +1032,7 @@ unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: D
     }
 }
 
-unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
+unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, Option<[i32; 4]>)>)>) {
     if IN_PRESENT.with(|c| c.replace(true)) {
         return;
     }
@@ -641,10 +1043,9 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
         }
     }
     let _reset = Reset;
-    let (queue, src, mut guard) = if let Some((queue, res)) = frame {
-        let raw = res as *mut c_void;
-        let Some(src) = ID3D12Resource::from_raw_borrowed(&raw) else { return };
-        (queue, src.clone(), PRESENTER.lock().unwrap())
+    let is_frame = frame.is_some();
+    let (queue, raw_planes, mut guard) = if let Some((queue, planes)) = frame {
+        (queue, planes, PRESENTER.lock().unwrap())
     } else {
         let Ok(guard) = PRESENTER.try_lock() else { return };
         if PRESENTX.load(Ordering::Relaxed) {
@@ -652,14 +1053,25 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
         }
         let candidate = CANDIDATE.lock().unwrap();
         let Some((queue, res)) = *candidate else { return };
-        let raw = res as *mut c_void;
-        let Some(src) = ID3D12Resource::from_raw_borrowed(&raw) else { return };
-        (queue, src.clone(), guard)
+        (queue, vec![(res, None)], guard)
     };
+    let resolved: Vec<(ID3D12Resource, D3D12_RESOURCE_DESC, [f32; 4])> = raw_planes
+        .into_iter()
+        .filter_map(|(res, rect)| {
+            let desc = backbuffer_like(res)?;
+            let raw = res as *mut c_void;
+            let r = ID3D12Resource::from_raw_borrowed(&raw)?.clone();
+            let uv = source_uv_rect(rect, desc.Width as u32, desc.Height);
+            Some((r, desc, uv))
+        })
+        .collect();
+    if resolved.is_empty() {
+        return;
+    }
     // PresentX on another queue than the presenter was made for (the fallback presented once from
     // a queue before the title's first PresentX, issue #103): the swap chain belongs to a queue –
     // a new presenter for the title's present queue, after the old one's copy is done
-    if frame.is_some() && guard.as_ref().is_some_and(|p| p.queue != queue) {
+    if is_frame && guard.as_ref().is_some_and(|p| p.queue != queue) {
         if let Some(old) = guard.as_ref() {
             let _ = fence::wait(&old.fence, old.value, &old.dev, Some(old.event), 1000);
         }
@@ -673,23 +1085,33 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     if p.disabled || p.last.elapsed() < min_interval {
         return;
     }
-    let Some(desc) = backbuffer_like(src.as_raw() as usize) else { return };
-    let Some(fmt) = swap_format(desc.Format) else { return };
+    let (w, h) = if resolved.len() == 1 {
+        (resolved[0].1.Width as u32, resolved[0].1.Height)
+    } else {
+        let mw = resolved.iter().map(|(_, d, _)| d.Width as u32).max().unwrap_or(0);
+        let mh = resolved.iter().map(|(_, d, _)| d.Height).max().unwrap_or(0);
+        (mw, mh)
+    };
+    let Some(fmt) = swap_format(resolved[0].1.Format) else { return };
     let Some(hwnd) = ensure_window() else { return };
     if p.queue != queue {
         return; // swap chain is bound to the first queue we presented from
     }
-    // wait for the previous copy so the allocator can be reused
-    if let Err(e) = fence::wait(&p.fence, p.value, &p.dev, Some(p.event), 100) {
+    // rotate to the oldest in-flight allocator slot and wait only for its fence (frame N-2)
+    let waited = {
+        let _cost = super::look_stats::deep().then(|| crate::hle::api_cost::time(crate::hle::api_cost::Call::PresentCopyWait));
+        prepare_pipelined_slot(p, is_frame)
+    };
+    if let Err(e) = waited {
         p.disabled = matches!(&e, FenceError::Removed(_));
         if !matches!(&e, FenceError::Timeout(_)) {
             crate::xlog_error!("present: previous copy: {e}");
         }
         return;
     }
-    p.copy_source = None;
+    p.copy_sources.clear();
     p.dumps.clear();
-    if !ensure_swapchain(p, hwnd, desc.Width as u32, desc.Height, fmt) {
+    if !ensure_swapchain(p, hwnd, w, h, fmt) {
         return;
     }
     let Some(sc) = p.sc.clone() else { return };
@@ -697,27 +1119,110 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     if p.alloc.Reset().is_err() || p.list.Reset(&p.alloc, None).is_err() {
         return;
     }
-    let b1 = [transition(&bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)];
-    p.list.ResourceBarrier(&b1);
-    p.list.CopyResource(&bb, &src);
-    let due = frame_dump_due();
+    // `XCL_DUMP_TARGETS`: a busy frame's render targets go with its picture (copied in the
+    // state the title left them, as `XCL_TRACE_FRAME`'s; its frame dump is also the
+    // `last_frame_dump` of the report)
+    let targets = super::targets::take_pending();
+    let dumping_targets = targets.is_some();
+    let due = frame_dump_due() || dumping_targets;
     let mut dumps = Vec::new();
-    if due {
-        if let Some((buffer, footprint)) = readback_copy(&p.list, &src, &desc) {
-            dumps.push(FrameDump { _source: src.clone(), buffer, footprint, format: desc.Format, tag: "frame".into() });
+    for (tag, res, d) in targets.map_or(Vec::new(), |f| super::targets::to_dump(PRESENTS.load(Ordering::Relaxed), &f)) {
+        if let Some((buffer, footprint)) = readback_copy(&p.list, &res, &d) {
+            dumps.push(FrameDump { _source: res, buffer, footprint, format: d.Format, tag });
         }
+    }
+    // and what each depth UAV twin holds (`depth_uav`; it rests in UNORDERED_ACCESS)
+    if dumping_targets {
+        for (tag, twin) in super::depth_uav::twins_to_dump() {
+            let d = twin.GetDesc();
+            p.list.ResourceBarrier(&[transition(&twin, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            let copied = readback_copy(&p.list, &twin, &d);
+            p.list.ResourceBarrier(&[transition(&twin, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+            if let Some((buffer, footprint)) = copied {
+                dumps.push(FrameDump { _source: twin, buffer, footprint, format: d.Format, tag });
+            }
+        }
+    }
+    let mut composited = false;
+    if resolved.len() > 1 {
+        if p.compositor.is_none() {
+            p.compositor = Compositor::new(&p.dev);
+        }
+        if let Some(comp) = p.compositor.as_mut() {
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if !LOGGED.swap(true, Ordering::Relaxed) {
+                let info: Vec<String> = resolved
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (_, d, uv))| format!("plane {i}: {}x{} {:?} uv {uv:?}", d.Width, d.Height, d.Format))
+                    .collect();
+                crate::xlog_info!("present: compositing {} planes into {w}x{h} {:?} ({})", resolved.len(), fmt, info.join(", "));
+            }
+            p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
+            if comp.record(&p.dev, &p.list, &bb, w, h, fmt, &resolved, p.ring.cur) {
+                if due {
+                    p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                    let bb_desc = bb.GetDesc();
+                    if let Some((buffer, footprint)) = readback_copy(&p.list, &bb, &bb_desc) {
+                        dumps.push(FrameDump { _source: bb.clone(), buffer, footprint, format: bb_desc.Format, tag: "frame".into() });
+                    }
+                    p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT)]);
+                } else {
+                    p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT)]);
+                }
+                composited = true;
+            } else {
+                p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT)]);
+            }
+        } else {
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                crate::xlog_warn!("present: compositor unavailable – falling back to plane 0");
+            }
+        }
+    }
+    if !composited {
+        let (src, desc, _) = &resolved[0];
+        let b1 = [transition(&bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)];
+        p.list.ResourceBarrier(&b1);
+        if desc.Width as u32 == p.w && desc.Height == p.h {
+            p.list.CopyResource(&bb, src);
+        } else if desc.Width > 0 && desc.Height > 0 && p.w > 0 && p.h > 0 {
+            let cw = (desc.Width as u32).min(p.w);
+            let ch = desc.Height.min(p.h);
+            let dst = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: ManuallyDrop::new(Some(bb.clone())),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            let src_loc = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: ManuallyDrop::new(Some(src.clone())),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            let box_ = D3D12_BOX { left: 0, top: 0, front: 0, right: cw, bottom: ch, back: 1 };
+            p.list.CopyTextureRegion(&dst, 0, 0, 0, &src_loc, Some(&box_));
+            let _ = ManuallyDrop::into_inner(dst.pResource);
+            let _ = ManuallyDrop::into_inner(src_loc.pResource);
+        }
+        if due {
+            if let Some((buffer, footprint)) = readback_copy(&p.list, src, desc) {
+                dumps.push(FrameDump { _source: src.clone(), buffer, footprint, format: desc.Format, tag: "frame".into() });
+            }
+        }
+        let b2 = [transition(&bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)];
+        p.list.ResourceBarrier(&b2);
     }
     // with `XCL_TRACE_FRAME`: also the render target the title binds most (its scene / UI)
     // (and the targets the watched one's contents went on to: rt_<n>_<k>)
     if due && trace_frame() {
         let busiest = busiest_rt();
         let followed = FOLLOWED.lock().unwrap();
+        // (a followed target is an address too: taken only while an RTV still holds it)
         let targets = busiest
             .into_iter()
-            .chain(followed.iter().copied())
-            .filter_map(|r| {
-                let rr = r as *mut c_void;
-                let res = ID3D12Resource::from_raw_borrowed(&rr)?.clone();
+            .chain(followed.iter().filter_map(|&r| view_resource(r)))
+            .filter_map(|res| {
                 let d = res.GetDesc();
                 if d.SampleDesc.Count > 1 {
                     return None;
@@ -730,8 +1235,6 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
             dumps.push(FrameDump { _source: res, buffer, footprint, format, tag });
         }
     }
-    let b2 = [transition(&bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)];
-    p.list.ResourceBarrier(&b2);
     if p.list.Close().is_err() {
         return;
     }
@@ -739,7 +1242,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&qraw) else { return };
     let Ok(cl) = p.list.cast::<ID3D12CommandList>() else { return };
     q.ExecuteCommandLists(&[Some(cl)]);
-    p.copy_source = Some(src);
+    p.copy_sources = resolved.into_iter().map(|(r, _, _)| r).collect();
     p.dumps = dumps;
     p.value += 1;
     if let Err(e) = q.Signal(&p.fence, p.value) {
@@ -749,7 +1252,14 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
         crate::xlog_error!("present: submit copy: {e}");
         return;
     }
-    if let Err(e) = sc.Present(0, DXGI_PRESENT(0)).ok() {
+    if dumping_targets {
+        super::targets::submitted();
+    }
+    let presented = {
+        let _in_driver = super::watch::in_driver(super::watch::Call::Present);
+        sc.Present(0, DXGI_PRESENT(0)).ok()
+    };
+    if let Err(e) = presented {
         let e = fence::api_error(&p.dev, "Present", e);
         p.disabled = matches!(&e, FenceError::Removed(_));
         crate::xlog_error!("present: {e}");
@@ -760,12 +1270,27 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
         match fence::wait(&p.fence, p.value, &p.dev, Some(p.event), 2000) {
             Ok(()) => {
                 for dump in p.dumps.drain(..) {
+                    if dump.tag.starts_with("twin") {
+                        super::depth_uav::log_values(&dump.buffer, &dump.footprint, &dump.tag);
+                        continue;
+                    }
+                    if dump.tag.starts_with("target") {
+                        super::targets::log_census(&dump.buffer, &dump.footprint, &dump.tag);
+                    }
                     write_frame(&dump.buffer, &dump.footprint, dump.format, &dump.tag);
                 }
+                mark_pipe_drained(p);
+                p.copy_sources.clear();
             }
             Err(e) => {
                 p.disabled = matches!(&e, FenceError::Removed(_));
-                crate::xlog_error!("present: frame dump copy: {e}");
+                // (a copy queued behind the title's work is no stopped GPU: not the fence's
+                // text, which a watchdog reads as one; its buffers stay on the ring slot)
+                if let FenceError::Timeout(ms) = e {
+                    crate::xlog_warn!("present: frame dump copy: not finished after {ms} ms – this dump is skipped");
+                } else {
+                    crate::xlog_error!("present: frame dump copy: {e}");
+                }
                 if p.disabled {
                     return;
                 }
@@ -774,7 +1299,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     }
     let n = PRESENTS.fetch_add(1, Ordering::Relaxed);
     if n == 0 {
-        crate::xlog_info!("present: first game frame shown ({}x{})", desc.Width, desc.Height);
+        crate::xlog_info!("present: first game frame shown ({w}x{h})");
     }
 }
 
@@ -865,6 +1390,56 @@ fn rgb(format: DXGI_FORMAT, t: u32) -> Option<[u8; 3]> {
     })
 }
 
+/// A texel of `format` (its bytes: `targets::texel_bytes` of them) as a colour to look at, for
+/// the formats `rgb` does not take: a frame's HDR and data targets (`XCL_DUMP_TARGETS`). A
+/// float channel is tone-mapped as the HDR formats are, its sign dropped (a normal, a motion
+/// vector); an integer target shows its low bytes. A flat picture over a scene that was drawn
+/// could not be followed through these: they were written black, "format not decoded".
+fn texel_rgb(format: DXGI_FORMAT, t: &[u8]) -> Option<[u8; 3]> {
+    let u16_at = |i: usize| u16::from_le_bytes([t[i], t[i + 1]]);
+    let u32_at = |i: usize| u32::from_le_bytes([t[i], t[i + 1], t[i + 2], t[i + 3]]);
+    // (NaN and infinities: white, so that they show)
+    let tm = |v: f32| if v.is_finite() { ((v.abs() / (1.0 + v.abs())).sqrt() * 255.0) as u8 } else { 255 };
+    let half = |i: usize| half_float(u16_at(i));
+    let float = |i: usize| f32::from_bits(u32_at(i));
+    if t.len() < super::targets::texel_bytes(format) {
+        return None;
+    }
+    Some(match format {
+        DXGI_FORMAT_R16G16B16A16_FLOAT | DXGI_FORMAT_R16G16B16A16_TYPELESS => [tm(half(0)), tm(half(2)), tm(half(4))],
+        DXGI_FORMAT_R16G16B16A16_UNORM => [t[1], t[3], t[5]],
+        DXGI_FORMAT_R32G32B32A32_FLOAT | DXGI_FORMAT_R32G32B32A32_TYPELESS => [tm(float(0)), tm(float(4)), tm(float(8))],
+        DXGI_FORMAT_R16G16_FLOAT | DXGI_FORMAT_R16G16_TYPELESS => [tm(half(0)), tm(half(2)), 0],
+        DXGI_FORMAT_R16G16_UNORM => [t[1], t[3], 0],
+        DXGI_FORMAT_R32G32_FLOAT => [tm(float(0)), tm(float(4)), 0],
+        DXGI_FORMAT_R32G32_UINT => [t[0], t[4], t[1]],
+        DXGI_FORMAT_R32_FLOAT | DXGI_FORMAT_D32_FLOAT | DXGI_FORMAT_R32_TYPELESS => [tm(float(0)); 3],
+        DXGI_FORMAT_R32_UINT => [t[0], t[1], t[2]],
+        DXGI_FORMAT_R16_FLOAT | DXGI_FORMAT_R16_TYPELESS => [tm(half(0)); 3],
+        DXGI_FORMAT_R16_UNORM | DXGI_FORMAT_D16_UNORM => [t[1]; 3],
+        DXGI_FORMAT_R16_UINT => [t[0], t[1], 0],
+        DXGI_FORMAT_R8G8_UNORM | DXGI_FORMAT_R8G8_TYPELESS => [t[0], t[1], 0],
+        DXGI_FORMAT_R8_UNORM | DXGI_FORMAT_A8_UNORM | DXGI_FORMAT_R8_TYPELESS => [t[0]; 3],
+        DXGI_FORMAT_R8_UINT => [t[0].wrapping_mul(37), t[0].wrapping_mul(91), t[0].wrapping_mul(151)],
+        DXGI_FORMAT_R8G8B8A8_TYPELESS => [t[0], t[1], t[2]],
+        DXGI_FORMAT_B8G8R8A8_TYPELESS => [t[2], t[1], t[0]],
+        DXGI_FORMAT_R10G10B10A2_TYPELESS => return rgb(DXGI_FORMAT_R10G10B10A2_UNORM, u32_at(0)),
+        _ if t.len() >= 4 => return rgb(format, u32_at(0)),
+        _ => return None,
+    })
+}
+
+/// An IEEE half float.
+fn half_float(h: u16) -> f32 {
+    let (sign, e, m) = (if h >> 15 != 0 { -1.0f32 } else { 1.0 }, (h >> 10 & 31) as i32, (h & 0x3FF) as f32 / 1024.0);
+    sign * match e {
+        0 => m * 2f32.powi(-14),
+        31 if m == 0.0 => f32::INFINITY,
+        31 => f32::NAN,
+        _ => (1.0 + m) * 2f32.powi(e - 15),
+    }
+}
+
 /// the largest render target the draws `XCL_TRACE_SHADERS` picked drew into (AddRef'd): the
 /// one the `XCL_TRACE_FRAME` dumps show instead of the busiest
 static WATCHED_RT: Mutex<Option<usize>> = Mutex::new(None);
@@ -906,13 +1481,19 @@ pub unsafe fn watch_rt(rt: usize) {
 }
 
 /// the single-sampled resource bound as a render target most often (`XCL_TRACE_FRAME`; a
-/// multisampled one cannot be copied to a buffer – the present list would not close)
-fn busiest_rt() -> Option<usize> {
+/// multisampled one cannot be copied to a buffer – the present list would not close).
+///
+/// `USES` and the watched target are addresses, not references. A target is taken only while an
+/// RTV still names it, which holds it (`view_resource`): a retail title's world releases
+/// transient targets all the time, and GetDesc on one of those addresses ended the process (an
+/// access violation under `present_now`, in every trace run that also dumped frames or targets).
+unsafe fn busiest_rt() -> Option<ID3D12Resource> {
     if let Some(r) = *WATCHED_RT.lock().unwrap() {
-        return Some(r);
+        return view_resource(r);
     }
-    let single = |r: usize| unsafe { ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).is_some_and(|x| x.GetDesc().SampleDesc.Count <= 1) };
-    USES.lock().unwrap().as_ref()?.iter().filter(|(&r, u)| u[USE_RT] > 0 && single(r)).max_by_key(|(_, u)| u[USE_RT]).map(|(&r, _)| r)
+    let mut bound: Vec<(usize, u64)> = USES.lock().unwrap().as_ref()?.iter().filter(|(_, u)| u[USE_RT] > 0).map(|(&r, u)| (r, u[USE_RT])).collect();
+    bound.sort_by_key(|&(_, binds)| std::cmp::Reverse(binds));
+    bound.into_iter().find_map(|(r, _)| view_resource(r).filter(|x| x.GetDesc().SampleDesc.Count <= 1))
 }
 
 /// an 11- / 10-bit unsigned float (5-bit exponent) -> f32
@@ -949,12 +1530,18 @@ unsafe fn write_frame(rb: &ID3D12Resource, fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRI
     }
     let (mut lit, mut decoded) = (0usize, true);
     let mut raw: HashMap<u32, usize> = HashMap::new();
+    // (a texel of 1, 2, 8 or 16 bytes is read at its own size: read as 4 bytes at a 4-byte
+    // stride, an HDR target showed every other half texel and a one-byte one ran past its row)
+    let bytes = super::targets::texel_bytes(format);
     for y in (0..oh).rev() {
         let start = bmp.len();
         for x in 0..ow {
-            let t = ((p as *const u8).add(fp.Offset as usize + step * y * pitch + 4 * step * x) as *const u32).read_unaligned();
+            let texel = std::slice::from_raw_parts((p as *const u8).add(fp.Offset as usize + step * y * pitch + bytes * step * x), bytes);
+            let mut first = [0u8; 4];
+            first[..bytes.min(4)].copy_from_slice(&texel[..bytes.min(4)]);
+            let t = u32::from_le_bytes(first);
             *raw.entry(t).or_default() += 1;
-            let c = rgb(format, t).unwrap_or_else(|| {
+            let c = texel_rgb(format, texel).unwrap_or_else(|| {
                 decoded = false;
                 [0; 3]
             });
@@ -999,6 +1586,9 @@ unsafe fn write_frame(rb: &ID3D12Resource, fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRI
 impl Drop for Presenter {
     fn drop(&mut self) {
         unsafe {
+            if !self.disabled && self.value > 0 {
+                let _ = fence::wait(&self.fence, self.value, &self.dev, Some(self.event), 1000);
+            }
             let _ = CloseHandle(self.event);
         }
     }
@@ -1007,6 +1597,64 @@ impl Drop for Presenter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dumped_texels_of_hdr_and_data_formats_have_a_colour() {
+        assert_eq!(half_float(0x3C00), 1.0);
+        assert_eq!(half_float(0xC000), -2.0);
+        assert_eq!(half_float(0x0000), 0.0);
+        assert!(half_float(0x0001) > 0.0 && half_float(0x0001) < 1e-6, "a denormal");
+        assert!(half_float(0x7C00).is_infinite() && half_float(0x7E00).is_nan());
+        // RGBA16F (1, 0, 4, 1): tone-mapped x / (1 + x), square root
+        let hdr: Vec<u8> = [0x3C00u16, 0, 0x4400, 0x3C00].iter().flat_map(|h| h.to_le_bytes()).collect();
+        assert_eq!(texel_rgb(DXGI_FORMAT_R16G16B16A16_FLOAT, &hdr), Some([180, 0, 228]));
+        // a NaN shows (white), a negative value by its size
+        let odd: Vec<u8> = [0x7E00u16, 0xBC00, 0, 0].iter().flat_map(|h| h.to_le_bytes()).collect();
+        assert_eq!(texel_rgb(DXGI_FORMAT_R16G16B16A16_FLOAT, &odd), Some([255, 180, 0]));
+        assert_eq!(texel_rgb(DXGI_FORMAT_R8_UNORM, &[200]), Some([200; 3]));
+        assert_eq!(texel_rgb(DXGI_FORMAT_R32_UINT, &[1, 2, 3, 4]), Some([1, 2, 3]));
+        assert_eq!(texel_rgb(DXGI_FORMAT_R16G16_UNORM, &[0, 10, 0, 20]), Some([10, 20, 0]));
+        assert_eq!(texel_rgb(DXGI_FORMAT_R32_FLOAT, &1.0f32.to_le_bytes()), Some([180; 3]));
+        // the formats `rgb` knows go through it
+        assert_eq!(texel_rgb(DXGI_FORMAT_R8G8B8A8_UNORM, &[1, 2, 3, 4]), Some([1, 2, 3]));
+        assert_eq!(texel_rgb(DXGI_FORMAT_B8G8R8A8_UNORM, &[1, 2, 3, 4]), Some([3, 2, 1]));
+        // fewer bytes than the format's texel: no colour (and no read past them)
+        assert_eq!(texel_rgb(DXGI_FORMAT_R16G16B16A16_FLOAT, &hdr[..4]), None);
+        assert_eq!(texel_rgb(DXGI_FORMAT_BC1_UNORM, &[0; 4]), None, "a format with no texels of its own");
+    }
+
+    #[test]
+    fn present_ring_overlaps_previous_frame_and_drains_cleanly() {
+        let mut ring = PresentRing::new(PRESENT_SLOTS);
+        // Frame 1 (p.value == 0) -> slot 0, no wait, no rotation.
+        assert_eq!(ring.begin_present(0), (0, 0, None));
+
+        // Frame 2 (p.value == 1 after frame 1 submitted) -> rotates 0 -> 1, no wait (overlaps frame 1).
+        assert_eq!(ring.begin_present(1), (1, 0, Some(0)));
+
+        // Frame 3 (p.value == 2 after frame 2 submitted) -> rotates 1 -> 0, waits only for frame 1 (N-2).
+        assert_eq!(ring.begin_present(2), (0, 1, Some(1)));
+        // Retry on timeout (p.value still 2) stays on slot 0 without rotating again.
+        assert_eq!(ring.begin_present(2), (0, 1, None));
+        ring.mark_slot_reusable(0);
+        assert_eq!(ring.begin_present(2), (0, 0, None));
+
+        // Frame 4 (p.value == 3 after frame 3 submitted) -> rotates 0 -> 1, waits only for frame 2 (N-2).
+        assert_eq!(ring.begin_present(3), (1, 2, Some(0)));
+        ring.mark_slot_reusable(1);
+
+        // Drain after frame 4 submitted (e.g. XCL_FRAME_DUMP / ResizeBuffers) clears all slots.
+        ring.mark_all_drained(4);
+        assert_eq!(ring.begin_present(4), (1, 0, None));
+        assert_eq!(ring.begin_present(5), (0, 0, Some(1)));
+
+        // 1-slot sync mode waits on every previous frame N-1 without rotating.
+        let mut sync = PresentRing::new(1);
+        assert_eq!(sync.begin_present(0), (0, 0, None));
+        assert_eq!(sync.begin_present(1), (0, 1, None));
+        sync.mark_slot_reusable(0);
+        assert_eq!(sync.begin_present(2), (0, 2, None));
+    }
 
     #[test]
     fn frame_rate_uses_frame_and_time_deltas() {
@@ -1075,6 +1723,27 @@ mod tests {
             assert_eq!(window_position("auto", 1280, 720), window_position("center", 1280, 720));
             std::env::remove_var("XCL_WINDOW_POS");
         }
+    }
+
+    #[test]
+    fn parse_present_planes_and_uv_rects() {
+        let mut rect0 = [160i32, 90, 800, 450];
+        let mut res0: usize = 0x1111_0000;
+        let mut res1: usize = 0x2222_0000;
+        let mut buf = [0u8; 2 * PLANE_STRIDE];
+        let write_u64 = |b: &mut [u8], off: usize, v: u64| b[off..off + 8].copy_from_slice(&v.to_le_bytes());
+        write_u64(&mut buf, 0x08, 1);
+        write_u64(&mut buf, 0x10, (&mut res0 as *mut usize) as u64);
+        write_u64(&mut buf, 0x18, rect0.as_mut_ptr() as u64);
+        write_u64(&mut buf, PLANE_STRIDE + 0x08, 1);
+        write_u64(&mut buf, PLANE_STRIDE + 0x10, (&mut res1 as *mut usize) as u64);
+        write_u64(&mut buf, PLANE_STRIDE + 0x18, 0);
+
+        let got = unsafe { extract_planes(2, buf.as_ptr()) };
+        assert_eq!(got, vec![(res0, Some(rect0)), (res1, None)]);
+        assert_eq!(source_uv_rect(got[0].1, 1600, 900), [0.1, 0.1, 0.5, 0.5]);
+        assert_eq!(source_uv_rect(got[1].1, 3840, 2160), [0.0, 0.0, 1.0, 1.0]);
+        assert_eq!(source_uv_rect(Some([0, 0, 4000, 900]), 1920, 1080), [0.0, 0.0, 1.0, 1.0]);
     }
 }
 
@@ -1153,9 +1822,155 @@ mod frame_dump_tests {
             write_frame(&buffer, &fp, fp.Footprint.Format, "frame");
             let bright = last_frame_dump().unwrap();
             assert_eq!(bright.non_dark_samples, Some(bright.sampled_pixels));
-            write_frame(&buffer, &fp, DXGI_FORMAT_R32_FLOAT, "frame");
+            // (a format no dump decodes, at the footprint's 4 bytes a texel: shared-exponent
+            // RGB is no render target's)
+            assert_eq!(texel_rgb(DXGI_FORMAT_R9G9B9E5_SHAREDEXP, &[31, 0, 0, 255]), None);
+            write_frame(&buffer, &fp, DXGI_FORMAT_R9G9B9E5_SHAREDEXP, "frame");
             let json = serde_json::to_value(last_frame_dump().unwrap()).unwrap();
             assert!(json["non_dark_samples"].is_null(), "undecoded is different from dark");
+        }
+    }
+
+    #[test]
+    fn compositor_blends_ui_plane_over_scene_plane() {
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+            let adapter: IDXGIAdapter = factory.EnumWarpAdapter().unwrap();
+            let mut dev: Option<ID3D12Device> = None;
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev).unwrap();
+            let dev = dev.unwrap();
+            let queue: ID3D12CommandQueue = dev
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() })
+                .unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let mut comp = Compositor::new(&dev).unwrap();
+
+            let make_tex = |w: u32, h: u32, flags: D3D12_RESOURCE_FLAGS| -> ID3D12Resource {
+                let mut r: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                        Width: w as u64,
+                        Height: h,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                        Flags: flags,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut r,
+                )
+                .unwrap();
+                r.unwrap()
+            };
+            let upload_tex = |tex: &ID3D12Resource, w: u32, h: u32, fill: &dyn Fn(u32, u32) -> [u8; 4]| -> ID3D12Resource {
+                let pitch = (w * 4).div_ceil(256) * 256;
+                let mut up: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                        Width: (pitch * h) as u64,
+                        Height: 1,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                    None,
+                    &mut up,
+                )
+                .unwrap();
+                let up = up.unwrap();
+                let mut p: *mut c_void = std::ptr::null_mut();
+                up.Map(0, None, Some(&mut p)).unwrap();
+                let bytes = std::slice::from_raw_parts_mut(p as *mut u8, (pitch * h) as usize);
+                for y in 0..h {
+                    for x in 0..w {
+                        let off = (y * pitch + x * 4) as usize;
+                        bytes[off..off + 4].copy_from_slice(&fill(x, y));
+                    }
+                }
+                up.Unmap(0, None);
+                let dst_loc = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(tex),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                };
+                let src_loc = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&up),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                            Offset: 0,
+                            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                                Width: w,
+                                Height: h,
+                                Depth: 1,
+                                RowPitch: pitch,
+                            },
+                        },
+                    },
+                };
+                list.ResourceBarrier(&[transition(tex, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)]);
+                list.CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, None);
+                list.ResourceBarrier(&[transition(tex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)]);
+                up
+            };
+
+            let scene = make_tex(4, 4, D3D12_RESOURCE_FLAG_NONE);
+            let ui = make_tex(8, 8, D3D12_RESOURCE_FLAG_NONE);
+            let out = make_tex(8, 8, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+            let _up0 = upload_tex(&scene, 4, 4, &|_, _| [0, 0, 255, 255]);
+            let _up1 = upload_tex(&ui, 8, 8, &|x, y| {
+                if y == 2 && x < 4 {
+                    [0, 128, 0, 128]
+                } else if x < 4 {
+                    [0, 0, 0, 0]
+                } else {
+                    [255, 0, 0, 255]
+                }
+            });
+
+            list.ResourceBarrier(&[transition(&out, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
+            let planes = [
+                (scene.clone(), scene.GetDesc(), [0.0, 0.0, 1.0, 1.0]),
+                (ui.clone(), ui.GetDesc(), [0.0, 0.0, 1.0, 1.0]),
+            ];
+            assert!(comp.record(&dev, &list, &out, 8, 8, DXGI_FORMAT_R8G8B8A8_UNORM, &planes, 0));
+            list.ResourceBarrier(&[transition(&out, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            let out_desc = out.GetDesc();
+            let (rb, fp) = readback_copy(&list, &out, &out_desc).unwrap();
+            list.Close().unwrap();
+
+            let cl: ID3D12CommandList = list.cast().unwrap();
+            queue.ExecuteCommandLists(&[Some(cl)]);
+            queue.Signal(&fence, 1).unwrap();
+            fence::wait(&fence, 1, &dev, None, 5000).unwrap();
+
+            let mut p: *mut c_void = std::ptr::null_mut();
+            rb.Map(0, None, Some(&mut p)).unwrap();
+            let px = |x: usize, y: usize| -> [u8; 4] {
+                let off = fp.Offset as usize + y * fp.Footprint.RowPitch as usize + x * 4;
+                let s = std::slice::from_raw_parts((p as *const u8).add(off), 4);
+                [s[0], s[1], s[2], s[3]]
+            };
+            assert_eq!(px(1, 1), [0, 0, 255, 255], "transparent UI exposes scene plane");
+            assert_eq!(px(6, 1), [255, 0, 0, 255], "opaque UI overwrites scene plane");
+            let blend = px(1, 2);
+            assert!(blend[0] <= 2 && (126..=130).contains(&blend[1]) && (125..=129).contains(&blend[2]) && blend[3] == 255, "unexpected blend {blend:?}");
+            rb.Unmap(0, None);
         }
     }
 }

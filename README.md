@@ -43,17 +43,13 @@ XCL is a research project and this is a snapshot of it. Please read this before 
 
 - **What upstream reports as working** (see the table further down): a few retail titles are
   listed as playable. Those claims are upstream's; they were not re-tested with this build.
-- **Large, new games: do not expect them to be playable.** With build 13 the game this build
-  was tested against starts in about 4 s, runs its menus and intro at 30 frames a second,
-  loads its world and reaches its **opening scene and the first controls prompt**; two runs of
-  five minutes ended without a hang or a crash, with **5 – 10 frames a second** in the world on
-  an RTX 5090. **The 3D world itself is still grey**: the pipelines of its geometry are refused,
-  and part of the memory its shaders read cannot be reached yet. The picture also stands still
-  for long stretches while big graphics pipelines are compiled. The settings of those runs are in
-  [`installer/CHANGES.txt`](installer/CHANGES.txt); they need a graphics card with a lot of
-  memory.
-  This branch is ahead of build 13: it is upstream's current main with the same changes on top,
-  and has not run in the game yet.
+- **Large, new games: do not expect them to be playable.** With build 14 the game this build
+  was tested against runs its menus and intro, loads its world and **draws it with geometry and
+  textures**; one run of 9 minutes (7.5 in the world) ended without a hang, a crash or a driver
+  error on an RTX 5090. It is **not playable**: about **3 frames a second** in the world, and
+  **the colours are wrong** (flattened into hard bands with a tint). It needed 31 GB of video
+  memory, and on NVIDIA a driver profile setting that raises the reserve for pipeline code. The
+  settings of that run are in [`installer/CHANGES.txt`](installer/CHANGES.txt).
 
 - **Network:** XCL has no networking code of its own and does not phone home. The *game* does
   try to use the network – name lookups, and its crash reporter uploads a memory dump when it
@@ -385,6 +381,14 @@ xcl shaders D:\data\shaders.rpf --measure-pso HEX --repeat 3         # cold driv
 xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 ```
 
+Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. Add
+`-Pipelines` to warm the GPU driver's compute-pipeline cache too (slower and GPU/driver-specific):
+
+```powershell
+.\scripts\precompile-shaders.ps1 -Package 'D:\data\shaders.rpf'
+.\scripts\precompile-shaders.ps1 -Package 'D:\data\shaders.rpf' -Pipelines
+```
+
 <details>
 <summary><b>Switches, caches, logs and the files XCL writes</b></summary>
 
@@ -400,6 +404,14 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 - **The game folder is never modified** – writes go to the overlay.
 - Translated shaders are reused across XCL rebuilds when the translator sources and DXC
   toolchain are unchanged; `XCL_TRANSLATED_CACHE=0` disables that disk cache.
+- Direct compute dispatches can split large programs into pipelines built in parallel.
+  `XCL_DIRECT_SPLIT_INSTRUCTIONS` sets the target instructions per piece (default 12500,
+  zero disables splitting). Loops stay in one piece. A strongly connected component over the
+  target gets its own piece, up to four times the target. Larger components and indirect
+  dispatches use the whole pipeline. A chained dispatch runs in slabs of groups that share one
+  scratch buffer of at most `XCL_SPLIT_SCRATCH_MB` (default 256); the chains of one recording
+  share it, and `XCL_SPLIT_SCRATCH_TOTAL_MB` (default 384) bounds what all recordings not yet
+  reset hold together (past it a dispatch runs in smaller slabs).
 - Huge pipelines (translated DXIL of `XCL_HUGE_PSO_BYTES` or more, default 262144) built on the
   background `xcl-pso*` workers take turns in the driver's compiler: `XCL_HUGE_PSO_CONCURRENCY`
   at once (default 1, maximum 64). Pipelines of 4 MiB or more use a separate one-wide lane so
@@ -412,12 +424,25 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   `XCL_PSO_TRACE=1` logs every driver compile. A huge compute program the driver refuses is
   logged with the driver's verdict (`the driver refused the compute PSO of record HASH … with
   0x…`): its dispatches are skipped.
+- A loop in a translated compute program run by a Dispatch (not ExecuteIndirect) is ended
+  after its dispatch's share of passes for each entry (between 1024 and 65 536 a thread, fewer the
+  more threads the dispatch has; the direct DXIL translator ends the thread's program there), so
+  one that runs away does not hold the GPU past the time Windows gives it. The direct
+  translator's compact form (programs of 20 000 instructions and more) and `XCL_PER_LANE` keep
+  only the thread's 65 536 passes in all. `XCL_DISPATCH_LOOP_BUDGET=0` leaves every loop the
+  thread's 65 536 passes, as before (to compare).
 - With `XCL_DRED=1`, a D3D12 device removal logs GPU breadcrumbs in `xcl.log`.
   XCL examines up to 4,096 command lists and reports up to 64 unfinished lists, starting with
-  those on which the GPU completed at least one operation.
+  those on which the GPU completed at least one operation. For each, it names the translated
+  pipeline bound at the last operation DRED saw complete and those bound after it, by their
+  console shaders' hashes (`cs`, `vs` / `ps`, `ms` / `ps`, `vs` / `gs` / `ps`).
 - `XCL_DSTORAGE_PARALLEL_DECOMPRESS=1` enables parallel CPU decompression for file-backed zlib
   requests with virtual destinations. Defaults: four workers and a shared 32 MiB staging budget
   (`XCL_DSTORAGE_WORKERS`, `XCL_DSTORAGE_MEMORY_BUDGET_MIB`). Requests retire in queue order.
+- The queue's page mappings (`CopyPageMappingsBatchX`: a title maps the pages its texture streaming
+  fills into its GPU views) are applied: a GPU-view page shows the physical page mapped into it.
+  `XCL_PAGE_MAPPINGS=0` turns them off (the call is ignored and a GPU-view page shows its CPU view at
+  the same offset, as before).
 - Every run writes `report.json` (called stubs, unknown D3D12.X slots and interfaces, XGameRuntime
   classes asked for, shader statistics, audio formats, crash).
   `d3d12.presents` counts presentations, not visible content. With `XCL_FRAME_DUMP=N` (`N > 1`),
@@ -426,6 +451,9 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   (decoded 8-bit R+G+B > 30). The field is `null` until a frame is sampled; `non_dark_samples` is
   `null` if its format cannot be decoded. Intermediate render-target dumps do not update it.
   Sampling uses every fourth pixel in each direction (`XCL_FRAME_DUMP_FULL=1`: every pixel).
+  `XCL_DUMP_TARGETS=<draws>[,<frames>]` logs, for the first frames with that many draws and dispatches,
+  each render target and the depth buffer drawn into (draws ran / stand-in / PC / skipped) and dumps
+  the eight drawn into most (`target<k>_<n>.bmp`); `XCL_DUMP_AFTER_S=<s>` waits `s` seconds first.
   A coarse sample can miss detail; a non-dark sample does not establish correct rendering or gameplay.
 - Title data: `%LOCALAPPDATA%\XCL\<title>\` (`%XCL_DATA_ROOT%`): `xcl.toml`, `overlay\`, `saves\`,
   `pls\` (the title's `S:\`), `temp\` (`T:\`), `cache\`, `logs\xcl.log`, `logs\report.json` (the

@@ -22,8 +22,19 @@ const SEAL_EVERY: Duration = Duration::from_millis(10);
 /// how often the thread here looks for batches that can go
 const TICK: Duration = Duration::from_millis(4);
 
+/// What is let go when the queues are past it.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Dead {
+    /// an adopted resource's last reference (its original Release ends it)
+    Resource(usize),
+    /// a pipeline state XCL owns (`hold_pipeline`)
+    Pipeline(usize),
+    /// a heap XCL owns (`hold_heap`)
+    Heap(usize),
+}
+
 struct Batch {
-    dead: Vec<usize>,
+    dead: Vec<Dead>,
     /// (fence, value) a queue: all reached = nothing submitted before the batch closed is left
     marks: Vec<(ID3D12Fence, u64)>,
 }
@@ -32,7 +43,7 @@ struct Batch {
 struct Held {
     /// queue → its fence here and the last value signalled on it
     fences: HashMap<usize, (ID3D12Fence, u64)>,
-    open: Vec<usize>,
+    open: Vec<Dead>,
     sealed: VecDeque<Batch>,
     last_seal: Option<Instant>,
 }
@@ -46,8 +57,8 @@ impl Held {
     }
 
     /// Close the open batch (at most every `SEAL_EVERY`, or `seal_now`) with a fence value on each of `queues`,
-    /// and take out the batches every queue is past: the resources to release now.
-    unsafe fn drain(&mut self, queues: &[ID3D12CommandQueue], seal_now: bool) -> Vec<usize> {
+    /// and take out the batches every queue is past: what to release now.
+    unsafe fn drain(&mut self, queues: &[ID3D12CommandQueue], seal_now: bool) -> Vec<Dead> {
         if !self.open.is_empty() && (seal_now || self.last_seal.is_none_or(|t| t.elapsed() >= SEAL_EVERY)) {
             let mut marks = Vec::with_capacity(queues.len());
             let mut ok = true;
@@ -122,7 +133,7 @@ static BUSY: Busy = Busy(Mutex::new(None));
 /// `Release` finds it unpinned, as before. Otherwise the thread here lets it go – the driver takes
 /// ~100 us to end a texture, and a title ends thousands of them when it changes places.
 pub unsafe fn hold(res: usize, pinned: bool) {
-    HELD.lock().unwrap().get_or_insert_with(Held::default).open.push(res);
+    HELD.lock().unwrap().get_or_insert_with(Held::default).open.push(Dead::Resource(res));
     let start = Instant::now();
     let busy = !pinned || BUSY.is(start);
     if !busy {
@@ -144,9 +155,13 @@ pub unsafe fn hold(res: usize, pinned: bool) {
             crate::xlog_info!("D3D12.X: {n} last releases left to the thread so far, {left} of them without a look at the queues");
         }
     }
-    // A thread of its own lets the held ones go: the title may release a resource and then
-    // wait for its memory without another submit (an imported heap pins the pages under its
-    // resources – unmapping them stood still while one was held "until the next submit").
+    start_thread();
+}
+
+/// A thread of its own lets the held ones go: the title may release a resource and then wait
+/// for its memory without another submit (an imported heap pins the pages under its resources –
+/// unmapping them stood still while one was held "until the next submit").
+fn start_thread() {
     static THREAD: std::sync::Once = std::sync::Once::new();
     THREAD.call_once(|| {
         let _ = std::thread::Builder::new().name("xcl-late-release".into()).spawn(|| loop {
@@ -154,6 +169,35 @@ pub unsafe fn hold(res: usize, pinned: bool) {
             unsafe { drain_known(false) };
         });
     });
+}
+
+/// A pipeline state XCL owns (raw pointer, 0 = none) is let go: the compute pass of a two-pass
+/// pipeline, the real pipeline behind a title's stand-in. Lists in flight may bind it (the title
+/// released its own pipeline, not XCL's, and D3D12 asks that a pipeline outlives the work that
+/// runs it), so it is released as a resource's last reference is: once every queue is past a
+/// fence value signalled after this. `XCL_LATE_RELEASE=0`: now.
+pub fn hold_pipeline(p: usize) {
+    if p == 0 {
+        return;
+    }
+    if !enabled() {
+        return super::pso_async::release(p);
+    }
+    HELD.lock().unwrap().get_or_insert_with(Held::default).open.push(Dead::Pipeline(p));
+    start_thread();
+}
+
+/// A heap XCL owns that reserved resources mapped tiles of (`vram`'s page pools) is let go: a
+/// resource the title released maps them until it goes here, and work queued before still reads
+/// them – with the heap gone under that work the GPU faults. So it goes as such a resource does,
+/// and not before those held earlier: once every queue is past a fence value signalled after this.
+/// `XCL_LATE_RELEASE=0`: now.
+pub fn hold_heap(heap: ID3D12Heap) {
+    if !enabled() {
+        return drop(heap);
+    }
+    HELD.lock().unwrap().get_or_insert_with(Held::default).open.push(Dead::Heap(heap.into_raw() as usize));
+    start_thread();
 }
 
 /// Release what every queue XCL knows of is past: the title's, the tile-mapping one, the
@@ -176,7 +220,26 @@ pub unsafe fn drain_known(seal_now: bool) {
         None => return,
     };
     // (outside the lock: a release may end other objects, whose releases come back here)
-    for res in gone {
+    for dead in gone {
+        let res = match dead {
+            Dead::Resource(res) => res,
+            Dead::Pipeline(p) => {
+                super::pso_async::release(p);
+                continue;
+            }
+            Dead::Heap(h) => {
+                drop(ID3D12Heap::from_raw(h as *mut c_void));
+                continue;
+            }
+        };
+        // (its views in the shared heap become null views before the object goes)
+        super::real::resource_ending(res);
+        // A placed buffer's tiles stay pinned until here: the held object maps them, and work
+        // queued before its release reads them through it. Unpinned right before the object goes
+        // (the queues are past that work), not after: then another thread could have made a
+        // buffer at the same address, whose tiles this would unpin. (`forget_buffer` takes no
+        // lock of this module's and does not wait for the sparse state's.)
+        super::sparse::forget_buffer(res);
         let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(super::real::orig_fn(res as *mut c_void, 2));
         f(res as *mut c_void);
     }
@@ -214,7 +277,7 @@ mod tests {
             let raw = res.unwrap().into_raw() as usize;
 
             let mut held = Held::default();
-            held.open.push(raw);
+            held.open.push(Dead::Resource(raw));
             let queues = [queue.clone()];
             assert!(held.drain(&queues, false).is_empty(), "the queue has not passed the batch's fence value");
             std::thread::sleep(Duration::from_millis(100));
@@ -228,7 +291,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(5));
                 gone = held.drain(&queues, false);
             }
-            assert_eq!(gone, vec![raw], "released once the queue is past the batch");
+            assert_eq!(gone, vec![Dead::Resource(raw)], "released once the queue is past the batch");
             assert!(held.is_empty());
             drop(ID3D12Resource::from_raw(raw as *mut c_void));
         }
@@ -251,8 +314,40 @@ mod tests {
     #[test]
     fn without_queues_a_batch_goes_at_once() {
         let mut held = Held::default();
-        held.open.push(0x1000);
-        assert_eq!(unsafe { held.drain(&[], false) }, vec![0x1000]);
+        held.open.push(Dead::Resource(0x1000));
+        held.open.push(Dead::Pipeline(0x2000));
+        assert_eq!(unsafe { held.drain(&[], false) }, vec![Dead::Resource(0x1000), Dead::Pipeline(0x2000)]);
         assert!(held.is_empty());
+    }
+
+    /// A pipeline state XCL lets go goes into a batch (a list in flight may bind it), and the
+    /// thread here releases it once the queues are past – through its COM Release. (That a batch
+    /// waits for a busy queue is `a_held_resource_goes_when_the_queue_is_past_its_batch`.)
+    #[test]
+    fn a_pipeline_xcl_lets_go_is_released_by_the_thread() {
+        use std::sync::atomic::AtomicU32;
+        #[repr(C)]
+        struct Fake {
+            vt: *const usize,
+            refs: AtomicU32,
+        }
+        unsafe extern "system" fn add_ref(this: *mut c_void) -> u32 {
+            (*(this as *const Fake)).refs.fetch_add(1, Ordering::SeqCst) + 1
+        }
+        unsafe extern "system" fn release(this: *mut c_void) -> u32 {
+            (*(this as *const Fake)).refs.fetch_sub(1, Ordering::SeqCst) - 1
+        }
+        let vt = [0usize, add_ref as usize, release as usize];
+        let fake = Box::new(Fake { vt: vt.as_ptr(), refs: AtomicU32::new(1) });
+        let p = &*fake as *const Fake as usize;
+        hold_pipeline(p);
+        assert!(enabled());
+        // (a queue XCL knows of may still be busy: the batch waits for its fence)
+        let start = Instant::now();
+        while fake.refs.load(Ordering::SeqCst) != 0 && start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(fake.refs.load(Ordering::SeqCst), 0, "released once the queues are past");
+        hold_pipeline(0);
     }
 }

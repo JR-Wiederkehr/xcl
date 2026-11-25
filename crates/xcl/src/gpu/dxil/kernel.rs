@@ -9,11 +9,11 @@
 //! `recomp::CsInterface`): user SGPRs from `io`, then the enabled group ids
 //! and TG_SIZE; v0..v2 = thread id in the group; results only through memory.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use super::cfg::{Cfg, Term};
 use super::container::Stage;
-use super::lower::{ComputeInit, Init, Lw, Partner, VAR_BUDGET, VAR_SCC, VAR_VGPR};
+use super::lower::{ComputeInit, Init, Lw, Partner, LOOP_BUDGET, VAR_BUDGET, VAR_LOOP_PASSES, VAR_SCC, VAR_VGPR};
 use super::module::{Block, Pred, Value};
 use super::shader::{RawUav, Shader};
 use super::ssa::Ssa;
@@ -38,7 +38,7 @@ pub struct KernelOptions {
 /// identity (`recomp::pso`): bump it when `pso::direct_compute` / `direct_graphics` change the
 /// containers. An edit of `gpu/dxil` needs no bump, `XCL_DIRECT_DXIL_SOURCE_ID` is its hash
 /// (the `gpu/dxil` sources are not in build.rs's translator source hash).
-pub const TRANSLATOR_VERSION: u32 = 10;
+pub const TRANSLATOR_VERSION: u32 = 11;
 
 /// `XCL_DIRECT_DXIL=1`: console compute shaders (and the kernel tests) go through this
 /// translator, with the HLSL path as the fallback for what it cannot translate yet.
@@ -65,6 +65,13 @@ pub fn translate(code: &[u8], o: KernelOptions) -> Result<Vec<u8>, String> {
 pub struct Kernel {
     pub dxil: Vec<u8>,
     pub static_samplers: Vec<([u32; 4], bool)>,
+    pub dispatch_chain: Option<std::sync::Arc<DispatchChain>>,
+}
+
+pub use super::module::split::DispatchChain;
+
+pub fn dispatch_piece_limit() -> usize {
+    std::env::var("XCL_DIRECT_SPLIT_INSTRUCTIONS").ok().and_then(|s| s.parse().ok()).unwrap_or(12_500)
 }
 
 /// `XCL_DIRECT_COMPACT`: `1` forces the compact form, `0` forbids it, unset leaves it to `compact::wanted`.
@@ -76,36 +83,54 @@ pub fn compact_mode() -> Option<bool> {
     }
 }
 
+/// Non-default `XCL_DIRECT_COMPACT_NEST` cache tag for the translated cache identity.
+pub fn compact_nest_tag() -> Option<String> {
+    super::compact::nest_mode().cache_tag()
+}
+
 /// `translate_full` in the compact form (`compact = true`) or the plain one.
 #[cfg(test)]
 pub fn translate_full_as(code: &[u8], o: KernelOptions, compact: bool) -> Result<Kernel, String> {
-    translate_entry(code, o, Entry::Kernel, Some(compact))
+    translate_entry(code, o, Entry::Kernel, Some(compact), None, super::compact::TABLE_WORDS_WAVE32)
+}
+
+/// `translate_full` in the compact form with an explicit dispatch nesting policy.
+#[cfg(test)]
+pub fn translate_full_nested(code: &[u8], o: KernelOptions, nest: super::compact::Nest) -> Result<Kernel, String> {
+    translate_entry(code, o, Entry::Kernel, Some(true), Some(nest), super::compact::TABLE_WORDS_WAVE32)
 }
 
 pub fn translate_full(code: &[u8], o: KernelOptions) -> Result<Kernel, String> {
-    translate_entry(code, o, Entry::Kernel, compact_mode())
+    translate_entry(code, o, Entry::Kernel, compact_mode(), None, super::compact::TABLE_WORDS_WAVE32)
 }
 
 /// A mesh-mode (NGG) program: the first pass that writes one record per group into
 /// `res` (the recompiler's `Mode::Mesh`; the pass-through mesh shader draws them).
 pub fn translate_mesh(code: &[u8], o: KernelOptions, ms: &MsInterface) -> Result<Kernel, String> {
-    translate_entry(code, o, Entry::Mesh(ms.clone()), None)
+    translate_entry(code, o, Entry::Mesh(ms.clone()), None, None, 0)
 }
 
 /// A vertex shader (the recompiler's `Mode::Vertex`; wave-size independent).
 pub fn translate_vertex(code: &[u8], o: KernelOptions, vs: &VsInterface) -> Result<Kernel, String> {
-    translate_entry(code, o, Entry::Vertex(vs.clone()), None)
+    translate_entry(code, o, Entry::Vertex(vs.clone()), None, None, 0)
 }
 
 /// A pixel shader (the recompiler's `Mode::Pixel`; wave-size independent).
 pub fn translate_pixel(code: &[u8], o: KernelOptions, ps: &PsInterface) -> Result<Kernel, String> {
-    translate_entry(code, o, Entry::Pixel(ps.clone()), None)
+    translate_entry(code, o, Entry::Pixel(ps.clone()), None, None, 0)
 }
 
 /// A geometry-mode (ES+GS) program: the compute pass that writes one mesh record per
 /// group of 21 triangles into `res` (the recompiler's `Mode::Geometry`). Always wave64.
 pub fn translate_geometry(code: &[u8], o: KernelOptions, g: &GsInterface) -> Result<Kernel, String> {
-    translate_entry(code, KernelOptions { wave64: true, ..o }, Entry::Geometry(g.clone()), None)
+    // The split form's ES phase runs in both hardware halves (`Partner::Present`): every ballot
+    // and lane read meets at a group barrier, the pattern that hung NVIDIA GPUs (#1727). The
+    // HLSL path's exchange spins by default: such a pass is left to it (`XCL_SAFE_BARRIER=0`:
+    // as before). The GS alone runs in the lower half without a partner.
+    if o.split && g.gs_start != Some(0) && crate::gpu::recomp::emit::safe_barrier_wanted() {
+        return Err("split wave64 geometry: the ES phase exchanges at group barriers".into());
+    }
+    translate_entry(code, KernelOptions { wave64: true, ..o }, Entry::Geometry(g.clone()), None, None, 0)
 }
 
 /// The entry ABI.
@@ -121,17 +146,58 @@ pub enum Entry {
 
 /// A compute-mode program (the CS ABI of `cs`).
 pub fn translate_compute(code: &[u8], o: KernelOptions, cs: &CsInterface) -> Result<Kernel, String> {
-    translate_entry(code, o, Entry::Compute(cs.clone()), compact_mode())
+    translate_compute_on(code, o, cs, true)
 }
 
-fn translate_entry(code: &[u8], o: KernelOptions, entry: Entry, compact: Option<bool>) -> Result<Kernel, String> {
+/// `translate_compute` for a GPU: one that runs only 32-lane waves takes larger compact tables.
+pub fn translate_compute_on(code: &[u8], o: KernelOptions, cs: &CsInterface, wave32_only: bool) -> Result<Kernel, String> {
+    translate_compute_rodata(code, o, cs, wave32_only, &[])
+}
+
+/// `translate_compute_on` with the constant data after the program (`translate_entry_rodata`).
+pub fn translate_compute_rodata(code: &[u8], o: KernelOptions, cs: &CsInterface, wave32_only: bool, rodata: &[(u32, Vec<u32>)]) -> Result<Kernel, String> {
+    let tables = if wave32_only { super::compact::TABLE_WORDS_WAVE32 } else { super::compact::TABLE_WORDS };
+    translate_entry_with(code, o, Entry::Compute(cs.clone()), compact_mode(), None, tables, rodata.to_vec())
+}
+
+fn translate_entry(
+    code: &[u8],
+    o: KernelOptions,
+    entry: Entry,
+    compact: Option<bool>,
+    nest: Option<super::compact::Nest>,
+    tables: usize,
+) -> Result<Kernel, String> {
+    translate_entry_with(code, o, entry, compact, nest, tables, Vec::new())
+}
+
+/// A program at `entry` with the constant data the console compiler put after it in the code
+/// region (`xbox::Fssm::rodata`, the recompiler's `Options::rodata`): `s_getpc_b64` plus the
+/// compiler's offset is its address, and dword loads at such an address read the table the
+/// module carries (`Lw::rodata_loads`). The compact tables as `translate_full` /
+/// `translate_compute` take them (a compute program for a GPU with 64-lane waves:
+/// `translate_compute_rodata`).
+pub fn translate_entry_rodata(code: &[u8], o: KernelOptions, entry: Entry, rodata: &[(u32, Vec<u32>)]) -> Result<Kernel, String> {
+    let (compact, tables) = if matches!(entry, Entry::Kernel | Entry::Compute(_)) { (compact_mode(), super::compact::TABLE_WORDS_WAVE32) } else { (None, 0) };
+    translate_entry_with(code, o, entry, compact, None, tables, rodata.to_vec())
+}
+
+fn translate_entry_with(
+    code: &[u8],
+    o: KernelOptions,
+    entry: Entry,
+    compact: Option<bool>,
+    nest: Option<super::compact::Nest>,
+    tables: usize,
+    rodata: Vec<(u32, Vec<u32>)>,
+) -> Result<Kernel, String> {
     // SSA construction recurses along the CFG (one level per guarded memory access between
     // a register's definition and its use): a thread with a large stack for big programs
     let code = code.to_vec();
     std::thread::Builder::new()
         .name("xcl-dxil-translate".into())
         .stack_size(256 << 20)
-        .spawn(move || translate_on_this_thread(&code, o, entry, compact))
+        .spawn(move || translate_on_this_thread(&code, o, entry, compact, nest, tables, rodata))
         .map_err(|e| format!("translator thread: {e}"))?
         .join()
         .map_err(|e| {
@@ -155,7 +221,15 @@ fn mem_windows(s: &mut Shader, mem_windows: u32, coherent: bool) -> (Vec<RawUav>
     ((0..n).map(|k| if coherent { s.raw_uav_coherent(2 + k, 0) } else { s.raw_uav(2 + k, 0) }).collect(), None)
 }
 
-fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry, compact: Option<bool>) -> Result<Kernel, String> {
+fn translate_on_this_thread(
+    code: &[u8],
+    o: KernelOptions,
+    entry: Entry,
+    compact: Option<bool>,
+    nest: Option<super::compact::Nest>,
+    tables: usize,
+    rodata: Vec<(u32, Vec<u32>)>,
+) -> Result<Kernel, String> {
     let geo = match &entry {
         Entry::Geometry(g) => Some(g.clone()),
         _ => None,
@@ -165,14 +239,19 @@ fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry, compact
         None => Cfg::build(code)?,
     };
     let kernel = matches!(entry, Entry::Kernel);
+    let follow_loads = matches!(entry, Entry::Kernel | Entry::Compute(_));
     let gfx = matches!(entry, Entry::Vertex(_) | Entry::Pixel(_));
     let compute = matches!(entry, Entry::Compute(_));
     let split = o.wave64 && o.split && !gfx;
     let leaders: BTreeSet<u64> = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
     let mut lw = Lw::new(&cfg.insts, &leaders, o, &entry);
+    lw.rodata = rodata;
     let uses_lds = lw.lds.is_some();
     let res = lw.res;
     let io = lw.init.io.expect("the I/O buffer");
+    let mut split_tid = None;
+    // a compute program: whether this group runs (`compute_init`: not past a folded dispatch's count)
+    let mut group_runs = None;
     let numthreads = match &entry {
         Entry::Kernel => {
             lw.setup_lanes();
@@ -185,7 +264,8 @@ fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry, compact
         }
         Entry::Compute(cs) => {
             let (tid, gtid) = lw.setup_lanes_compute(cs.threads, uses_lds);
-            compute_init(&mut lw, cs, tid, gtid);
+            if split && !uses_lds && cs.threads == [64, 1, 1] { split_tid = Some(tid); }
+            group_runs = Some(compute_init(&mut lw, cs, tid, gtid));
             cs.threads
         }
         Entry::Mesh(ms) => {
@@ -238,7 +318,7 @@ fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry, compact
     }
 
     let plan = if (compute || kernel) && compact.unwrap_or_else(|| super::compact::large(&cfg)) { super::compact::plan(&cfg, &lw) } else { None };
-    let plan = plan.filter(|p| compact.unwrap_or_else(|| super::compact::wanted(&cfg, p)));
+    let plan = plan.filter(|p| compact.unwrap_or_else(|| super::compact::wanted(&cfg, p, tables)));
     if let Some(p) = &plan {
         crate::xlog_info!("[SHADER] direct DXIL compact form: {} blocks of {} kinds", p.order.len(), p.rep.len());
     }
@@ -277,6 +357,8 @@ fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry, compact
     }
     let h0 = if plan.is_some() { lw.block(None) } else { head(&mut lw, entry) };
     let exit = lw.block(None);
+    // where `Block(0)` goes
+    let mut first = h0;
     if gs_only {
         // the GS alone: in the lower hardware wave only
         let gate = lw.block(Some(1));
@@ -284,13 +366,29 @@ fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry, compact
         lw.s.m.set_block(gate);
         let up = lw.upper;
         lw.cond_br(up, exit, h0);
+    } else if let Some(runs) = group_runs {
+        // a folded dispatch's groups past the console's count leave at once (the whole group:
+        // no barrier waits on them)
+        let gate = lw.block(Some(1));
+        lw.edge(Block(0), gate);
+        lw.s.m.set_block(gate);
+        lw.cond_br(runs, h0, exit);
+        first = gate;
     } else {
         lw.edge(Block(0), h0);
     }
     let switch = if two_phase { Some(lw.block(None)) } else { None };
+    // a compute program's loops: each entry has its own count of passes besides the lane's budget
+    let passes = if compute && plan.is_none() && !cfg.headers.is_empty() { Some(loop_passes(&mut lw, &cfg, numthreads.iter().product())) } else { None };
+    // scalar loads the program repeats keep their first values (compute programs and kernels:
+    // the other stages enter their code by edges the CFG does not hold)
+    let reloads = if follow_loads { super::reload::analyze(&cfg) } else { Default::default() };
     let mut gs_entry: Option<usize> = None;
     if let Some(p) = &plan {
-        super::compact::emit(&mut lw, &cfg, p, h0, exit)?;
+        match nest {
+            Some(n) => super::compact::emit_with_nest(&mut lw, &cfg, p, h0, exit, n)?,
+            None => super::compact::emit(&mut lw, &cfg, p, h0, exit)?,
+        }
     }
     for &b in cfg.rpo.iter().filter(|_| plan.is_none()) {
         let h = head(&mut lw, b);
@@ -307,6 +405,26 @@ fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry, compact
         }
         let end = if es_block { switch.unwrap() } else { exit };
         if cfg.headers.contains(&b) {
+            if let Some((cap, inside)) = &passes {
+                // this entry of the loop has a pass less (`Em::loop_guard`'s `xcl_n<k>`), and the
+                // loops directly inside it start afresh. In a reducible CFG every path that enters
+                // a loop, first or again, passes the head of the loop around it, which lies outside
+                // the inner one: a reset there is one on each entry. A loop that runs out leaves to
+                // `end` and ends the lane's program, where the HLSL path's break goes on after the
+                // loop: both end a loop that ran away, neither gives a right result.
+                let var = VAR_LOOP_PASSES + b as u32;
+                let n = lw.rd(var);
+                let none = lw.cmpc(Pred::Eq, n, 0);
+                let cont = lw.block(Some(1));
+                lw.cond_br(none, end, cont);
+                lw.s.m.set_block(cont);
+                let one = lw.c(1);
+                let n = lw.sub(n, one);
+                lw.wr(var, n);
+                for &c in inside.get(&b).into_iter().flatten() {
+                    lw.wr(VAR_LOOP_PASSES + c as u32, *cap);
+                }
+            }
             // a lane's loop iterations are capped (the recompiler's LOOP_GUARD)
             let left = lw.rd(VAR_BUDGET);
             let none = lw.cmpc(Pred::Eq, left, 0);
@@ -318,8 +436,10 @@ fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry, compact
             lw.wr(VAR_BUDGET, l);
         }
         for &i in &cfg.blocks[b].insts {
+            lw.reload = reloads.get(b, i);
             lw.inst(&cfg.insts[i])?;
         }
+        lw.reload = None;
         match cfg.blocks[b].term {
             Term::Jump(t) if es_block && in_gs(t) => {
                 // the ES's s_setpc_b64 into the GS: through the phase switch
@@ -388,9 +508,10 @@ fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry, compact
     }
     lw.s.m.ret();
     lw.s.m.set_block(Block(0));
-    lw.s.m.br(h0);
+    lw.s.m.br(first);
     let hw = if split || !o.wave64 { 32 } else { 64 };
-    lw.finish(numthreads, hw)
+    let limit = if compute && (!split || split_tid.is_some()) { dispatch_piece_limit() } else { 0 };
+    lw.finish_dispatch(numthreads, hw, limit, split_tid)
 }
 
 /// True when a pixel shader uses RDNA2 Primitive Ordered Pixel Shading (POPS):
@@ -465,8 +586,11 @@ impl Lw {
             heap_mem,
             res,
             fmt_table: None,
+            rodata: Vec::new(),
+            rodata_table: None,
             fmt_desc_cache: HashMap::new(),
             fmt_comp1_cache: HashMap::new(),
+            reload: None,
             uma_base_val: None,
             ntmp: 0,
             scratch: None,
@@ -477,10 +601,12 @@ impl Lw {
             f32_rm: false,
             track_frexp_denorm: crate::gpu::recomp::emit::tracks_frexp_f32_denorm(insts),
             has_f64_round_op: false,
+            img_writes: crate::gpu::recomp::emit::image_write_srsrcs(insts),
             exec_cache: HashMap::new(),
             xs: None,
             xw: None,
             xc: None,
+            barrier_waves: None,
             waves: 1,
             cw: z,
             xn: z,
@@ -496,6 +622,7 @@ impl Lw {
             whole_live: Default::default(),
             guard_override: None,
             mask_override: None,
+            local_masks: false,
             exchange_error: None,
             pc: 0,
         };
@@ -538,32 +665,66 @@ impl Lw {
         if let (Some(t), true) = (group_threads, split) {
             lw.waves = t.div_ceil(64).max(1);
         }
+        if let (Some(t), Entry::Compute(_) | Entry::Mesh(_)) = (group_threads, entry) {
+            let hw_lanes = if split || !o.wave64 { 32 } else { 64 };
+            lw.barrier_waves = Some(t.div_ceil(hw_lanes).max(1));
+        }
         if split && std::env::var_os("XCL_X64_ALL_MASKS").is_none() {
             lw.whole_live = crate::gpu::recomp::x64_masks::by_pc(insts, kernel);
         }
-        lw.setup_storage(uses_lds, if split { slot } else { 1 });
+        // (before the storage: the spin exchange has its own slots and counters)
         if let (Some(t), true) = (group_threads, split) {
             lw.partner = match t {
                 0..=32 => Partner::Missing,
-                33..=64 => Partner::Present,
+                // One console wave in two hardware halves. The halves of a compute or mesh
+                // group meet through the bounded counters, as those of larger groups do: a
+                // group barrier at every exchange hung NVIDIA GPUs when several such programs
+                // ran at once (device hung, driver event 153: #1727; the change is #1741's).
+                // A geometry program sets its partner by phase (`translate_on_this_thread`).
+                33..=64 if !matches!(entry, Entry::Compute(_) | Entry::Mesh(_)) => Partner::Present,
                 _ => Partner::Spin,
             };
         }
+        lw.setup_storage(uses_lds, if split { slot } else { 1 });
         lw
     }
 
     /// The finished container and the static samplers the program bound, once every block
     /// is closed: `numthreads` and the hardware wave size `hw` for a compute-like entry, the
     /// stage's I/O for a VS / PS.
-    pub fn finish(mut self, numthreads: [u32; 3], hw: u32) -> Result<Kernel, String> {
+    pub fn finish(self, numthreads: [u32; 3], hw: u32) -> Result<Kernel, String> {
+        self.finish_dispatch(numthreads, hw, 0, None)
+    }
+
+    fn finish_dispatch(mut self, numthreads: [u32; 3], hw: u32, limit: usize, split_tid: Option<Value>) -> Result<Kernel, String> {
         if let Some(e) = self.exchange_error.take() {
             return Err(e);
         }
         let stage = self.s.stage;
+        let mut dispatch_chain = None;
         let c = if matches!(stage, Stage::Vertex | Stage::Pixel) {
             let g = self.gfx.take().ok_or("graphics entry without graphics I/O")?;
             let info = if stage == Stage::Pixel { super::graphics::StageInfo::Pixel { early_depth_stencil: false } } else { super::graphics::StageInfo::Vertex };
             self.s.try_finish_graphics(g.io, info)
+        } else if limit > 0 && (numthreads == [32, 1, 1] || split_tid.is_some()) && hw == 32 {
+            self.s.m.optimize();
+            // A single split wave64 meets its other half through group-shared counters its entry
+            // zeroes (`Partner::Spin`), and the exchange's running number counts from the
+            // program's start: a later piece of a chain, a new dispatch, would wait for counts
+            // its own counters never reach. Such a program stays whole.
+            if split_tid.is_some() && self.partner == Partner::Spin {
+                let size: usize = (0..self.s.m.block_count()).map(|b| self.s.m.block_insts(Block(b as u32)).len()).sum();
+                if size > limit {
+                    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if n < 4 || n.is_power_of_two() {
+                        crate::xlog_info!("compute split: a split wave64 compute program of {size} instructions stays whole: its halves exchange through group-shared counters a later dispatch would start again at zero ({} so far)", n + 1);
+                    }
+                }
+            } else {
+                dispatch_chain = self.s.split_compute(numthreads, split_tid, limit).map(std::sync::Arc::new);
+            }
+            self.s.finish_optimized(numthreads, Some(hw))
         } else {
             self.s.try_finish(numthreads, Some(hw))
         }
@@ -574,8 +735,91 @@ impl Lw {
                 return Err(format!("direct DXIL failed validation: {e}\n--- disassembly ---\n{dis}"));
             }
         }
-        Ok(Kernel { dxil: c, static_samplers: self.static_used.iter().map(|&(w, c, _)| (w, c)).collect() })
+        Ok(Kernel { dxil: c, static_samplers: self.static_used.iter().map(|&(w, c, _)| (w, c)).collect(), dispatch_chain })
     }
+}
+
+#[cfg(test)]
+#[test]
+fn dispatch_chain_native_wave64_builds_whole() {
+    use crate::gpu::recomp::runner;
+
+    let threads = [64, 1, 1];
+    let cs = CsInterface { threads, ..Default::default() };
+    let options = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+    let mut lw = Lw::new(&[], &Default::default(), options, &Entry::Compute(cs));
+    let (tid, _) = lw.setup_lanes_compute(threads, false);
+    let offset = lw.shlc(tid, 2);
+    let width = lw.s.wave_lane_count();
+    let mem = lw.mems[0];
+    // conditional updates: blocks the optimiser cannot merge into one
+    for _ in 0..40 {
+        let update = lw.s.m.new_block();
+        let join = lw.s.m.new_block();
+        let taken = lw.cmp(Pred::ULt, tid, width);
+        lw.s.m.cond_br(taken, update, join);
+        lw.s.m.set_block(update);
+        let old = lw.s.raw_load(mem, offset, 1)[0];
+        let new = lw.add(old, width);
+        lw.s.raw_store(mem, offset, &[new]);
+        lw.s.m.br(join);
+        lw.s.m.set_block(join);
+    }
+    lw.s.m.ret();
+    lw.s.m.optimize();
+    // Exercise the native-wave admission gate with an otherwise partitionable CFG.
+    assert!(lw.s.m.dispatch_plan(64).is_some());
+    let program = lw.finish_dispatch(threads, 64, 64, None).unwrap();
+    assert!(program.dispatch_chain.is_none());
+    super::validate::validate(&program.dxil).expect("valid native wave64 whole shader");
+
+    if !runner::wave64_supported().unwrap_or(false) {
+        runner::skip_test("no wave64");
+        return;
+    }
+    let initial: Vec<u32> = (1..=64).collect();
+    let expected: Vec<_> = initial.iter().map(|v| v + 40 * 64).collect();
+    let result = runner::dispatch(&program.dxil, [1, 1, 1], &[], &initial).unwrap();
+    assert_eq!(result, expected);
+}
+
+/// A single split wave64 of a compute group meets its other half through group-shared counters
+/// its entry zeroes (`Partner::Spin`): its program stays whole above the piece limit too.
+#[cfg(test)]
+#[test]
+fn a_split_wave64_compute_program_stays_whole() {
+    let threads = [64, 1, 1];
+    let cs = CsInterface { threads, ..Default::default() };
+    let options = KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
+    let mut lw = Lw::new(&[], &Default::default(), options, &Entry::Compute(cs));
+    assert!(lw.partner == Partner::Spin);
+    let (tid, _) = lw.setup_lanes_compute(threads, false);
+    let offset = lw.shlc(tid, 2);
+    let mem = lw.mems[0];
+    let half = lw.half;
+    let early = lw.exchange(half);
+    // conditional updates: blocks the optimiser cannot merge into one (their edges go to the
+    // SSA too: the spin exchange reads its running number through it)
+    for _ in 0..40 {
+        let update = lw.block(Some(1));
+        let join = lw.block(Some(2));
+        let taken = lw.cmpc(Pred::ULt, tid, 48);
+        lw.cond_br(taken, update, join);
+        lw.s.m.set_block(update);
+        let old = lw.s.raw_load(mem, offset, 1)[0];
+        let new = lw.add(old, early);
+        lw.s.raw_store(mem, offset, &[new]);
+        lw.br(join);
+        lw.s.m.set_block(join);
+    }
+    let late = lw.exchange(tid);
+    lw.s.raw_store(mem, offset, &[late]);
+    lw.s.m.ret();
+    lw.s.m.optimize();
+    assert!(lw.s.m.dispatch_plan(64).is_some(), "the program could be cut");
+    let program = lw.finish_dispatch(threads, 32, 64, Some(tid)).unwrap();
+    assert!(program.dispatch_chain.is_none());
+    super::validate::validate(&program.dxil).expect("valid split wave64 whole shader");
 }
 
 /// The kernel's epilogue: SGPRs and SCC from lane 0, every touched VGPR per lane.
@@ -608,12 +852,28 @@ fn store_registers(lw: &mut Lw, res: super::shader::RawUav) {
 
 /// The compute entry's fixed registers (the HLSL compute mode's prologue): group ids
 /// after the user SGPRs, TG_SIZE, SCC = 0, EXEC = the wave's threads, v0..v2 = thread id.
-pub fn compute_init(lw: &mut Lw, cs: &CsInterface, tid: Value, gtid: [Value; 3]) {
+/// Returns whether this group runs: a dispatch folded into Y (`recomp::IO_GROUP_LIMIT` in `io`
+/// not 0, the console's group count in X) takes its group in X from both ids, and the groups
+/// past that count do not run.
+pub fn compute_init(lw: &mut Lw, cs: &CsInterface, tid: Value, gtid: [Value; 3]) -> Value {
+    let io = lw.init.io.expect("the I/O buffer");
+    let o = lw.c((crate::gpu::recomp::IO_GROUP_LIMIT * 4) as u32);
+    let limit = lw.s.raw_load(io, o, 1)[0];
+    let (gx, gy) = (lw.s.group_id(0), lw.s.group_id(1));
+    let k = lw.c(crate::gpu::recomp::FOLD_X);
+    let rows = lw.mul(gy, k);
+    let flat = lw.add(gx, rows);
+    let folded = lw.cmpc(Pred::Ne, limit, 0);
+    let zero = lw.c(0);
+    let ids = [lw.sel(folded, flat, gx), lw.sel(folded, zero, gy)];
+    let inside = lw.cmp(Pred::ULt, flat, limit);
+    let t = lw.b(true);
+    let runs = lw.sel(folded, inside, t);
     let mut sgpr = HashMap::new();
     let mut next = cs.user_sgprs;
     for k in 0..3 {
         if cs.tgid[k] {
-            let g = lw.s.group_id(k as u32);
+            let g = if k < 2 { ids[k] } else { lw.s.group_id(2) };
             sgpr.insert(next, g);
             next += 1;
         }
@@ -641,6 +901,40 @@ pub fn compute_init(lw: &mut Lw, cs: &CsInterface, tid: Value, gtid: [Value; 3])
         }
     }
     lw.init.compute = Some(ComputeInit { sgpr, vgpr, zero });
+    runs
+}
+
+/// A compute program's count of passes for each entry of a loop (the HLSL compute mode's
+/// `xcl_cap`): the dispatch's share for a group (`IO_LOOP_BUDGET`, loaded once in the entry
+/// block; 0 = not known: `LOOP_BUDGET`) among its `threads`, between `DISPATCH_LOOP_PASSES_MIN`
+/// and `LOOP_BUDGET`, set there for every loop. Returns it and the loops directly inside each
+/// loop (`cfg::loop_parents`), whose counts that loop's head sets back to it.
+fn loop_passes(lw: &mut Lw, cfg: &Cfg, threads: u32) -> (Value, BTreeMap<usize, Vec<usize>>) {
+    use crate::gpu::recomp::{DISPATCH_LOOP_PASSES_MIN, IO_LOOP_BUDGET};
+    let cur = lw.cur();
+    let before = lw.s.m.set_insert_before_term(true);
+    lw.s.m.set_block(lw.init.entry);
+    let io = lw.init.io.expect("io");
+    let off = lw.c(IO_LOOP_BUDGET as u32 * 4);
+    let share = lw.s.raw_load(io, off, 1)[0];
+    let k = lw.c(threads.max(1));
+    let each = lw.bin(super::module::BinOp::UDiv, share, k);
+    let lo = lw.c(DISPATCH_LOOP_PASSES_MIN);
+    let each = lw.umax(each, lo);
+    let hi = lw.c(LOOP_BUDGET);
+    let each = lw.umin(each, hi);
+    let unknown = lw.cmpc(Pred::Eq, share, 0);
+    let cap = lw.sel(unknown, hi, each);
+    let mut inside: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (h, around) in super::cfg::loop_parents(cfg) {
+        lw.wr(VAR_LOOP_PASSES + h as u32, cap);
+        if let Some(p) = around {
+            inside.entry(p).or_default().push(h);
+        }
+    }
+    lw.s.m.set_block(cur);
+    lw.s.m.set_insert_before_term(before);
+    (cap, inside)
 }
 
 /// The mesh entry's registers (the HLSL mesh mode's prologue): SGPRs from `io` with the
@@ -662,6 +956,13 @@ pub fn mesh_init(lw: &mut Lw, ms: &MsInterface, tid: Value, io: super::shader::R
     let vtx = lw.add(vtx, sv);
     let prm = lw.addc(rec, (MESH_HEADER + ms.max_vertices as usize * ms.vert_dwords()) as u32);
     let prm = lw.add(prm, slot);
+    // A record has room for `max_vertices` vertices and `max_primitives` primitives; a thread
+    // past either exports nothing (the console's hardware drops an export past what the program
+    // asked room for). `res` is a root UAV: nothing bounds a store there, and one past the last
+    // record of the buffer is a store to an unmapped address (a retail title's first frames
+    // with mesh programs lost the device to a shader's access to unmapped memory).
+    let vok = lw.cmpc(Pred::ULt, slot, ms.max_vertices);
+    let pok = lw.cmpc(Pred::ULt, slot, ms.max_primitives);
     let zero = lw.c(0);
     let mut sgpr = HashMap::new();
     let o3 = lw.c(12);
@@ -680,7 +981,7 @@ pub fn mesh_init(lw: &mut Lw, ms: &MsInterface, tid: Value, io: super::shader::R
     let mut vgpr = HashMap::new();
     vgpr.insert(5, v5);
     lw.init.compute = Some(ComputeInit { sgpr, vgpr, zero });
-    lw.mesh = Some(super::lower::MeshCtx { rec, vtx, prm, outputs: ms.outputs.clone() });
+    lw.mesh = Some(super::lower::MeshCtx { rec, vtx, prm, vok, pok, outputs: ms.outputs.clone() });
 }
 
 /// EXEC at entry: the console wave's threads (static per wave in the split form: no

@@ -313,7 +313,7 @@ pub fn capture(stage: &str, ptr: usize, len: usize) {
         *st.stats.unknown_parts.entry(p.fourcc.clone()).or_default() += 1;
     }
     drop(g);
-    if !dumps_enabled() {
+    if !dumps_enabled(stage, h) {
         let names: Vec<&str> = parts.iter().map(|p| p.fourcc.as_str()).collect();
         crate::xlog_info!("[SHADER] {stage} {h:016x}: {} B, format {}, parts [{}]", blob.len(), kind.label(), names.join(","));
         if kind == Kind::XboxNative {
@@ -343,9 +343,21 @@ pub fn capture(stage: &str, ptr: usize, len: usize) {
 /// more for that: the report's `recomp_*` counts come from it). Off by default: a retail game's
 /// ~17 000 dumps took 4.8 GB, and translating each again took its loading threads ~0.1 s a
 /// program at every start.
-fn dumps_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("XCL_DUMP_SHADERS").is_ok_and(|v| v == "1"))
+/// `XCL_DUMP_SHADERS=ps,0123456789abcdef`: only the shaders of those stages (as the log names
+/// them: `vs`, `ps`, `cs` …) and the ones with those dump hashes (16 hex digits).
+fn dumps_enabled(stage: &str, h: u64) -> bool {
+    static WANTED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    dump_wanted(WANTED.get_or_init(|| dump_list(&std::env::var("XCL_DUMP_SHADERS").unwrap_or_default())), stage, h)
+}
+
+/// The items of an `XCL_DUMP_SHADERS` value.
+fn dump_list(v: &str) -> Vec<String> {
+    v.split(',').map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty()).collect()
+}
+
+/// Whether a list of `XCL_DUMP_SHADERS` items asks for the shader of `stage` with dump hash `h`.
+fn dump_wanted(list: &[String], stage: &str, h: u64) -> bool {
+    list.iter().any(|s| s == "1" || s.eq_ignore_ascii_case(stage) || (s.len() == 16 && u64::from_str_radix(s, 16) == Ok(h)))
 }
 
 /// Console container without dumps: its FSSM variants and instructions accounted.
@@ -534,6 +546,23 @@ mod tests {
         assert!(parts.iter().any(|p| p.fourcc == "DXIL"));
         let l = rdna2_listing(&blob);
         assert!(l.contains("FSSM #0 [PS]") && l.contains("v_add_f32"), "{l}");
+    }
+
+    /// `XCL_DUMP_SHADERS`: `1` is every shader, a stage name that stage, 16 hex digits one
+    /// shader – and a hash is not taken for a stage, nor "1" for a hash.
+    #[test]
+    fn a_dump_list_names_stages_and_hashes() {
+        let h = 0x0942_b913_6a89_143du64;
+        assert!(dump_wanted(&dump_list("1"), "cs", h));
+        assert!(!dump_wanted(&dump_list(""), "ps", h));
+        assert!(!dump_wanted(&dump_list("0"), "ps", 0));
+        let ps = dump_list(" PS , 0942b9136a89143d ");
+        assert!(dump_wanted(&ps, "ps", 7), "a stage");
+        assert!(dump_wanted(&ps, "vs", h), "a hash, whatever its stage");
+        assert!(!dump_wanted(&ps, "vs", h + 1));
+        assert!(!dump_wanted(&dump_list("0000000000000001"), "vs", 7));
+        assert!(dump_wanted(&dump_list("0000000000000001"), "vs", 1));
+        assert!(!dump_wanted(&dump_list("1x"), "vs", 1), "not every shader");
     }
 
     #[test]

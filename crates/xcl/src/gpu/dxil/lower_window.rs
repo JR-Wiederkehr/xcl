@@ -3,7 +3,7 @@
 //! `xcl_m*` accessors with `Options::heap_windows` (`recomp::emit::mem_accessors`).
 
 use super::lower::{Lw, VAR_WIN};
-use super::module::{Pred, Value};
+use super::module::{CastOp, Pred, Value};
 use crate::gpu::rdna2::Decoded;
 
 /// A term of a 64-bit effective address (`window_at`).
@@ -59,21 +59,81 @@ impl Lw {
         if !self.windowed() {
             return;
         }
-        let mut ea = self.pack64(lo, hi);
-        for &t in adds {
-            let x = match t {
-                Ea::U(v) => self.zext64(v),
-                Ea::K(k) => self.c64(k as u64),
-                Ea::S(v) => self.sext64(v),
-                Ea::Mul(a, b) => {
-                    let (a, b) = (self.zext64(a), self.zext64(b));
-                    self.mul(a, b)
+        let non_zero = |t: &Ea| match *t {
+            Ea::K(0) => false,
+            Ea::U(v) | Ea::S(v) => self.s.m.const_u64(v) != Some(0),
+            Ea::Mul(a, b) => self.s.m.const_u64(a) != Some(0) && self.s.m.const_u64(b) != Some(0),
+            Ea::K(_) => true,
+        };
+        let terms: Vec<Ea> = adds.iter().copied().filter(non_zero).collect();
+        let (mut lo, mut hi) = (lo, hi);
+        let uadd = |lw: &mut Self, lo: &mut Value, hi: &mut Value, add_lo: Value, add_hi: Option<Value>| {
+            if let Some(ah) = add_hi {
+                *hi = lw.add(*hi, ah);
+            }
+            if lw.s.m.const_u64(*lo) == Some(0) {
+                *lo = add_lo;
+            } else {
+                let sum = lw.add(*lo, add_lo);
+                let carry = lw.cmp(Pred::ULt, sum, *lo);
+                *lo = sum;
+                let i32 = lw.s.m.i32();
+                let c32 = lw.s.m.cast(CastOp::ZExt, carry, i32);
+                *hi = lw.add(*hi, c32);
+            }
+        };
+        for (idx, t) in terms.iter().copied().enumerate() {
+            let has_more = idx + 1 < terms.len();
+            match t {
+                Ea::K(k) => {
+                    let kv = self.c(k);
+                    uadd(self, &mut lo, &mut hi, kv, None);
                 }
-            };
-            ea = self.add(ea, x);
+                Ea::U(v) => uadd(self, &mut lo, &mut hi, v, None),
+                Ea::S(v) => match self.s.m.const_u64(v) {
+                    Some(k) if (k as i32) < 0 => {
+                        let neg_k = (k as u32).wrapping_neg();
+                        if self.s.m.const_u64(lo) == Some(0) {
+                            lo = v;
+                            hi = self.addc(hi, u32::MAX);
+                        } else {
+                            let borrow = self.cmpc(Pred::ULt, lo, neg_k);
+                            if has_more {
+                                lo = self.add(lo, v);
+                            }
+                            let i32 = self.s.m.i32();
+                            let b32 = self.s.m.cast(CastOp::ZExt, borrow, i32);
+                            hi = self.sub(hi, b32);
+                        }
+                    }
+                    Some(_) => uadd(self, &mut lo, &mut hi, v, None),
+                    None => {
+                        let sign = self.ashrc(v, 31);
+                        uadd(self, &mut lo, &mut hi, v, Some(sign));
+                    }
+                },
+                Ea::Mul(a, b) => match (self.s.m.const_u64(a), self.s.m.const_u64(b)) {
+                    (Some(1), _) => uadd(self, &mut lo, &mut hi, b, None),
+                    (_, Some(1)) => uadd(self, &mut lo, &mut hi, a, None),
+                    (Some(ka), Some(kb)) => {
+                        let prod = (ka as u32 as u64) * (kb as u32 as u64);
+                        let (plo, phi) = (prod as u32, (prod >> 32) as u32);
+                        if phi != 0 {
+                            hi = self.addc(hi, phi);
+                        }
+                        if plo != 0 {
+                            let plov = self.c(plo);
+                            uadd(self, &mut lo, &mut hi, plov, None);
+                        }
+                    }
+                    _ => {
+                        let (phi, plo) = self.s.umul_wide(a, b);
+                        uadd(self, &mut lo, &mut hi, plo, Some(phi));
+                    }
+                },
+            }
         }
-        let (_, h) = self.unpack64(ea);
-        self.window_hi(h, write);
+        self.window_hi(hi, write);
     }
 
     /// `window_at` of a high dword already computed (`window_read` / `window_write`).
@@ -89,6 +149,76 @@ impl Lw {
             w = self.sel(z, zero, w);
         }
         self.wr(VAR_WIN, w);
+    }
+
+    /// `Lw::rodata` (the HLSL kernel's `xcl_gload`): the dwords `vals` a load read from memory
+    /// at `a`, `a + 4`.. (`a` dword-aligned), with those at a code address inside one of the
+    /// program's constant data blocks replaced by the block's dword. A code address has the
+    /// high dword `CODE_ADDRESS_HI` with several windows (`s_getpc_b64`; the window of the
+    /// access was just selected: `VAR_WIN`) and is the program's offset with one. `vals` as
+    /// they are without data.
+    pub(crate) fn rodata_loads(&mut self, a: Value, vals: Vec<Value>) -> Vec<Value> {
+        let total: usize = self.rodata.iter().map(|b| b.1.len()).sum();
+        if total == 0 {
+            return vals;
+        }
+        let table = match self.rodata_table {
+            Some(g) => g,
+            None => {
+                let words: Vec<u32> = self.rodata.iter().flat_map(|b| b.1.iter().copied()).collect();
+                let words: Vec<Value> = words.into_iter().map(|w| self.s.m.i32c(w)).collect();
+                let i32 = self.s.m.i32();
+                let at = self.s.m.array(total as u64, i32);
+                let init = self.s.m.aggregate(at, &words);
+                let g = self.s.m.global("xcl_rodata", at, 0, Some(init), true, 4);
+                self.rodata_table = Some(g);
+                g
+            }
+        };
+        let code = if self.windowed() {
+            let w = self.rd(VAR_WIN);
+            let base = self.uma_base();
+            let hi = self.c(crate::gpu::recomp::CODE_ADDRESS_HI);
+            let cw = self.sub(hi, base);
+            Some(self.cmp(Pred::Eq, w, cw))
+        } else {
+            None
+        };
+        // per block: `a`'s offset in it, its dword's index in the table, the block's bytes
+        let mut first = 0u32;
+        let mut blocks = Vec::new();
+        for (at, len) in self.rodata.iter().map(|b| (b.0, b.1.len() as u32)).filter(|b| b.1 > 0).collect::<Vec<_>>() {
+            let k = self.c(at);
+            let off = self.sub(a, k);
+            let q = self.lshrc(off, 2);
+            let q = self.addc(q, first);
+            blocks.push((off, q, 4 * len));
+            first += len;
+        }
+        let z = self.c(0);
+        vals.into_iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let i = i as u32;
+                let (mut inside, mut idx) = (None, z);
+                for &(off, q, bytes) in &blocks {
+                    let (o, q) = if i == 0 { (off, q) } else { (self.addc(off, 4 * i), self.addc(q, i)) };
+                    let c = self.cmpc(Pred::ULt, o, bytes);
+                    idx = self.sel(c, q, idx);
+                    inside = Some(match inside {
+                        Some(x) => self.or(x, c),
+                        None => c,
+                    });
+                }
+                let mut inside = inside.expect("a block");
+                if let Some(cw) = code {
+                    inside = self.and(inside, cw);
+                }
+                let p = self.s.m.gep(table, &[z, idx]);
+                let t = self.s.m.load(p, 4);
+                self.sel(inside, t, v)
+            })
+            .collect()
     }
 
     /// The window of a buffer access: V# base `d1[15:0]:d0` plus `adds` (the stride bits

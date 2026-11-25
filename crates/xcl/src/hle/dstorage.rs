@@ -345,11 +345,9 @@ unsafe fn bcpack_fill(r: &Request, target: &FillTarget) -> bool {
     let ok = match target {
         FillTarget::Pages(pages) => crate::hle::kernelx::write_physical_pages(pages, r.destination_page_offset as usize, &bytes),
         FillTarget::Virtual => {
-            if !writable(r.destination as usize, n) {
-                return false;
-            }
+            let Some(dest) = cpu_range(r.destination as usize, n).filter(|&d| writable(d, n)) else { return false };
             if n > 0 {
-                std::ptr::copy_nonoverlapping(bytes.as_ptr(), r.destination as *mut u8, n);
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), dest as *mut u8, n);
             }
             true
         }
@@ -787,6 +785,13 @@ impl Request {
 }
 
 /// Snapshot a `PULONG_PTR` physical page array at enqueue time (callers often stack-allocate it).
+/// `[p, p + len)` overlaps the calling thread's stack.
+fn on_callers_stack(p: usize, len: usize) -> bool {
+    let (mut lo, mut hi) = (0usize, 0usize);
+    unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits(&mut lo, &mut hi) };
+    p < hi && p.saturating_add(len.max(1)) > lo
+}
+
 unsafe fn snapshot_page_array(ptr: u64, offset: u16, byte_len: u32) -> Result<Vec<usize>, HRESULT> {
     if byte_len == 0 {
         return Ok(Vec::new());
@@ -830,6 +835,25 @@ unsafe fn write_title(p: usize, bytes: &[u8]) -> bool {
     let mut done = 0usize;
     let st = NtWriteVirtualMemory(windows_sys::Win32::System::Threading::GetCurrentProcess(), p as *mut c_void, bytes.as_ptr().cast(), bytes.len(), &mut done);
     st >= 0 && done == bytes.len()
+}
+
+/// Where the CPU reads or writes `[p, p + n)` of the title's memory for a request: a GPU view of
+/// its memory in a view window (`d3d12x::view_want`; the CPU cannot touch it) at the CPU view
+/// behind it, whose pages the view's tiles show – a retail title gives DirectStorage the GPU
+/// view's addresses; any other address as it is. None: the range runs past its GPU view, or its
+/// pages are kept apart (the queue's page mappings: written there, it would land in another
+/// page's bytes).
+fn cpu_range(p: usize, n: usize) -> Option<usize> {
+    cpu_range_in(p, n, |a| crate::hle::d3d12x::view_want::is_view(a as u64))
+}
+
+/// `cpu_range`, with `in_view` saying which addresses lie in a view window.
+fn cpu_range_in(p: usize, n: usize, in_view: impl Fn(usize) -> bool) -> Option<usize> {
+    if p == 0 || !in_view(p) {
+        return Some(p);
+    }
+    // (every page of the range, not only its first and last byte)
+    crate::hle::d3d12x::view_want::cpu_run(p as u64, n as u64).map(|c| c as usize)
 }
 
 /// Whether `n` bytes at `p` are committed, writable memory.
@@ -896,14 +920,26 @@ fn note_request(r: &Request) {
             r.intermediate_size
         );
     }
+    // destinations in a GPU view (written at its CPU view, `cpu_range`)
+    if !r.dest_physical_pages() && crate::hle::d3d12x::view_want::is_view(r.destination) {
+        static VIEW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static VIEW_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let k = VIEW.fetch_add(1, Ordering::Relaxed) + 1;
+        let b = VIEW_BYTES.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
+        if k.is_power_of_two() {
+            crate::xlog_info!("DirectStorage: {k} requests so far into a GPU view of the title's memory ({} MB), written at its CPU view", b >> 20);
+        }
+    }
 }
 
 /// Run a request; the destination gets the bytes or nothing.
-unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[usize]>, src_pages: Option<&[usize]>) -> Result<(), HRESULT> {
+unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[usize]>, dest_on_stack: bool, src_pages: Option<&[usize]>) -> Result<(), HRESULT> {
     let n = r.destination_size as usize;
     note_request(r);
-    let sparse_dest = !r.dest_physical_pages() && in_sparse_memory(r.destination as usize, n);
-    if !r.dest_physical_pages() && !sparse_dest && !writable(r.destination as usize, n) {
+    // (a page list is read where it is: only a destination of bytes can be a GPU view)
+    let dest = if r.dest_physical_pages() { r.destination as usize } else { cpu_range(r.destination as usize, n).ok_or(E_ACCESS_VIOLATION)? };
+    let sparse_dest = !r.dest_physical_pages() && in_sparse_memory(dest, n);
+    if !r.dest_physical_pages() && !sparse_dest && !writable(dest, n) {
         return Err(E_ACCESS_VIOLATION);
     }
     let src: Vec<u8> = if r.memory_source() {
@@ -914,11 +950,12 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
                 return Err(E_ACCESS_VIOLATION);
             }
         } else {
-            if !crate::gpu::shader::readable(r.source as usize, r.source_size as usize) {
+            let at = cpu_range(r.source as usize, b.len()).ok_or(E_ACCESS_VIOLATION)?;
+            if !crate::gpu::shader::readable(at, r.source_size as usize) {
                 return Err(E_ACCESS_VIOLATION);
             }
             if !b.is_empty() {
-                std::ptr::copy_nonoverlapping(r.source as *const u8, b.as_mut_ptr(), b.len());
+                std::ptr::copy_nonoverlapping(at as *const u8, b.as_mut_ptr(), b.len());
             }
         }
         b
@@ -961,10 +998,12 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
         // lists in slots of its own table and writes a slot's pages after EnqueueRequest, so at
         // enqueue a slot can still name the pages of its previous request: written there, the
         // data lands in memory the title has since used for something else, or in freed pages.
-        // The list as it is now is taken when all its pages are allocated; otherwise (an array
-        // on the stack, overwritten since) the snapshot.
+        // The list as it is now is taken when all its pages are allocated. A list that was on the
+        // enqueuing thread's stack keeps the snapshot: that memory is reused once the call
+        // returns, and a page ID written there since can belong to another allocation.
         let mut current = vec![0usize; pages.len()];
-        let pages = if read_own(r.destination as usize, current.as_mut_ptr() as *mut u8, std::mem::size_of_val(pages))
+        let pages = if !dest_on_stack
+            && read_own(r.destination as usize, current.as_mut_ptr() as *mut u8, std::mem::size_of_val(pages))
             && current[..] != pages[..]
             && crate::hle::kernelx::physical_pages_live(&current)
         {
@@ -1000,15 +1039,16 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
             return Err(E_ACCESS_VIOLATION);
         }
     } else if n > 0 {
-        crate::hle::kernelx::pagelog::note("DirectStorage write", r.destination as usize, 0, n);
+        crate::hle::kernelx::pagelog::note("DirectStorage write", dest, 0, n);
         if sparse_dest {
-            if !write_title(r.destination as usize, &payload[..n]) {
+            if !write_title(dest, &payload[..n]) {
                 return Err(E_ACCESS_VIOLATION);
             }
         } else {
-            std::ptr::copy_nonoverlapping(payload.as_ptr(), r.destination as *mut u8, n);
+            std::ptr::copy_nonoverlapping(payload.as_ptr(), dest as *mut u8, n);
         }
-        crate::hle::d3d12x::title_textures::note_known_write(r.destination as usize, n);
+        // (where the bytes are: the CPU view's pages are watched and shown, a GPU view's are not)
+        crate::hle::d3d12x::title_textures::note_known_write(dest, n);
     }
     Ok(())
 }
@@ -1045,6 +1085,8 @@ enum Entry {
         req: Request,
         file: Option<Arc<FileInner>>,
         dest_pages: Option<Vec<usize>>,
+        /// the destination page list was on the enqueuing thread's stack (`on_callers_stack`)
+        dest_on_stack: bool,
         src_pages: Option<Vec<usize>>,
     },
     /// refused at enqueue: reported in queue order by the worker (unless cancelled, as a request)
@@ -1199,12 +1241,12 @@ impl QueueInner {
             return;
         }
         match e {
-            Entry::Request { seq, req, file, dest_pages, src_pages } => {
+            Entry::Request { seq, req, file, dest_pages, dest_on_stack, src_pages } => {
                 if self.is_cancelled(seq, req.tag) {
                     // Cancelled requests are skipped without affecting status or error record.
                     return;
                 }
-                if let Err(hr) = unsafe { execute(&req, file.as_deref(), dest_pages.as_deref(), src_pages.as_deref()) } {
+                if let Err(hr) = unsafe { execute(&req, file.as_deref(), dest_pages.as_deref(), dest_on_stack, src_pages.as_deref()) } {
                     self.update_error(hr, req, file.as_deref(), since_status);
                 }
             }
@@ -1265,8 +1307,8 @@ impl QueueInner {
         }
     }
 
-    fn enqueue_request(self: &Arc<Self>, req: Request, file: Option<Arc<FileInner>>, dest_pages: Option<Vec<usize>>, src_pages: Option<Vec<usize>>) {
-        self.enqueue_numbered(|seq| Entry::Request { seq, req, file, dest_pages, src_pages });
+    fn enqueue_request(self: &Arc<Self>, req: Request, file: Option<Arc<FileInner>>, dest_pages: Option<Vec<usize>>, dest_on_stack: bool, src_pages: Option<Vec<usize>>) {
+        self.enqueue_numbered(|seq| Entry::Request { seq, req, file, dest_pages, dest_on_stack, src_pages });
     }
 
     /// A request refused at enqueue, numbered as a request so `CancelRequestsWithTag` covers it.
@@ -1456,7 +1498,8 @@ unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) 
     } else {
         None
     };
-    q.enqueue_request(r, file, dest_pages, src_pages);
+    let dest_on_stack = dest_pages.as_ref().is_some_and(|p| on_callers_stack(r.destination as usize, std::mem::size_of_val(&p[..])));
+    q.enqueue_request(r, file, dest_pages, dest_on_stack, src_pages);
 }
 
 unsafe extern "system" fn queue_enqueue_status(p: *mut c_void, array: *mut c_void, index: u32) {
@@ -1767,6 +1810,70 @@ mod tests {
         assert_eq!(Request::parse(&request(7 << BCPACK_SHIFT, 0x1000, 24, 0x2000, 0, 20)).check(false), Err(E_DESTINATION_SIZE), "BCPack BC7 part block");
         assert_eq!(Request::parse(&request(4 << BCPACK_SHIFT, 0x1000, 12, 0x2000, 0, 20)).check(false), Err(E_DESTINATION_SIZE), "BCPack BC4 part block");
         assert_eq!(Request::parse(&request(0, 0, 64, 0x2000, 0, 64)).check(false), Err(E_ACCESS_VIOLATION));
+    }
+
+    /// A destination (or memory source) in a GPU view of the title's memory is reached at the CPU
+    /// view behind it – the CPU cannot touch the GPU view, and such a request failed with
+    /// E_ACCESS_VIOLATION; a range that runs past the view is refused, and every other address,
+    /// every one without view windows too, is used as it is.
+    #[test]
+    fn a_range_in_a_gpu_view_is_reached_at_its_cpu_view() {
+        use crate::hle::kernelx::mirrors;
+        const SIZE: usize = 67 << 16;
+        // (addresses far above anything Windows hands out: only the pairing is used)
+        let (c, g) = (0x7250_0000_0000usize, 0x7258_0000_0000usize);
+        mirrors::reserved(c, SIZE, 0x2040_2000, 0x04);
+        assert!(mirrors::reserved(g, SIZE, 0x2040_2000, 0x801));
+        let view = |a: usize| (g..g + SIZE).contains(&a);
+        assert_eq!(cpu_range_in(g + 0x1_2340, 0x800, view), Some(c + 0x1_2340));
+        assert_eq!(cpu_range_in(g + SIZE - 0x100, 0x100, view), Some(c + SIZE - 0x100));
+        assert_eq!(cpu_range_in(g + SIZE - 0x100, 0x101, view), None, "past the view's end");
+        assert_eq!(cpu_range_in(g, 0, view), Some(c));
+        assert_eq!(cpu_range_in(c + 0x40, 0x100, view), Some(c + 0x40), "the CPU view itself");
+        assert_eq!(cpu_range_in(g + 0x40, 0x100, |_| false), Some(g + 0x40), "no view windows: as it was");
+        mirrors::released(c);
+        assert_eq!(cpu_range_in(g + 0x40, 0x100, view), Some(g + 0x40), "unpaired: as it was (and refused where it is written)");
+    }
+
+    /// A range over GPU-view pages the queue's page mappings keep apart is refused (it would be
+    /// written into another page's bytes); one inside a single page is reached where that page is
+    /// kept, and one over pages never named at the CPU view, as before.
+    #[test]
+    fn a_range_over_gpu_view_pages_kept_apart_is_refused() {
+        use crate::hle::d3d12x::view_want::cpu_run;
+        use crate::hle::kernelx::{self, mirrors::{self, PAGE}};
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        unsafe {
+            if crate::gpu::uma::get().is_none() {
+                return crate::gpu::recomp::runner::skip_test("no unified memory");
+            }
+            // a pair of views of a size of the test's own, and two physical pages at their home:
+            // the pool
+            let size = 229 * PAGE;
+            let c = VirtualAlloc(std::ptr::null(), size, MEM_RESERVE, PAGE_READWRITE) as usize;
+            let g = VirtualAlloc(std::ptr::null(), size, MEM_RESERVE, PAGE_READWRITE) as usize;
+            assert!(c != 0 && g != 0);
+            mirrors::reserved(c, size, 0x2040_2000, 0x04);
+            assert!(mirrors::reserved(g, size, 0x2040_2000, 0x801));
+            let (mut n, mut pages) = (2usize, [0usize; 2]);
+            assert_eq!(kernelx::AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut n, pages.as_mut_ptr()), 1);
+            let home = kernelx::MapTitlePhysicalPages(std::ptr::null_mut(), 2, 0, 4, pages.as_mut_ptr()) as usize;
+            assert_ne!(home, 0);
+            // pool page 1 at view page 0, pool page 0 at view page 1: kept apart
+            let ranges: [[u32; 3]; 2] = [[0, 1, 1], [0, 0, 1]];
+            let batch = [g as u64, 2, ranges.as_ptr() as u64];
+            assert!(mirrors::apply_batches(1, batch.as_ptr() as usize, home, 2).is_some());
+            let view = |a: usize| (g..g + size).contains(&a);
+            assert_eq!(cpu_run(g as u64, 2 * PAGE as u64), None);
+            assert_eq!(cpu_range_in(g + PAGE - 8, 16, view), None, "over two pages kept apart");
+            assert_eq!(cpu_range_in(g + 8, 16, view), Some(home + PAGE + 8), "inside one: where it is kept");
+            assert_eq!(cpu_range_in(g + PAGE + 8, 16, view), Some(home + 8));
+            assert_eq!(cpu_range_in(g + 2 * PAGE, 2 * PAGE, view), Some(c + 2 * PAGE), "pages never named: the CPU view");
+            kernelx::FreeTitlePhysicalPages(std::ptr::null_mut(), 2, pages.as_mut_ptr());
+            mirrors::released(c);
+            VirtualFree(c as *mut c_void, 0, MEM_RELEASE);
+            VirtualFree(g as *mut c_void, 0, MEM_RELEASE);
+        }
     }
 
     #[test]
@@ -2434,76 +2541,6 @@ mod tests {
         }
     }
 
-    /// A title's table slot still names its previous request's page at enqueue and gets this
-    /// request's page before Submit: the data goes to the page named at execution, and the old
-    /// page (in use for something else by then) is left alone.
-    #[test]
-    fn a_destination_page_rewritten_after_enqueue() {
-        use crate::hle::kernelx::{AllocateTitlePhysicalPages, FreeTitlePhysicalPages, MapTitlePhysicalPages, PHYS_PAGE_SIZE};
-        if crate::gpu::uma::get().is_none() {
-            return;
-        }
-        unsafe {
-            let mut count = 2usize;
-            let mut pages = [0usize; 2];
-            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut count, pages.as_mut_ptr()), 1);
-
-            let mut f = std::ptr::null_mut();
-            assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
-            let vt = *(f as *const *const usize);
-            let create_queue: unsafe extern "system" fn(*mut c_void, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(3));
-            let create_status: unsafe extern "system" fn(*mut c_void, u32, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(5));
-            let mut desc = [0u8; 0x18];
-            desc[0..4].copy_from_slice(&1u32.to_le_bytes());
-            desc[8..10].copy_from_slice(&16u16.to_le_bytes());
-            desc[10] = 2;
-            let mut q = std::ptr::null_mut();
-            assert_eq!(create_queue(f, desc.as_ptr(), &IID_QUEUE, &mut q), S_OK);
-            let mut s = std::ptr::null_mut();
-            assert_eq!(create_status(f, 1, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
-            let qv = *(q as *const *const usize);
-            let enqueue: unsafe extern "system" fn(*mut c_void, *const u8) = std::mem::transmute(*qv.add(3));
-            let status: unsafe extern "system" fn(*mut c_void, *mut c_void, u32) = std::mem::transmute(*qv.add(4));
-            let submit: unsafe extern "system" fn(*mut c_void) = std::mem::transmute(*qv.add(6));
-            let sv = *(s as *const *const usize);
-            let complete: unsafe extern "system" fn(*mut c_void, u32) -> bool = std::mem::transmute(*sv.add(3));
-            let hresult: unsafe extern "system" fn(*mut c_void, u32) -> HRESULT = std::mem::transmute(*sv.add(4));
-
-            let reserved = windows_sys::Win32::System::Memory::VirtualAlloc(
-                std::ptr::null(),
-                2 * PHYS_PAGE_SIZE,
-                windows_sys::Win32::System::Memory::MEM_RESERVE,
-                windows_sys::Win32::System::Memory::PAGE_READWRITE,
-            );
-            assert!(!reserved.is_null());
-            assert_eq!(MapTitlePhysicalPages(reserved, 2, 0, 4, pages.as_mut_ptr()), reserved);
-            let old_page = std::slice::from_raw_parts_mut(reserved as *mut u8, 0x100);
-            old_page.fill(0xAB);
-
-            let data: Vec<u8> = (0..0x100u32).map(|i| (i * 7 + 1) as u8).collect();
-            let mut slot = Box::new([pages[0]]);
-            enqueue(q, request_ex(SOURCE_MEMORY_BIT | DEST_PHYS_PAGES_BIT, slot.as_ptr() as u64, 0, data.len() as u32, data.as_ptr() as u64, 0, data.len() as u32, 0, 0).as_ptr());
-            std::ptr::write_volatile(&mut slot[0], pages[1]);
-            status(q, s, 0);
-            submit(q);
-            let t = std::time::Instant::now();
-            while !complete(s, 0) && t.elapsed().as_secs() < 5 {
-                std::thread::yield_now();
-            }
-            assert_eq!(hresult(s, 0), S_OK);
-            let new_page = std::slice::from_raw_parts((reserved as *const u8).add(PHYS_PAGE_SIZE), data.len());
-            assert_eq!(new_page, &data[..], "the data goes to the page the slot names at execution");
-            assert!(old_page.iter().all(|&b| b == 0xAB), "the slot's previous page is left alone");
-
-            MapTitlePhysicalPages(reserved, 2, 0, 4, std::ptr::null_mut());
-            windows_sys::Win32::System::Memory::VirtualFree(reserved, 0, windows_sys::Win32::System::Memory::MEM_RELEASE);
-            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 2, pages.as_mut_ptr()), 1);
-            queue_close(q);
-            queue_release(q);
-            status_release(s);
-        }
-    }
-
     /// A destination page array with a deferred (0) entry whose memory is decommitted while
     /// requests are on the queue (#476): the worker's reread fails the request
     /// (E_ACCESS_VIOLATION) and never faults, whatever the array's state at that moment.
@@ -2569,6 +2606,95 @@ mod tests {
             assert_eq!(hresult(s, 0), E_ACCESS_VIOLATION);
 
             VirtualFree(table as *mut c_void, 0, MEM_RELEASE);
+            queue_close(q);
+            queue_release(q);
+            status_release(s);
+        }
+    }
+
+    /// A title's table slot still names its previous request's page at enqueue and gets this
+    /// request's page before Submit: the data goes to the page named at execution, and the old
+    /// page (in use for something else by then) is left alone. A list on the enqueuing thread's
+    /// stack keeps its snapshot: a page written there since, though allocated, is not taken.
+    #[test]
+    fn a_destination_page_rewritten_after_enqueue() {
+        use crate::hle::kernelx::{AllocateTitlePhysicalPages, FreeTitlePhysicalPages, MapTitlePhysicalPages, PHYS_PAGE_SIZE};
+        if crate::gpu::uma::get().is_none() {
+            return;
+        }
+        unsafe {
+            let mut count = 2usize;
+            let mut pages = [0usize; 2];
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut count, pages.as_mut_ptr()), 1);
+
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let create_queue: unsafe extern "system" fn(*mut c_void, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(3));
+            let create_status: unsafe extern "system" fn(*mut c_void, u32, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(5));
+            let mut desc = [0u8; 0x18];
+            desc[0..4].copy_from_slice(&1u32.to_le_bytes());
+            desc[8..10].copy_from_slice(&16u16.to_le_bytes());
+            desc[10] = 2;
+            let mut q = std::ptr::null_mut();
+            assert_eq!(create_queue(f, desc.as_ptr(), &IID_QUEUE, &mut q), S_OK);
+            let mut s = std::ptr::null_mut();
+            assert_eq!(create_status(f, 2, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
+            let qv = *(q as *const *const usize);
+            let enqueue: unsafe extern "system" fn(*mut c_void, *const u8) = std::mem::transmute(*qv.add(3));
+            let status: unsafe extern "system" fn(*mut c_void, *mut c_void, u32) = std::mem::transmute(*qv.add(4));
+            let submit: unsafe extern "system" fn(*mut c_void) = std::mem::transmute(*qv.add(6));
+            let sv = *(s as *const *const usize);
+            let complete: unsafe extern "system" fn(*mut c_void, u32) -> bool = std::mem::transmute(*sv.add(3));
+            let hresult: unsafe extern "system" fn(*mut c_void, u32) -> HRESULT = std::mem::transmute(*sv.add(4));
+
+            let reserved = windows_sys::Win32::System::Memory::VirtualAlloc(
+                std::ptr::null(),
+                2 * PHYS_PAGE_SIZE,
+                windows_sys::Win32::System::Memory::MEM_RESERVE,
+                windows_sys::Win32::System::Memory::PAGE_READWRITE,
+            );
+            assert!(!reserved.is_null());
+            assert_eq!(MapTitlePhysicalPages(reserved, 2, 0, 4, pages.as_mut_ptr()), reserved);
+            let old_page = std::slice::from_raw_parts_mut(reserved as *mut u8, 0x100);
+            old_page.fill(0xAB);
+
+            let data: Vec<u8> = (0..0x100u32).map(|i| (i * 7 + 1) as u8).collect();
+            let mut slot = Box::new([pages[0]]);
+            enqueue(q, request_ex(SOURCE_MEMORY_BIT | DEST_PHYS_PAGES_BIT, slot.as_ptr() as u64, 0, data.len() as u32, data.as_ptr() as u64, 0, data.len() as u32, 0, 0).as_ptr());
+            std::ptr::write_volatile(&mut slot[0], pages[1]);
+            status(q, s, 0);
+            submit(q);
+            let t = std::time::Instant::now();
+            while !complete(s, 0) && t.elapsed().as_secs() < 5 {
+                std::thread::yield_now();
+            }
+            assert_eq!(hresult(s, 0), S_OK);
+            let new_page = std::slice::from_raw_parts((reserved as *const u8).add(PHYS_PAGE_SIZE), data.len());
+            assert_eq!(new_page, &data[..], "the data goes to the page the slot names at execution");
+            assert!(old_page.iter().all(|&b| b == 0xAB), "the slot's previous page is left alone");
+
+            // the same on the enqueuing thread's stack: rewritten after enqueue with another live
+            // page, the list keeps its snapshot
+            let other = std::slice::from_raw_parts_mut((reserved as *mut u8).add(PHYS_PAGE_SIZE), data.len());
+            other.fill(0xCD);
+            let data2: Vec<u8> = (0..0x100u32).map(|i| (i * 3 + 5) as u8).collect();
+            let mut on_stack = [pages[0]];
+            enqueue(q, request_ex(SOURCE_MEMORY_BIT | DEST_PHYS_PAGES_BIT, on_stack.as_ptr() as u64, 0, data2.len() as u32, data2.as_ptr() as u64, 0, data2.len() as u32, 0, 0).as_ptr());
+            std::ptr::write_volatile(&mut on_stack[0], pages[1]);
+            status(q, s, 1);
+            submit(q);
+            let t = std::time::Instant::now();
+            while !complete(s, 1) && t.elapsed().as_secs() < 5 {
+                std::thread::yield_now();
+            }
+            assert_eq!(hresult(s, 1), S_OK);
+            assert_eq!(&old_page[..], &data2[..], "a list on the stack: the page of its snapshot");
+            assert!(other.iter().all(|&b| b == 0xCD), "the page written on the stack since is left alone");
+
+            MapTitlePhysicalPages(reserved, 2, 0, 4, std::ptr::null_mut());
+            windows_sys::Win32::System::Memory::VirtualFree(reserved, 0, windows_sys::Win32::System::Memory::MEM_RELEASE);
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 2, pages.as_mut_ptr()), 1);
             queue_close(q);
             queue_release(q);
             status_release(s);

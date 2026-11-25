@@ -1,41 +1,40 @@
-XCL - modified build 13
+XCL - modified build 14
 ======================
 
 This is NOT an official XCL release. It is XCL (https://github.com/xcl-dev/xcl, GPL-2.0-only)
-built from upstream commit 7f7e768 (2026-11-24) plus the changes listed below. The complete
-source of this build is at https://github.com/theaustinayers/xcl (tag v0.1.0-mod.13, branch
-modified-build). The licence is in LICENSE.txt, third-party notices in THIRD_PARTY.md.
+built from upstream commit 68a284a (2026-11-25) plus the changes listed below. The complete
+source of this build is at https://github.com/theaustinayers/xcl (tag v0.1.0-mod.14, branch
+build-14). The licence is in LICENSE.txt, third-party notices in THIRD_PARTY.md.
 
-What changed since build 12
+What changed since build 13
 ---------------------------
-- The tested game reaches its opening scene in the 3D world and its first controls prompt and
-  keeps running: two runs of five minutes on an RTX 5090 ended without a hang, a crash or a
-  driver error (2,446 and 2,012 frames). In the world it shows 5 - 10 frames a second; menus
-  and intro 30. It is still NOT PLAYABLE: the picture of the 3D world is grey, because the
-  pipelines of its geometry are refused and part of the memory its shaders read cannot be
-  reached yet; and the picture stands still for long stretches while the game's big graphics
-  pipelines are compiled one after another (5 - 7 s each in the NVIDIA driver). Both are the
-  next thing.
-- The freeze after about 30 s in the world: command lists that had been split kept old pieces and
-  sent them again every frame (upstream pull request #929); waits were taken for deadlocks and
-  released too early (#2052); the console's cache flushes are real barriers; garbage indirect
-  draw and dispatch counts are not run.
-- Loading: the memory a game maps a page at a time is mapped together (upstream pull requests
-  #1517, #1792, #1184 and two fixes on top): 142 -> 3.2 microseconds a page in a test of 8,192
-  pages; the gap without a picture on the first loading screen went from 8 - 10 s to 4 s.
-- Submits: small writes of the CPU go up in one dispatch, only what changed of a texture goes up,
-  what each recorded call looks up has its own lock, releases are left to a thread. In the world
-  2 - 3 times the work a second of the build before.
-- A copy of the committed memory window and the game's big heaps in video memory (upstream pull
-  requests #1329 and the settings below).
-- Textures whose memory is not all there yet are read region by region: the world loads with
-  12 - 56 frames every 2 s where the build before showed 0 - 7.
+- The 3D world of the tested game is no longer grey: its geometry and its textures are drawn.
+  One run of 9 minutes on an RTX 5090 (7.5 of them in the world) ended without a hang, a crash
+  or a driver error. It is still NOT PLAYABLE: about 3 frames a second in the world (XCL's work
+  on the CPU for each submit is the limit), and the colours are wrong - flattened into a few
+  hard bands with a tint. Both are the next thing.
+- Textures: the queue's CopyPageMappingsBatchX maps pages into GPU views (on upstream pull
+  request #1031), a texture over such pages is read where they are kept and goes up again when
+  a mapping under it changes.
+- Geometry: the argument pass of a two-pass ExecuteIndirect(DispatchMesh) sets every view it
+  declares (a fault of the GPU at the start of the world came from one left unset); depth
+  buffers with unordered access get a stencil twin behind XCL_DEPTH_UAV_TWIN=1.
+- NVIDIA: the driver keeps the machine code of the pipelines in use in a reserve of 512 MiB.
+  This game fills it, and the device is then lost without a message (0x887a0005). The reserve
+  can be raised in the driver's profile for xcl.exe: setting 0x001ABC0F (a size in bytes), set
+  here to 2048 MiB with a profile tool run as administrator. The run above was made with it.
+- A device removal says what the list the GPU was in had left, the state of the device and the
+  system's commit; the frame trace names depth buffers and holds a render target only while a
+  view holds it (a crash of traced runs).
+- Memory: about 31 of 32 GB of video memory and 46 - 54 GB of committed memory were in use in
+  the world. A card with less video memory is not expected to get there.
 
 Settings of the run above (environment variables, set them before starting XCL):
-  XCL_DIRECT_DXIL=1  XCL_HEAP_WINDOWS=1  XCL_UMA_SHADOW=1  XCL_COHERENT_HEAPS=sparse:16
-  XCL_LOOK_SKIP=1  XCL_DSTORAGE_PARALLEL_DECOMPRESS=1  XCL_DSTORAGE_WORKERS=8
-  XCL_DSTORAGE_MEMORY_BUDGET_MIB=512  XCL_COPY_THREADS=8
-They need a lot of video memory (28 GB were in use); without them the build runs as upstream's.
+  XCL_UMA_WINDOWS=16  XCL_COPY_THREADS=8  XCL_TEXTURE_SAFE_READ=1
+  XCL_GFX_PSO_WAIT_MS=100  XCL_HUGE_PSO_CONCURRENCY=3  XCL_PSO_IMAGE_SKIP=1
+  XCL_TWO_PASS_MB=4096  XCL_DIRECT_SPLIT_INSTRUCTIONS=0  XCL_NETWORK=0
+The shaders were built ahead of the run (xcl shaders <pack> --precompile, see the README);
+without that the first minutes in the world stand still while they are compiled.
 
 What this build has that upstream's commit does not
 ---------------------------------------------------

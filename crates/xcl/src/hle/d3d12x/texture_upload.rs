@@ -38,6 +38,8 @@ pub(super) struct Item {
     pub changed: Option<Vec<(usize, usize)>>,
     /// where it is kept what its pages held
     pub known: Option<Known>,
+    /// where its pages are read, for a texture in a GPU view whose pages the title mapped
+    pub pages: Option<Arc<PageMap>>,
 }
 
 // ---------------------------------------------------------------------------------------
@@ -114,6 +116,27 @@ pub(super) fn forget(known: &Known) {
     k.hashes.clear();
     k.forgotten += 1;
     k.again = None;
+}
+
+/// What a texture's memory holds from here on is not taken for what the PC texture holds (an
+/// upload going on keeps nothing it reads): its next write sends all of it. What is to go up
+/// again stays.
+pub(super) fn unknown(known: &Known) {
+    let mut k = known.lock().unwrap();
+    k.hashes.clear();
+    k.forgotten += 1;
+}
+
+/// `parts` of a texture (from, to) are not what its PC texture holds (a mapping changed under
+/// them): they go up again with its next upload, with no comparison (`take_again`).
+pub(super) fn stale(known: &Known, parts: Vec<(usize, usize)>) {
+    // (sorted and joined)
+    let parts = join(Change::Parts(Vec::new()), Change::Parts(parts));
+    let mut k = known.lock().unwrap();
+    k.again = Some(match k.again.take() {
+        Some((c, behind)) => (join(c, parts), behind),
+        None => (parts, Vec::new()),
+    });
 }
 
 /// `changed` of a texture (None: all of it) went up on `to`. An older upload of the texture on
@@ -204,6 +227,8 @@ pub(super) struct Written<'a> {
     /// its written pages (sorted addresses)
     pub dirty: &'a [usize],
     pub known: &'a Known,
+    /// where its pages are read (`Item::pages`)
+    pub pages: Option<&'a PageMap>,
 }
 
 /// What became of a texture's written pages.
@@ -267,7 +292,7 @@ pub(super) unsafe fn changed(textures: &[Written], trust: bool) -> (Vec<Change>,
         let look = |g: usize| {
             let group = &pages[groups[g].clone()];
             let (first, last) = (&group[0], &group[group.len() - 1]);
-            read(first.at, last.at + last.len - first.at, |b| {
+            read(textures[first.texture].pages, first.at, last.at + last.len - first.at, |b| {
                 for p in group {
                     let h = content_hash(&b[p.at - first.at..][..p.len]);
                     // SAFETY: see `Page`
@@ -313,10 +338,63 @@ thread_local! {
     static SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
+/// Where the 64 KiB pages of a texture in a GPU view are read, resolved once for an upload
+/// (`kernelx::mirrors::resolve`): a read takes no lock and asks Windows nothing but the bytes.
+pub(super) struct PageMap {
+    /// the 64 KiB page of the texture's first byte
+    first: usize,
+    /// for each page from `first` on: where the page mapped there is kept, 0 for nothing, or (bit
+    /// 0 set) the address read for a page the title never mapped there
+    at: Box<[usize]>,
+}
+
+impl PageMap {
+    const PAGE: usize = crate::hle::kernelx::mirrors::PAGE;
+
+    /// The table of a texture at `va` from `resolve`'s addresses.
+    pub fn new(va: usize, at: Vec<usize>) -> Self {
+        PageMap { first: va & !(Self::PAGE - 1), at: at.into_boxed_slice() }
+    }
+
+    /// The bytes of the texture's address `at` on into `to`, a 64 KiB page at a time: zeros for a
+    /// page that shows nothing (or lies past the table), where it is kept for a mapped page (one
+    /// read: a physical page is committed whole or not at all), as any title memory otherwise.
+    pub unsafe fn copy(&self, at: usize, to: &mut [u8]) {
+        let mut done = 0;
+        while done < to.len() {
+            let a = at + done;
+            let (k, off) = (a.wrapping_sub(self.first) / Self::PAGE, a & (Self::PAGE - 1));
+            let n = (Self::PAGE - off).min(to.len() - done);
+            let piece = &mut to[done..done + n];
+            match self.at.get(k).copied().filter(|_| a >= self.first).unwrap_or(0) {
+                0 => piece.fill(0),
+                p if p & 1 != 0 => super::title_textures::copy_readable((p & !1) + off, piece),
+                p => super::title_textures::copy_or_zeros(p + off, piece),
+            }
+            done += n;
+        }
+    }
+}
+
 /// `f` with the `len` bytes of the title's memory at `at`: where they are in the window that stays
 /// committed, else a copy of them (the title may decommit a page meanwhile on another thread), with
-/// zeros for pages that cannot be read.
-unsafe fn read<R>(at: usize, len: usize, f: impl FnOnce(&[u8]) -> R) -> R {
+/// zeros for pages that cannot be read. With `pages`, they are read where its table says.
+unsafe fn read<R>(pages: Option<&PageMap>, at: usize, len: usize, f: impl FnOnce(&[u8]) -> R) -> R {
+    if let Some(m) = pages {
+        if len > READ {
+            let mut v = vec![0u8; len];
+            m.copy(at, &mut v);
+            return f(&v);
+        }
+        return SCRATCH.with(|s| {
+            let mut s = s.borrow_mut();
+            if s.len() < len {
+                s.resize(READ, 0);
+            }
+            m.copy(at, &mut s[..len]);
+            f(&s[..len])
+        });
+    }
     if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(at, len)) {
         return f(std::slice::from_raw_parts(at as *const u8, len));
     }
@@ -550,7 +628,7 @@ unsafe fn fill_hashed(items: &[Item], pieces: &[Piece], ptr: *mut u8, bytes: u64
                     let p = &pieces[*piece];
                     let (it, c) = (&items[p.item], &items[p.item].tex.texels().unwrap().chain);
                     let from = it.src + p.slice * c.slice_bytes + c.block_at(p.level, bx.start, *by);
-                    read(from, bx.len() * c.layout.block_bytes, |b| {
+                    read(it.pages.as_deref(), from, bx.len() * c.layout.block_bytes, |b| {
                         note(p.item, from, b);
                         c.detile_blocks(b, p.level, p.slice, *by, bx.clone(), p.rect, to.0.add(p.at as usize), p.footprint.RowPitch as usize);
                     });
@@ -559,7 +637,7 @@ unsafe fn fill_hashed(items: &[Item], pieces: &[Piece], ptr: *mut u8, bytes: u64
                     let first = &pieces[range.start];
                     let (it, c) = (&items[first.item], &items[first.item].tex.texels().unwrap().chain);
                     let from = it.src + first.slice * c.slice_bytes;
-                    read(from, c.layout.block_bytes, |b| {
+                    read(it.pages.as_deref(), from, c.layout.block_bytes, |b| {
                         note(first.item, from, b);
                         for p in &pieces[range.clone()] {
                             c.detile_blocks(b, p.level, p.slice, 0, 0..1, p.rect, to.0.add(p.at as usize), p.footprint.RowPitch as usize);
@@ -572,7 +650,7 @@ unsafe fn fill_hashed(items: &[Item], pieces: &[Piece], ptr: *mut u8, bytes: u64
                     let (l, e) = (&c.levels[p.level], c.layout.elem_log2);
                     let (stride, row) = (l.pitch << e, (p.rect.x1 - p.rect.x0) << e);
                     let from = it.src + p.slice * c.slice_bytes + l.offset + y.start * stride + (p.rect.x0 << e);
-                    read(from, y.len() * stride - (p.rect.x0 << e), |b| {
+                    read(it.pages.as_deref(), from, y.len() * stride - (p.rect.x0 << e), |b| {
                         note(p.item, from, b);
                         for (n, y) in y.clone().enumerate() {
                             let dst = to.0.add(p.at as usize + (y - p.rect.y0) * p.footprint.RowPitch as usize);
@@ -584,7 +662,7 @@ unsafe fn fill_hashed(items: &[Item], pieces: &[Piece], ptr: *mut u8, bytes: u64
                     let first = &pieces[range.start];
                     let it = &items[first.item];
                     let s = it.tex.texels().unwrap();
-                    read(it.src, s.size() as usize, |b| {
+                    read(it.pages.as_deref(), it.src, s.size() as usize, |b| {
                         note(first.item, it.src, b);
                         for p in &pieces[range.clone()] {
                             let (l, row) = (&s.chain.levels[p.level], p.rect.x1 * s.bpe as usize);
@@ -796,7 +874,7 @@ mod tests {
         let (src, size) = (base + PAGE + 0x800, 7 * PAGE);
         let known: Known = Default::default();
         let dirty: Vec<usize> = (0..11).map(|k| base + k * PAGE).collect();
-        let look = |dirty: &[usize]| unsafe { changed(&[Written { src, size, dirty, known: &known }], true) };
+        let look = |dirty: &[usize]| unsafe { changed(&[Written { src, size, dirty, known: &known, pages: None }], true) };
         assert_eq!(look(&[]).0, vec![Change::None]);
         assert_eq!(look(&dirty).0, vec![Change::All], "nothing is known of it");
         assert_eq!(look(&dirty[9..]).0, vec![Change::None], "pages it does not lie on");
@@ -819,9 +897,18 @@ mod tests {
         assert_eq!(look(&[base + 5 * PAGE]).0, vec![Change::Parts(vec![(3 * PAGE + 0x800, 4 * PAGE + 0x800)])]);
         assert_eq!(look(&dirty).0, vec![Change::Parts(vec![(0, 0x800), (6 * PAGE + 0x800, size)])]);
         // (without trust every written page has)
-        assert_eq!(unsafe { changed(&[Written { src, size, dirty: &dirty[2..3], known: &known }], false) }.0, vec![Change::Parts(vec![(0x800, PAGE + 0x800)])]);
+        assert_eq!(unsafe { changed(&[Written { src, size, dirty: &dirty[2..3], known: &known, pages: None }], false) }.0, vec![Change::Parts(vec![(0x800, PAGE + 0x800)])]);
         forget(&known);
         assert_eq!(look(&dirty[2..3]).0, vec![Change::All]);
+        // nothing taken for what the PC texture holds: all of it at the next write, and what was to
+        // go up again stays
+        all_sent(&known, src, size);
+        assert_eq!(look(&dirty[3..5]).0, vec![Change::Parts(vec![(PAGE + 0x800, 3 * PAGE + 0x800)])]);
+        known.lock().unwrap().again = Some((Change::Parts(vec![(0, 64)]), Vec::new()));
+        unknown(&known);
+        assert!(known.lock().unwrap().again.is_some());
+        assert_eq!(look(&dirty[3..5]).0, vec![Change::All]);
+        known.lock().unwrap().again = None;
         // several textures at once, many pages: the same as one by one
         let big = vec![7u8; 600 * PAGE];
         let at = (big.as_ptr() as usize).next_multiple_of(PAGE);
@@ -829,7 +916,7 @@ mod tests {
         all_sent(&a, at, 300 * PAGE);
         all_sent(&b, at + 300 * PAGE, 290 * PAGE);
         let pages: Vec<usize> = (0..590).map(|k| at + k * PAGE).collect();
-        let both = || unsafe { changed(&[Written { src: at, size: 300 * PAGE, dirty: &pages, known: &a }, Written { src: at + 300 * PAGE, size: 290 * PAGE, dirty: &pages, known: &b }], true).0 };
+        let both = || unsafe { changed(&[Written { src: at, size: 300 * PAGE, dirty: &pages, known: &a, pages: None }, Written { src: at + 300 * PAGE, size: 290 * PAGE, dirty: &pages, known: &b, pages: None }], true).0 };
         assert_eq!(both(), vec![Change::Parts(vec![(0, 300 * PAGE)]), Change::Parts(vec![(0, 290 * PAGE)])]);
         assert_eq!(both(), vec![Change::None, Change::None]);
     }
@@ -915,7 +1002,7 @@ mod tests {
                 let want = super::super::title_textures::subresources(mem.as_ptr() as usize, &m.tex);
                 for round in 0..5 {
                     let changed = (round > 0).then(|| some_ranges(size, n * 11 + round));
-                    let items = [Item { res: m.res.clone(), src: mem.as_ptr() as usize, tex: Arc::clone(&m.tex), states: vec![D3D12_RESOURCE_STATE_COMMON], changed: changed.clone(), known: None }];
+                    let items = [Item { res: m.res.clone(), src: mem.as_ptr() as usize, tex: Arc::clone(&m.tex), states: vec![D3D12_RESOURCE_STATE_COMMON], changed: changed.clone(), known: None, pages: None }];
                     let (mut pieces, mut bytes) = (Vec::new(), 0u64);
                     plan_item(&dev, 0, &items[0], &mut bytes, &mut pieces).unwrap_or_else(|e| panic!("{kind:?}: {e}"));
                     if round == 0 {
@@ -968,7 +1055,7 @@ mod tests {
                 let s = m.tex.texels().unwrap();
                 let size = m.tex.size() as usize;
                 let first = random_bytes(size, n as u64 * 31 + 3);
-                let item = |mem: &[u8], changed| Item { res: m.res.clone(), src: mem.as_ptr() as usize, tex: Arc::clone(&m.tex), states: vec![D3D12_RESOURCE_STATE_COMMON], changed, known: None };
+                let item = |mem: &[u8], changed| Item { res: m.res.clone(), src: mem.as_ptr() as usize, tex: Arc::clone(&m.tex), states: vec![D3D12_RESOURCE_STATE_COMMON], changed, known: None, pages: None };
                 let (_, all) = run(&[item(&first, None)]);
                 let mut want = super::super::title_textures::subresources(first.as_ptr() as usize, &m.tex);
                 assert!(read_back(&dev, &queue, &m.res, want.len()) == want.iter().map(|w| w.data.clone()).collect::<Vec<_>>(), "{kind:?}: all of it");
@@ -1056,9 +1143,9 @@ mod tests {
             put(0, size);
             let known: Known = Default::default();
             let pages: Vec<usize> = (0..size / PAGE).map(|k| src + k * PAGE).collect();
-            let look = |of: &[usize]| changed(&[Written { src, size, dirty: of, known: &known }], true).0.remove(0);
+            let look = |of: &[usize]| changed(&[Written { src, size, dirty: of, known: &known, pages: None }], true).0.remove(0);
             let upload = |changed: Option<Vec<(usize, usize)>>| {
-                let it = [Item { res: m.res.clone(), src, tex: Arc::clone(&m.tex), states: vec![D3D12_RESOURCE_STATE_COMMON], changed, known: Some(Arc::clone(&known)) }];
+                let it = [Item { res: m.res.clone(), src, tex: Arc::clone(&m.tex), states: vec![D3D12_RESOURCE_STATE_COMMON], changed, known: Some(Arc::clone(&known)), pages: None }];
                 let (mut p, mut bytes) = (Vec::new(), 0u64);
                 plan_item(&dev, 0, &it[0], &mut bytes, &mut p).unwrap();
                 let mut buf = vec![0u8; bytes as usize];
@@ -1159,12 +1246,60 @@ mod tests {
             VirtualAlloc((p + PAGE) as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE);
             std::ptr::write_bytes((p + PAGE) as *mut u8, 0x77, PAGE);
             // (what an earlier read left in the scratch memory does not show)
-            read(p + PAGE, PAGE, |b| assert!(b.iter().all(|&x| x == 0x77)));
-            read(p, 4 * PAGE, |b| {
+            read(None, p + PAGE, PAGE, |b| assert!(b.iter().all(|&x| x == 0x77)));
+            read(None, p, 4 * PAGE, |b| {
                 assert_eq!(b.len(), 4 * PAGE);
                 assert!(b[..PAGE].iter().all(|&x| x == 0) && b[PAGE..2 * PAGE].iter().all(|&x| x == 0x77) && b[2 * PAGE..].iter().all(|&x| x == 0));
             });
             VirtualFree(p as *mut c_void, 0, MEM_RELEASE);
+        }
+    }
+
+    /// A texture whose GPU-view pages are kept apart is read through its table, in one read across
+    /// them: two pages where they are kept, a page that shows nothing, a page never mapped (read as
+    /// any memory) and a page whose memory is gone; and `changed` compares through the table.
+    #[test]
+    fn an_upload_reads_pages_kept_apart() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        const VIEW: usize = 0x1_0000;
+        unsafe {
+            let page = |v: u8| {
+                let p = VirtualAlloc(std::ptr::null(), VIEW, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+                assert_ne!(p, 0);
+                std::ptr::write_bytes(p as *mut u8, v, VIEW);
+                p
+            };
+            let (a, b, c, gone) = (page(0x11), page(0x22), page(0x33), page(0x44));
+            VirtualFree(gone as *mut c_void, 0, MEM_RELEASE);
+            // (the texture's own address: a GPU view's, never touched here)
+            let first = 0x7E5A_0000_0000usize;
+            let m = PageMap::new(first + 0x8000, vec![a, b, 0, c | 1, gone]);
+            let want = |off: usize| match off / VIEW {
+                0 => 0x11,
+                1 => 0x22,
+                3 => 0x33,
+                _ => 0,
+            };
+            read(Some(&m), first + 0x8000, 5 * VIEW - 0x8000, |got| {
+                assert_eq!(got.len(), 5 * VIEW - 0x8000);
+                assert!(got.iter().enumerate().all(|(k, &x)| x == want(k + 0x8000)), "each page from where it is kept");
+            });
+            read(Some(&m), first + VIEW - 0x1000, 0x2000, |got| assert!(got[..0x1000].iter().all(|&x| x == 0x11) && got[0x1000..].iter().all(|&x| x == 0x22)));
+            // past the table: nothing
+            read(Some(&m), first + 5 * VIEW, PAGE, |got| assert!(got.iter().all(|&x| x == 0)));
+            // the written pages compared through the table
+            let (src, size) = (first, 4 * VIEW);
+            let known: Known = Default::default();
+            let dirty: Vec<usize> = (0..size / PAGE).map(|k| src + k * PAGE).collect();
+            let look = || changed(&[Written { src, size, dirty: &dirty, known: &known, pages: Some(&m) }], true).0.remove(0);
+            all_sent(&known, src, size);
+            assert_eq!(look(), Change::Parts(vec![(0, size)]), "nothing was known of them");
+            assert_eq!(look(), Change::None);
+            *((b + 0x1005) as *mut u8) ^= 1;
+            assert_eq!(look(), Change::Parts(vec![(VIEW + 0x1000, VIEW + 0x2000)]), "the page that differs where it is kept");
+            for p in [a, b, c] {
+                VirtualFree(p as *mut c_void, 0, MEM_RELEASE);
+            }
         }
     }
 }
