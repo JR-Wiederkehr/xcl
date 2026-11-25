@@ -13,6 +13,7 @@
 //! 4095 MiB works (exactly 4 GiB is rejected), opening 4 GiB takes ~0.5 s.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
@@ -48,6 +49,8 @@ pub struct Uma {
     inner: Mutex<Inner>,
     /// free ranges of the sparse windows (address → length) and the reservations in them
     sparse_free: Mutex<(BTreeMap<usize, usize>, BTreeMap<usize, usize>)>,
+    /// the committed windows are not the GPU's memory: it has copies of them (`set_shadowed`)
+    shadowed: AtomicBool,
     /// XCL's own pool in window 0 for `Arena` blocks: (start, end, free blocks). The title
     /// cannot take it – a title that commits all of unified memory at start (Unicorn
     /// Overlord: 2046 of 2048 MB) left no room for draw arguments, and draws were skipped.
@@ -152,6 +155,22 @@ impl Uma {
         *self.pool.lock().unwrap() = (p, p + bytes, (p..p + bytes).step_by(ARENA_BLOCK).rev().collect());
     }
 
+    /// Diagnostic: how the committed window stands: free bytes in it in total, the largest free
+    /// run, the bytes in use, and XCL's pool blocks left.
+    pub fn committed_state(&self) -> (usize, usize, usize, usize) {
+        let Some(win) = self.kinds.iter().position(|w| matches!(w, WindowKind::Committed(_))) else { return (0, 0, 0, 0) };
+        let g = self.inner.lock().unwrap();
+        let mine = |o: usize| o / WINDOW == win;
+        let (mut free, mut largest) = (0usize, 0usize);
+        for (_, &l) in g.free.iter().filter(|(&o, _)| mine(o)) {
+            free += l;
+            largest = largest.max(l);
+        }
+        let used = g.used.iter().filter(|(&o, _)| mine(o)).map(|(_, &l)| l).sum();
+        drop(g);
+        (free, largest, used, self.pool.lock().unwrap().2.len())
+    }
+
     /// A block of `ARENA_BLOCK` bytes from XCL's pool (None: the pool is used up or absent).
     fn pool_block(&self) -> Option<usize> {
         self.pool.lock().unwrap().2.pop()
@@ -197,6 +216,7 @@ impl Uma {
                 win_allocs: vec![base, c_base],
                 inner: Mutex::new(inner),
                 sparse_free: Mutex::new(sparse_free),
+                shadowed: AtomicBool::new(false),
                 pool: Mutex::new((0, 0, Vec::new())),
             };
             u.reserve_pool(POOL);
@@ -275,6 +295,23 @@ impl Uma {
     /// size it: on a 4 GiB window ~40 ms a call, a retail game's DirectStorage requests crawled).
     pub fn in_committed_window(&self, p: usize, len: usize) -> bool {
         len > 0 && self.is_committed(p) && p.checked_add(len - 1).is_some_and(|e| self.window_of(e) == self.window_of(p))
+    }
+
+    /// The GPU could not open the committed windows as heaps (`OpenExistingHeapFromAddress`
+    /// not implemented: D3DMetal): each has a buffer in video memory instead, a copy that
+    /// `d3d12x::sparse` keeps in step like a sparse window's tiles.
+    pub fn set_shadowed(&self) {
+        self.shadowed.store(true, Ordering::Release);
+    }
+
+    pub fn shadowed(&self) -> bool {
+        self.shadowed.load(Ordering::Acquire)
+    }
+
+    /// Whether the GPU works on a copy of the memory at `p` (a sparse window, or a committed
+    /// one that is shadowed): what the GPU writes there the CPU sees only after a readback.
+    pub fn is_gpu_copy(&self, p: usize) -> bool {
+        self.is_sparse(p) || (self.shadowed() && self.is_committed(p))
     }
 
     /// Address space for a title reservation of `size` bytes in the sparse windows (64 KiB
@@ -403,6 +440,7 @@ impl Uma {
                     win_allocs,
                     inner: Mutex::new(inner),
                     sparse_free: Mutex::new(Default::default()),
+                    shadowed: AtomicBool::new(false),
                     pool: Mutex::new((0, 0, Vec::new())),
                 });
             }

@@ -7,7 +7,6 @@
 
 #[macro_use]
 pub mod log;
-pub mod prof;
 pub mod manifest;
 pub mod config;
 pub mod disasm;

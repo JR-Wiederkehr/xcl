@@ -17,7 +17,7 @@ prebuilt binaries, game files, keys or shader caches in the source.
 ```powershell
 git clone https://github.com/theaustinayers/xcl
 cd xcl
-git checkout v0.1.0-mod.12        # the tag of the release you want to check
+git checkout v0.1.0-mod.13        # the tag of the release you want to check
 powershell -ExecutionPolicy Bypass -File build.ps1
 ```
 

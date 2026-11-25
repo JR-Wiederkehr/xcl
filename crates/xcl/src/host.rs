@@ -40,25 +40,27 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 [p, e, d, x, f[0], f[1], f[2], f[3], r, b >> 20, fail]
             };
             let mut last = snap();
-            let mut last_prof = crate::prof::snapshot();
+            let mut cost = crate::hle::api_cost::totals();
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(2));
-                let prof = crate::prof::snapshot();
-                let parts: Vec<String> = (0..prof.len()).filter(|&i| prof[i].1 != last_prof[i].1).map(|i| format!("{} {} ms/{}", crate::prof::NAMES[i], prof[i].0 - last_prof[i].0, prof[i].1 - last_prof[i].1)).collect();
-                crate::xlog_info!("xcl time (2 s): {}", parts.join(", "));
-                for line in crate::hle::d3d12x::list_x::sync_dump() {
-                    crate::xlog_info!("sync (2 s): {line}");
-                }
-                if let Some(line) = crate::hle::d3d12x::alloc_pool::stats() {
-                    crate::xlog_info!("allocators (2 s): {line}");
-                }
-                last_prof = prof;
                 let now = snap();
                 let d: Vec<u64> = now.iter().zip(last).map(|(a, b)| a - b).collect();
                 crate::xlog_info!(
                     "activity (2 s): {} presents, {} submits, {} draws, {} dispatches, {} frame-event waits ({} timed out), {} frame statistics ({} not flipped); DirectStorage {} requests, {} MB, {} failed",
                     d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10]
                 );
+                // the time the title's threads spent in some of XCL's calls
+                let spent = crate::hle::api_cost::totals();
+                let calls: Vec<String> = crate::hle::api_cost::CALLS
+                    .iter()
+                    .zip(spent.iter().zip(cost))
+                    .filter(|(_, (n, o))| n.0 > o.0)
+                    .map(|(c, (n, o))| format!("{} {} in {} ms", n.0 - o.0, c.1, (n.1 - o.1) / 1000))
+                    .collect();
+                cost = spent;
+                if !calls.is_empty() {
+                    crate::xlog_info!("calls (2 s, all threads): {}", calls.join(", "));
+                }
                 // where the memory is: the process's commit, video memory, and XCL's parts of it
                 let private = unsafe {
                     use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
@@ -101,19 +103,6 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 crate::eh::dump_threads();
             }
         });
-    }
-    // The console's timer is fine-grained: a title's `Sleep(1)` and short timed waits take about
-    // a millisecond there. A Windows process gets 15.6 ms steps unless it asks (per process since
-    // Windows 10 2004), and a retail title's audio thread then asked for a 20 ms packet only every
-    // 45 – 62 ms (three or four steps): a third of its audio. `XCL_TIMER_RESOLUTION=0` leaves the
-    // system default.
-    if std::env::var("XCL_TIMER_RESOLUTION").map_or(true, |v| v.trim() != "0") {
-        #[link(name = "winmm", kind = "raw-dylib")]
-        extern "system" {
-            fn timeBeginPeriod(period: u32) -> u32;
-        }
-        let r = unsafe { timeBeginPeriod(1) };
-        crate::xlog_info!("timer resolution: 1 ms asked for the process (timeBeginPeriod: {r})");
     }
     // `XCL_RUN_SECONDS=n`: the title ends itself after n seconds – the GPU drained, the log and
     // report written (a process killed from outside with GPU work in flight can hang in the driver)

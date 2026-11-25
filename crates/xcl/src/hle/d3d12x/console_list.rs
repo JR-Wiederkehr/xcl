@@ -83,6 +83,11 @@ const INLINE_SGPRS: u32 = 12;
 const INLINE_SGPRS_GFX: u32 = 24;
 const FIRST_SGPR: usize = 4;
 const FIRST_SGPR_GFX: usize = 8;
+/// Most bytes of root arguments a layout has. The PC's limit is 64 DWORDs (256 bytes: a
+/// constant or a table 1, a root descriptor 2, D3D12 "Root Signature Limits"); the console's
+/// is not known, so 16 times that. A malformed blob (a count of 0x3FFF_FFFF constants) gets no
+/// layout instead of one of gigabytes, which every Set*RootSignature allocates.
+const MAX_ARGS: u32 = 4096;
 
 /// Layout from a serialized root signature: a DXBC container with RTS0 or a bare RTS0.
 pub fn layout_from_blob(blob: &[u8]) -> Option<Layout> {
@@ -108,10 +113,12 @@ pub fn layout_from_blob(blob: &[u8]) -> Option<Layout> {
             _ => Param::Table { at: l.size },
         };
         let bytes = match p {
-            Param::Constants { count, .. } => 4 * count,
+            Param::Constants { count, .. } => count.checked_mul(4)?,
             Param::Table { .. } => 4,
             Param::Descriptor { .. } => 8,
         };
+        // the inline sums below are at most the size
+        let size = l.size.checked_add(bytes).filter(|&s| s <= MAX_ARGS)?;
         spilled |= l.inline + bytes > 4 * INLINE_SGPRS;
         if !spilled {
             l.inline += bytes;
@@ -120,7 +127,7 @@ pub fn layout_from_blob(blob: &[u8]) -> Option<Layout> {
         if !spilled_gfx {
             l.inline_gfx += bytes;
         }
-        l.size += bytes;
+        l.size = size;
         l.params.push(p);
     }
     Some(l)
@@ -297,11 +304,12 @@ struct ListState {
 }
 
 static LISTS: Mutex<Option<HashMap<usize, ListState>>> = Mutex::new(None);
-/// unified-memory blocks of finished recordings, freed when their allocator is reset
+/// unified-memory blocks of finished recordings by the PC allocator they were on, freed when the
+/// GPU is done with it (it is reset, or `alloc_pool` sees it pass their submits)
 static PENDING: Mutex<Option<HashMap<usize, Vec<usize>>>> = Mutex::new(None);
 
-/// Unified-memory blocks a recording on `allocator` uses: freed when it is reset (no
-/// allocator known: kept until the next reset of any – never freed early).
+/// Unified-memory blocks a recording on the PC allocator `allocator` uses: freed when the GPU is
+/// done with it (no allocator known: kept until the next reset of any – never freed early).
 pub(super) fn hold_until_reset(allocator: usize, blocks: Vec<usize>) {
     if !blocks.is_empty() {
         PENDING.lock().unwrap().get_or_insert_with(HashMap::new).entry(allocator).or_default().extend(blocks);
@@ -318,7 +326,8 @@ pub(crate) fn take_pending_for_test(allocator: usize) -> Vec<usize> {
     PENDING.lock().unwrap().as_mut().and_then(|m| m.remove(&allocator)).unwrap_or_default()
 }
 
-/// An allocator was reset: the GPU no longer uses what its recordings put in unified memory.
+/// The GPU no longer uses what recordings on the PC allocator `allocator` put in unified memory:
+/// it was reset, or `alloc_pool` saw the GPU pass their submits.
 pub fn allocator_reset(allocator: *mut c_void) {
     let blocks = PENDING.lock().unwrap().as_mut().and_then(|m| m.remove(&(allocator as usize)));
     if let Some(b) = blocks {
@@ -672,6 +681,7 @@ pub struct Translation {
 /// Turn the recorded console commands into commands on the PC list and close it.
 pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
     let obj = obj as usize;
+    super::title_textures::note_list_closed(obj);
     let mut guard = LISTS.lock().unwrap();
     let st = guard.as_mut().and_then(|m| m.get_mut(&obj)).ok_or("not an XCL console list")?;
     if let Some(last) = st.chunks.last_mut() {
@@ -694,6 +704,8 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
     let mut layout: Option<Arc<Layout>> = None;
     let mut table: Vec<u8> = Vec::new();
     let mut pso: Option<*const ConsolePso> = None;
+    // heap windows (`pso::heap_windows`): a dispatch needs the shared heap even when the list set none
+    let mut heaps_set = false;
     let chunks: Vec<Vec<u32>> = st.chunks.iter().map(|(c, used)| c[..*used].chunks(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect()).collect();
     'chunks: for words in &chunks {
         let mut at = 0usize;
@@ -719,6 +731,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                     }
                 }
                 list.SetDescriptorHeaps(&heaps);
+                heaps_set = true;
                 at += 2 + 2 * n;
             } else if w0 == TRANSITIONS_MARKER {
                 let n = get(1) as usize;
@@ -830,6 +843,12 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                             Some(r) => list.SetComputeRootSignature(r),
                             None => list.SetComputeRootSignature(rs.as_ref().ok_or("no XCL ABI root signature")?),
                         }
+                        if !heaps_set && crate::gpu::recomp::pso::heap_windows() {
+                            if let Some(g) = super::console_heap::global_heap() {
+                                list.SetDescriptorHeaps(&[Some(g)]);
+                                heaps_set = true;
+                            }
+                        }
                         list.SetComputeRootUnorderedAccessView(0, va(io_at));
                         list.SetComputeRootUnorderedAccessView(1, va(res_at));
                         for k in 0..4 {
@@ -838,7 +857,9 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         let raw = real as *mut c_void;
                         let pc = ID3D12PipelineState::from_raw_borrowed(&raw).ok_or("PSO")?;
                         list.SetPipelineState(pc);
+                        let t = super::gpu_profile::begin(list.as_raw(), real, super::gpu_profile::Kind::Dispatch, [x, y, z]);
                         list.Dispatch(x, y, z);
+                        super::gpu_profile::end(list.as_raw(), t);
                         out.dispatches += 1;
                     }
                     _ => out.skipped_dispatches += 1,
@@ -955,6 +976,19 @@ mod tests {
             r.extend([0, 0, count]);
         }
         r.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    /// A blob whose constant count makes the arguments overflow u32 (0x4000_0000) or take
+    /// gigabytes (0x3FFF_FFFF: 0xFFFF_FFFC bytes, allocated at every Set*RootSignature) has no
+    /// layout; the largest one allowed still has one.
+    #[test]
+    fn a_huge_constant_count_has_no_layout() {
+        assert!(layout_from_blob(&rts0(&[(1, 0x4000_0000)])).is_none());
+        assert!(layout_from_blob(&rts0(&[(1, 0x3FFF_FFFF)])).is_none());
+        assert!(layout_from_blob(&rts0(&[(4, 0), (1, 0xFFFF_FFFF)])).is_none());
+        assert!(layout_from_blob(&rts0(&[(1, MAX_ARGS / 4), (0, 0)])).is_none());
+        let l = layout_from_blob(&rts0(&[(1, MAX_ARGS / 4 - 3), (4, 0), (0, 0)])).unwrap();
+        assert_eq!((l.size, l.inline), (MAX_ARGS, 0));
     }
 
     /// What the console's compiler does (its output on these root signatures): parameters in

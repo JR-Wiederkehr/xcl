@@ -62,7 +62,6 @@ pub unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, pl
 }
 
 unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u8) {
-    let _t = crate::prof::scope(crate::prof::Cat::Present);
     let frames = BOUNDARIES.fetch_add(1, Ordering::Relaxed) + 1;
     if frames % 300 == 0 {
         // the title's frame rate, for comparing runs (every 300 frames)
@@ -249,6 +248,11 @@ pub fn known_queues() -> Vec<usize> {
 }
 
 static EXECUTES: AtomicU64 = AtomicU64::new(0);
+
+/// XCL is presenting on this thread (its own copy of the frame is being submitted).
+pub(super) fn presenting() -> bool {
+    IN_PRESENT.with(|c| c.get())
+}
 
 /// (PresentX calls, ExecuteCommandLists calls) so far
 pub fn activity() -> (u64, u64) {

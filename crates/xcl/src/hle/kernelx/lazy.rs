@@ -45,7 +45,6 @@ unsafe fn commit(page: usize) -> bool {
 }
 
 unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
-    let _t = crate::prof::scope(crate::prof::Cat::LazyFault);
     let r = &*(*info).ExceptionRecord;
     if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS || r.NumberParameters < 2 {
         return EXCEPTION_CONTINUE_SEARCH;
@@ -82,6 +81,11 @@ pub(crate) fn mark(page: usize) {
 /// `page` is unmapped: true if it was never used (nothing to keep of it).
 pub(super) fn unmark(page: usize) -> bool {
     LAZY.write().unwrap_or_else(|e| e.into_inner()).remove(&page)
+}
+
+/// Whether `page` is mapped and still not committed.
+pub(super) fn is_marked(page: usize) -> bool {
+    LAZY.read().unwrap_or_else(|e| e.into_inner()).contains(&page)
 }
 
 /// The lazy pages of `[p, p + len)` committed – memory a kernel call or XCL writes.

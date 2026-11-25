@@ -6,7 +6,8 @@
 //!   riid, out), CreateStatusArray(capacity, name, riid, out), SetCpuAffinity(mask),
 //!   SetDebugFlags(flags), SetStagingBufferSize(bytes), then 7 more,
 //! * queue desc (0x18): source type u32 @0 (0 file, 1 memory), capacity u16 @8, priority i8
-//!   @10 (-1 … 2; memory queues 2), name @0x10,
+//!   @10 (-1 … 2; memory queues 2), name @0x10; the newer factory's desc (0x20) adds options
+//!   u64 @0x18 (`DSTORAGE_QUEUE_OPTIONS`: bit 0 `AutoSubmitDisabled`),
 //! * request (0x48): options u64 @0 (`DSTORAGE_REQUEST_OPTIONS`: bit 0 `ZlibDecompress`,
 //!   bits 1–4 `BcpackMode`, bits 5–20 `SwizzleMode`, bit 21 `DestinationIsPhysicalPages`,
 //!   bit 22 `SourceType` (0 file / 1 memory), bit 23 `SourceIsPhysicalPages`),
@@ -27,9 +28,12 @@
 //! VFS like the title's own, memory copies, zlib, BCPack where `hle::bcpack` rebuilds the
 //! blocks of the mode), a status entry gets the first failure of the requests since the
 //! previous one, a signal sets the fence from the CPU. Methods not listed are logged and
-//! answer E_NOTIMPL; the other BCPack modes and the hardware swizzle are refused.
+//! answer E_NOTIMPL; BCPack BC2 and modes above 7, and the hardware swizzle, are refused.
 
 #![allow(non_snake_case)]
+
+#[path = "dstorage/parallel.rs"]
+mod parallel;
 
 use std::ffi::c_void;
 use std::os::windows::fs::FileExt;
@@ -132,7 +136,7 @@ fn bcpack_name(mode: u8) -> String {
     BCPACK_NAMES.get(mode as usize).map_or_else(|| format!("mode {mode}"), |n| n.to_string())
 }
 
-/// BCPack requests refused at enqueue (XCL has no decoder for their mode), by mode.
+/// BCPack requests refused at enqueue (BC2, mode 0 and the modes above 7), by mode.
 struct BcpackRefusals {
     requests: [AtomicU64; 16],
     with_zlib: [AtomicU64; 16],
@@ -196,7 +200,7 @@ pub struct BcpackStats {
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct DStorageStats {
-    /// BCPack requests refused (no decoder), by `DSTORAGE_BCPACK_MODE`
+    /// BCPack requests refused at enqueue, by `DSTORAGE_BCPACK_MODE`
     pub bcpack_refused: BTreeMap<String, BcpackStats>,
     /// BCPack requests the decoder ran on, by `DSTORAGE_BCPACK_MODE`
     #[serde(default)]
@@ -275,15 +279,14 @@ fn bcpack_unpack(r: &Request, packed: &[u8], n: usize) -> Result<Vec<u8>, HRESUL
     }
 }
 
-/// Log a refused BCPack request: one warning per mode and zlib stage, then a running count on
-/// the first 16 refusals and every power of two.
+/// Log a refused BCPack request: one warning per mode, then a count on the first 16 and powers of two.
 fn log_bcpack_refusal(r: &Request, k: u64) {
     let bc = r.bcpack();
     let key = format!("BCPack {}{}", bcpack_name(bc), if r.zlib() { " after zlib" } else { "" });
     warn_once(
         &key,
         format_args!(
-            "mode {bc} unsupported (src={}, intermediate={}, dst={}, swizzle={}); the request fails with E_DECOMPRESSION",
+            "mode {bc} unsupported or disabled (src={}, intermediate={}, dst={}, swizzle={}); the request fails with E_DECOMPRESSION",
             r.source_size,
             r.intermediate_size,
             r.destination_size,
@@ -295,9 +298,8 @@ fn log_bcpack_refusal(r: &Request, k: u64) {
     }
 }
 
-/// `XCL_DSTORAGE_BCPACK_FILL=1`: a refused BCPack destination gets solid blocks of its BCn
-/// format (magenta; red for BC4/BC5) instead of staying as it was, so the title's textures
-/// that wait on BCPack show where they are. The request still fails.
+/// `XCL_DSTORAGE_BCPACK_FILL=1`: a refused BCPack destination gets solid BCn blocks (magenta, red for BC4/BC5).
+/// The request still fails.
 fn bcpack_fill_from_env() -> bool {
     std::env::var("XCL_DSTORAGE_BCPACK_FILL").is_ok_and(|v| !v.trim().is_empty() && v.trim() != "0")
 }
@@ -481,17 +483,25 @@ unsafe extern "system" fn factory_unknown(_p: *mut c_void) -> HRESULT {
     E_NOTIMPL
 }
 
+/// `DSTORAGE_QUEUE_OPTIONS` bit 0: the queue runs its requests only at `Submit`, not when it is
+/// half full.
+const AUTO_SUBMIT_DISABLED: u64 = 1;
+
 /// Slot 10 of the newer factory: CreateQueue with a 0x20-byte desc – the 0x18 of
-/// `factory_create_queue`, then a u64 (a retail game: 1).
-unsafe extern "system" fn factory_create_queue1(p: *mut c_void, desc: *const u8, riid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+/// `factory_create_queue`, then the queue's options u64 (a retail game: `AutoSubmitDisabled`).
+unsafe extern "system" fn factory_create_queue1(_p: *mut c_void, desc: *const u8, riid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+    let mut options = 0;
     if !desc.is_null() {
-        let extra = (desc.add(0x18) as *const u64).read_unaligned();
+        options = (desc.add(0x18) as *const u64).read_unaligned();
         static SEEN: AtomicBool = AtomicBool::new(false);
         if !SEEN.swap(true, Ordering::Relaxed) {
-            crate::xlog_info!("DirectStorage: CreateQueue (0x20 desc), u64 @0x18 = {extra:#x}");
+            crate::xlog_info!("DirectStorage: CreateQueue (0x20 desc), options {options:#x}");
+        }
+        if options & !AUTO_SUBMIT_DISABLED != 0 {
+            warn_once("DSTORAGE_QUEUE_OPTIONS", format_args!("unknown queue option bits {:#x}", options & !AUTO_SUBMIT_DISABLED));
         }
     }
-    factory_create_queue(p, desc, riid, out)
+    create_queue(desc, riid, out, options & AUTO_SUBMIT_DISABLED == 0)
 }
 
 unsafe extern "system" fn factory_set_cpu_affinity(_p: *mut c_void, _mask: u64) -> HRESULT {
@@ -621,7 +631,8 @@ unsafe extern "system" fn factory_create_status_array(_p: *mut c_void, capacity:
     if capacity == 0 || capacity > 1 << 20 {
         return E_INVALIDARG;
     }
-    let inner = Arc::new(StatusInner { slots: (0..capacity).map(|_| AtomicI32::new(E_PENDING)).collect() });
+    // a slot nothing was enqueued into is complete (S_OK); EnqueueStatus makes it E_PENDING
+    let inner = Arc::new(StatusInner { slots: (0..capacity).map(|_| AtomicI32::new(S_OK)).collect() });
     let o = new_object(status_vtbl(), inner);
     let hr = status_qi(o, riid, out);
     status_release(o);
@@ -766,6 +777,11 @@ impl Request {
                 }
             }
         }
+        if let Some(block) = super::bcpack::block_size(self.bcpack()) {
+            if self.destination_size == 0 || self.destination_size as usize % block != 0 {
+                return Err(E_DESTINATION_SIZE);
+            }
+        }
         Ok(())
     }
 }
@@ -794,6 +810,26 @@ unsafe fn read_own(at: usize, out: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0usize;
     at != 0 && ReadProcessMemory(GetCurrentProcess(), at as *const c_void, out as *mut c_void, len, &mut done) != 0 && done == len
+}
+
+/// Whether `[p, p + n)` lies in XCL's sparse windows: memory the title's GPU heaps are in. XCL
+/// commits their allocations whole; a part of one that the title gave back is found by the write
+/// (`write_title`), not by a query of the pages (a VirtualQuery there walks to the end of the
+/// committed run: 3-5 ms each for a 1-2 GB heap).
+fn in_sparse_memory(p: usize, n: usize) -> bool {
+    let Some(u) = crate::gpu::uma::get() else { return false };
+    n > 0 && u.is_sparse(p) && p.checked_add(n - 1).is_some_and(|e| u.is_sparse(e))
+}
+
+/// The bytes into the title's memory; false when the memory is not there (a write that faults).
+unsafe fn write_title(p: usize, bytes: &[u8]) -> bool {
+    #[link(name = "ntdll", kind = "raw-dylib")]
+    extern "system" {
+        fn NtWriteVirtualMemory(process: HANDLE, at: *mut c_void, data: *const c_void, len: usize, done: *mut usize) -> i32;
+    }
+    let mut done = 0usize;
+    let st = NtWriteVirtualMemory(windows_sys::Win32::System::Threading::GetCurrentProcess(), p as *mut c_void, bytes.as_ptr().cast(), bytes.len(), &mut done);
+    st >= 0 && done == bytes.len()
 }
 
 /// Whether `n` bytes at `p` are committed, writable memory.
@@ -840,30 +876,34 @@ pub fn counters() -> (u64, u64, u64) {
     (REQUESTS.load(Ordering::Relaxed), BYTES.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed))
 }
 
+fn note_request(r: &Request) {
+    let n = r.destination_size as usize;
+    // the first requests: where a title's data goes and how it is packed
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let k = N.fetch_add(1, Ordering::Relaxed);
+    REQUESTS.fetch_add(1, Ordering::Relaxed);
+    BYTES.fetch_add(n as u64, Ordering::Relaxed);
+    if k < 16 || k.is_power_of_two() {
+        crate::xlog_info!(
+            "DirectStorage: request #{k}: options {:#x} ({} source{}), destination {:#x}{} ({n} bytes, page offset {}), source size {}, intermediate {}",
+            r.options,
+            if r.memory_source() { "memory" } else { "file" },
+            if r.zlib() { ", zlib" } else { "" },
+            r.destination,
+            if r.dest_physical_pages() { " (physical pages)" } else { "" },
+            r.destination_page_offset,
+            r.source_size,
+            r.intermediate_size
+        );
+    }
+}
+
 /// Run a request; the destination gets the bytes or nothing.
 unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[usize]>, src_pages: Option<&[usize]>) -> Result<(), HRESULT> {
     let n = r.destination_size as usize;
-    {
-        // the first requests: where a title's data goes and how it is packed
-        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let k = N.fetch_add(1, Ordering::Relaxed);
-        REQUESTS.fetch_add(1, Ordering::Relaxed);
-        BYTES.fetch_add(n as u64, Ordering::Relaxed);
-        if k < 16 || k.is_power_of_two() {
-            crate::xlog_info!(
-                "DirectStorage: request #{k}: options {:#x} ({} source{}), destination {:#x}{} ({n} bytes, page offset {}), source size {}, intermediate {}",
-                r.options,
-                if r.memory_source() { "memory" } else { "file" },
-                if r.zlib() { ", zlib" } else { "" },
-                r.destination,
-                if r.dest_physical_pages() { " (physical pages)" } else { "" },
-                r.destination_page_offset,
-                r.source_size,
-                r.intermediate_size
-            );
-        }
-    }
-    if !r.dest_physical_pages() && !writable(r.destination as usize, n) {
+    note_request(r);
+    let sparse_dest = !r.dest_physical_pages() && in_sparse_memory(r.destination as usize, n);
+    if !r.dest_physical_pages() && !sparse_dest && !writable(r.destination as usize, n) {
         return Err(E_ACCESS_VIOLATION);
     }
     let src: Vec<u8> = if r.memory_source() {
@@ -917,11 +957,30 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
 
     if r.dest_physical_pages() {
         let pages = dest_pages.ok_or(E_ACCESS_VIOLATION)?;
+        // The console reads the page list when it runs the request. A retail title keeps its
+        // lists in slots of its own table and writes a slot's pages after EnqueueRequest, so at
+        // enqueue a slot can still name the pages of its previous request: written there, the
+        // data lands in memory the title has since used for something else, or in freed pages.
+        // The list as it is now is taken when all its pages are allocated; otherwise (an array
+        // on the stack, overwritten since) the snapshot.
+        let mut current = vec![0usize; pages.len()];
+        let pages = if read_own(r.destination as usize, current.as_mut_ptr() as *mut u8, std::mem::size_of_val(pages))
+            && current[..] != pages[..]
+            && crate::hle::kernelx::physical_pages_live(&current)
+        {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let k = N.fetch_add(1, Ordering::Relaxed) + 1;
+            if k == 1 || k.is_power_of_two() {
+                crate::xlog_info!("DirectStorage: {k} page lists written after their request was enqueued: the pages named at execution are used");
+            }
+            &current[..]
+        } else {
+            pages
+        };
         // A page number of 0 in the snapshot taken at enqueue (no page has it): the entry is
         // read again now. A retail title keeps its page arrays in its own tables and fills an
         // entry after EnqueueRequest – its streaming requests were refused by the thousand
-        // with page 0. An array that had its pages at enqueue stays as it was snapshotted
-        // (titles also pass arrays on the stack).
+        // with page 0.
         let late: Vec<usize>;
         let pages = if pages.contains(&0) && crate::gpu::shader::readable(r.destination as usize, std::mem::size_of_val(pages)) {
             late = (0..pages.len()).map(|k| if pages[k] != 0 { pages[k] } else { (r.destination as *const usize).add(k).read_unaligned() }).collect();
@@ -933,7 +992,15 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
             return Err(E_ACCESS_VIOLATION);
         }
     } else if n > 0 {
-        std::ptr::copy_nonoverlapping(payload.as_ptr(), r.destination as *mut u8, n);
+        crate::hle::kernelx::pagelog::note("DirectStorage write", r.destination as usize, 0, n);
+        if sparse_dest {
+            if !write_title(r.destination as usize, &payload[..n]) {
+                return Err(E_ACCESS_VIOLATION);
+            }
+        } else {
+            std::ptr::copy_nonoverlapping(payload.as_ptr(), r.destination as *mut u8, n);
+        }
+        crate::hle::d3d12x::title_textures::note_known_write(r.destination as usize, n);
     }
     Ok(())
 }
@@ -972,8 +1039,9 @@ enum Entry {
         dest_pages: Option<Vec<usize>>,
         src_pages: Option<Vec<usize>>,
     },
-    /// refused at enqueue: reported in queue order by the worker
+    /// refused at enqueue: reported in queue order by the worker (unless cancelled, as a request)
     Refused {
+        seq: u64,
         hr: HRESULT,
         req: Request,
         file: Option<Arc<FileInner>>,
@@ -1019,6 +1087,15 @@ struct QueueInner {
     errors: Mutex<(u32, Option<FirstError>)>,
     /// `XCL_DSTORAGE_BCPACK_FILL` when the queue was made
     bcpack_fill: AtomicBool,
+    #[cfg(test)]
+    pool_override: OnceLock<Option<Arc<parallel::DecompressPool>>>,
+    #[cfg(test)]
+    test_hook: OnceLock<parallel::TestHook>,
+    /// a half-full queue submits by itself (not when made with `AutoSubmitDisabled`)
+    auto_submit: bool,
+    /// signalled when pending entries leave (`Submit`, a cancel, `Close`): a full queue made with
+    /// `AutoSubmitDisabled` holds its next enqueue until then
+    room: Condvar,
 }
 
 impl QueueInner {
@@ -1049,6 +1126,7 @@ impl QueueInner {
             return;
         }
         let batch = std::mem::take(&mut self.pending.lock().unwrap().entries);
+        self.room.notify_all();
         if batch.is_empty() {
             return;
         }
@@ -1082,62 +1160,86 @@ impl QueueInner {
             }
         }
         let _active = ActiveGuard(self);
+        if let Some(pool) = parallel::pool_for(self) {
+            parallel::run(self, pool, rx);
+            return;
+        }
         // the first failure of the requests since the last status entry
         let mut since_status = S_OK;
         for batch in rx {
-            for e in batch {
-                if self.closed.load(Ordering::Acquire) {
-                    if let Entry::Status(s, i) = e {
-                        if let Some(slot) = s.slots.get(i as usize) {
-                            slot.store(E_QUEUE_CLOSED, Ordering::Release);
-                        }
-                    }
-                    continue;
-                }
-                match e {
-                    Entry::Request { seq, req, file, dest_pages, src_pages } => {
-                        if self.is_cancelled(seq, req.tag) {
-                            // Cancelled requests are skipped without affecting status or error record.
-                            continue;
-                        }
-                        if let Err(hr) = unsafe { execute(&req, file.as_deref(), dest_pages.as_deref(), src_pages.as_deref()) } {
-                            self.fail(hr, req, file.as_deref());
-                            if since_status >= 0 {
-                                since_status = hr;
-                            }
-                        }
-                    }
-                    Entry::Refused { hr, req, file, fill } => {
-                        if let Some(t) = &fill {
-                            // the destination gets solid blocks; the request still fails
-                            unsafe { bcpack_fill(&req, t) };
-                        }
-                        self.fail(hr, req, file.as_deref());
-                        if since_status >= 0 {
-                            since_status = hr;
-                        }
-                    }
-                    Entry::Status(s, i) => {
-                        if let Some(slot) = s.slots.get(i as usize) {
-                            slot.store(since_status, Ordering::Release);
-                        }
-                        since_status = S_OK;
-                    }
-                    Entry::Signal(fence, value) => unsafe {
-                        fence.signal(value);
-                    },
-                    #[cfg(test)]
-                    Entry::Gate(b) => {
-                        b.wait();
-                    }
-                }
+            for entry in batch {
+                self.run_entry(entry, &mut since_status);
             }
         }
     }
 
+    fn update_error(&self, hr: HRESULT, req: Request, file: Option<&FileInner>, since_status: &mut HRESULT) {
+        self.fail(hr, req, file);
+        if *since_status >= 0 {
+            *since_status = hr;
+        }
+    }
+
+    #[inline]
+    fn run_entry(&self, e: Entry, since_status: &mut HRESULT) {
+        if self.closed.load(Ordering::Acquire) {
+            if let Entry::Status(s, i) = e {
+                if let Some(slot) = s.slots.get(i as usize) {
+                    slot.store(E_QUEUE_CLOSED, Ordering::Release);
+                }
+            }
+            return;
+        }
+        match e {
+            Entry::Request { seq, req, file, dest_pages, src_pages } => {
+                if self.is_cancelled(seq, req.tag) {
+                    // Cancelled requests are skipped without affecting status or error record.
+                    return;
+                }
+                if let Err(hr) = unsafe { execute(&req, file.as_deref(), dest_pages.as_deref(), src_pages.as_deref()) } {
+                    self.update_error(hr, req, file.as_deref(), since_status);
+                }
+            }
+            Entry::Refused { seq, hr, req, file, fill } => {
+                // a cancelled request is no failure, refused or not
+                if self.is_cancelled(seq, req.tag) {
+                    return;
+                }
+                if let Some(t) = &fill {
+                    // the destination gets solid blocks; the request still fails
+                    unsafe { bcpack_fill(&req, t) };
+                }
+                self.update_error(hr, req, file.as_deref(), since_status);
+            }
+            Entry::Status(s, i) => {
+                if let Some(slot) = s.slots.get(i as usize) {
+                    slot.store(*since_status, Ordering::Release);
+                }
+                *since_status = S_OK;
+            }
+            Entry::Signal(fence, value) => unsafe {
+                fence.signal(value);
+            },
+            #[cfg(test)]
+            Entry::Gate(b) => {
+                b.wait();
+            }
+        }
+    }
+
+    /// A queue made with `AutoSubmitDisabled` that holds `capacity` entries: wait until the title's
+    /// `Submit` (from another thread), a cancel or `Close` takes some, as the console's queue
+    /// stalls an enqueue at capacity. Others never wait: they submit when half full.
+    fn wait_for_room<'a>(&self, mut p: std::sync::MutexGuard<'a, Pending>) -> std::sync::MutexGuard<'a, Pending> {
+        while !self.auto_submit && p.entries.len() >= self.capacity && !self.closed.load(Ordering::Acquire) {
+            p = self.room.wait(p).unwrap();
+        }
+        p
+    }
+
     fn enqueue(self: &Arc<Self>, e: Entry) {
         let n = {
-            let mut p = self.pending.lock().unwrap();
+            let mut p = self.wait_for_room(self.pending.lock().unwrap());
             if self.closed.load(Ordering::Acquire) {
                 return;
             }
@@ -1150,23 +1252,32 @@ impl QueueInner {
             p.entries.len()
         };
         // as on PC: a half-full queue submits by itself
-        if n >= (self.capacity / 2).max(1) {
+        if self.auto_submit && n >= (self.capacity / 2).max(1) {
             self.submit();
         }
     }
 
     fn enqueue_request(self: &Arc<Self>, req: Request, file: Option<Arc<FileInner>>, dest_pages: Option<Vec<usize>>, src_pages: Option<Vec<usize>>) {
+        self.enqueue_numbered(|seq| Entry::Request { seq, req, file, dest_pages, src_pages });
+    }
+
+    /// A request refused at enqueue, numbered as a request so `CancelRequestsWithTag` covers it.
+    fn enqueue_refused(self: &Arc<Self>, hr: HRESULT, req: Request, file: Option<Arc<FileInner>>, fill: Option<FillTarget>) {
+        self.enqueue_numbered(|seq| Entry::Refused { seq, hr, req, file, fill });
+    }
+
+    fn enqueue_numbered(self: &Arc<Self>, entry: impl FnOnce(u64) -> Entry) {
         let n = {
-            let mut p = self.pending.lock().unwrap();
+            let mut p = self.wait_for_room(self.pending.lock().unwrap());
             if self.closed.load(Ordering::Acquire) {
                 return;
             }
             let seq = p.next_seq;
             p.next_seq += 1;
-            p.entries.push(Entry::Request { seq, req, file, dest_pages, src_pages });
+            p.entries.push(entry(seq));
             p.entries.len()
         };
-        if n >= (self.capacity / 2).max(1) {
+        if self.auto_submit && n >= (self.capacity / 2).max(1) {
             self.submit();
         }
     }
@@ -1203,6 +1314,11 @@ fn queue_vtbl() -> &'static [usize] {
 }
 
 unsafe extern "system" fn factory_create_queue(_p: *mut c_void, desc: *const u8, riid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+    create_queue(desc, riid, out, true)
+}
+
+/// A queue from the 0x18 bytes of `desc` (`auto_submit`: a half-full queue submits by itself).
+unsafe fn create_queue(desc: *const u8, riid: *const GUID, out: *mut *mut c_void, auto_submit: bool) -> HRESULT {
     if out.is_null() {
         return E_POINTER;
     }
@@ -1239,6 +1355,12 @@ unsafe extern "system" fn factory_create_queue(_p: *mut c_void, desc: *const u8,
         error_event: ev as usize,
         errors: Mutex::new((0, None)),
         bcpack_fill: AtomicBool::new(bcpack_fill_from_env()),
+        #[cfg(test)]
+        pool_override: OnceLock::new(),
+        #[cfg(test)]
+        test_hook: OnceLock::new(),
+        auto_submit,
+        room: Condvar::new(),
     });
     let o = new_object(queue_vtbl(), inner);
     let hr = queue_qi(o, riid, out);
@@ -1275,7 +1397,6 @@ unsafe extern "system" fn queue_release(p: *mut c_void) -> u32 {
 }
 
 unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) {
-    let _t = crate::prof::scope(crate::prof::Cat::DsEnqueue);
     let q = queue(p);
     if q.closed.load(Ordering::Acquire) || req.is_null() {
         return;
@@ -1294,7 +1415,7 @@ unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) 
                 };
             }
         }
-        return q.enqueue(Entry::Refused { hr, req: r, file: None, fill });
+        return q.enqueue_refused(hr, r, None, fill);
     }
     let file = if r.memory_source() {
         None
@@ -1303,7 +1424,7 @@ unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) 
         let f = r.source as *mut c_void;
         let mut vt = 0usize;
         if !read_own(f as usize, &mut vt as *mut usize as *mut u8, 8) || vt != file_vtbl().as_ptr() as usize {
-            return q.enqueue(Entry::Refused { hr: E_FILE_HANDLE, req: r, file: None, fill: None });
+            return q.enqueue_refused(E_FILE_HANDLE, r, None, None);
         }
         Some(Arc::clone(inner::<FileInner>(f)))
     };
@@ -1311,7 +1432,7 @@ unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) 
         match snapshot_page_array(r.destination, r.destination_page_offset, r.destination_size) {
             Ok(pages) => Some(pages),
             Err(hr) => {
-                return q.enqueue(Entry::Refused { hr, req: r, file, fill: None });
+                return q.enqueue_refused(hr, r, file, None);
             }
         }
     } else {
@@ -1321,7 +1442,7 @@ unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) 
         match snapshot_page_array(r.source, r.source_page_offset, r.source_size) {
             Ok(pages) => Some(pages),
             Err(hr) => {
-                return q.enqueue(Entry::Refused { hr, req: r, file, fill: None });
+                return q.enqueue_refused(hr, r, file, None);
             }
         }
     } else {
@@ -1358,7 +1479,6 @@ unsafe extern "system" fn queue_enqueue_signal(p: *mut c_void, fence: *mut c_voi
 }
 
 unsafe extern "system" fn queue_submit(p: *mut c_void) {
-    let _t = crate::prof::scope(crate::prof::Cat::DsSubmit);
     let q = queue(p);
     if !q.closed.load(Ordering::Acquire) {
         q.submit();
@@ -1371,7 +1491,8 @@ unsafe extern "system" fn queue_cancel(p: *mut c_void, mask: u64, value: u64) {
     let q = queue(p);
     let cutoff = {
         let mut pend = q.pending.lock().unwrap();
-        pend.entries.retain(|e| !matches!(e, Entry::Request { req, .. } if req.tag & mask == value));
+        pend.entries.retain(|e| !matches!(e, Entry::Request { req, .. } | Entry::Refused { req, .. } if req.tag & mask == value));
+        q.room.notify_all();
         pend.next_seq.saturating_sub(1)
     };
     if cutoff == 0 {
@@ -1399,6 +1520,8 @@ unsafe extern "system" fn queue_close(p: *mut c_void) {
             std::mem::take(&mut pend.entries)
         }
     };
+    // an enqueue held by a full queue goes on (and finds the queue closed)
+    q.room.notify_all();
     for e in drained {
         if let Entry::Status(s, i) = e {
             if let Some(slot) = s.slots.get(i as usize) {
@@ -1407,6 +1530,7 @@ unsafe extern "system" fn queue_close(p: *mut c_void) {
         }
         // `Entry::Signal` drops `FenceRef` (calling Release); `Entry::Request` drops `FileInner`.
     }
+    parallel::wake_waiters(q);
     // Wait outside queue locks so no in-flight worker request can still touch caller buffers
     // after `Close()` returns (including for concurrent `Close()` callers).
     let (lock, cvar) = &q.worker_active;
@@ -1428,7 +1552,8 @@ unsafe extern "system" fn queue_get_error_event(p: *mut c_void) -> HANDLE {
 
 /// DSTORAGE_ERROR_RECORD (0x290): failure count u32 @0, then the first failure: HRESULT @8,
 /// command type @0xC (none: 0xFFFFFFFF), the request's options @0x10, destination @0x18 and
-/// size @0x20, its file name @0x24 (0x104 UTF-16) or memory source @0x238
+/// size @0x20, its file name @0x24 (0x104 UTF-16) and file offset @0x230 or memory source @0x238,
+/// source size @0x240, cancellation tag @0x248 (name @0x250 not kept)
 unsafe extern "system" fn queue_retrieve_error_record(p: *mut c_void, out: *mut u8) {
     if out.is_null() {
         return;
@@ -1451,7 +1576,10 @@ unsafe extern "system" fn queue_retrieve_error_record(p: *mut c_void, out: *mut 
                     for (i, c) in f.file.iter().take(0x103).enumerate() {
                         rec[0x24 + 2 * i..0x26 + 2 * i].copy_from_slice(&c.to_le_bytes());
                     }
+                    rec[0x230..0x238].copy_from_slice(&f.request.offset.to_le_bytes());
                 }
+                rec[0x240..0x244].copy_from_slice(&f.request.source_size.to_le_bytes());
+                rec[0x248..0x250].copy_from_slice(&f.request.tag.to_le_bytes());
             }
             None => rec[0xC..0x10].copy_from_slice(&NO_COMMAND.to_le_bytes()),
         }
@@ -1493,6 +1621,114 @@ mod tests {
         b
     }
 
+    /// A queue the newer factory makes with `AutoSubmitDisabled` runs its requests at `Submit`
+    /// only, not when it is half full; one made without the option still submits by itself.
+    #[test]
+    fn a_queue_with_auto_submit_disabled_waits_for_submit() {
+        use std::time::{Duration, Instant};
+        unsafe {
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY_X1, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let create_queue1: unsafe extern "system" fn(*mut c_void, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(10));
+            for (options, by_itself) in [(AUTO_SUBMIT_DISABLED, false), (0, true)] {
+                let mut desc = [0u8; 0x20];
+                desc[0..4].copy_from_slice(&1u32.to_le_bytes()); // memory source
+                desc[8..10].copy_from_slice(&4u16.to_le_bytes()); // capacity 4: half full at 2
+                desc[10] = 2;
+                desc[0x18..0x20].copy_from_slice(&options.to_le_bytes());
+                let mut q = std::ptr::null_mut();
+                assert_eq!(create_queue1(f, desc.as_ptr(), &IID_QUEUE_X1, &mut q), S_OK);
+                let qv = *(q as *const *const usize);
+                let enqueue: unsafe extern "system" fn(*mut c_void, *const u8) = std::mem::transmute(*qv.add(3));
+                let submit: unsafe extern "system" fn(*mut c_void) = std::mem::transmute(*qv.add(6));
+
+                let src = [0x5Au8; 64];
+                let dst = [vec![0u8; 64], vec![0u8; 64]];
+                for d in &dst {
+                    enqueue(q, request(SOURCE_MEMORY_BIT, d.as_ptr() as u64, 64, src.as_ptr() as u64, 0, 64).as_ptr());
+                }
+                let done = || dst.iter().all(|d| d.iter().all(|b| std::ptr::read_volatile(b) == 0x5A));
+                let t = Instant::now();
+                while !done() && t.elapsed() < Duration::from_millis(300) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                assert_eq!(done(), by_itself, "options {options:#x}: a half-full queue submits by itself only without AutoSubmitDisabled");
+                if !by_itself {
+                    submit(q);
+                    let t = Instant::now();
+                    while !done() && t.elapsed() < Duration::from_secs(5) {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    assert!(done(), "Submit runs the queue's requests");
+                }
+                queue_close(q);
+                queue_release(q);
+            }
+        }
+    }
+
+    /// A full queue made with `AutoSubmitDisabled` holds the next enqueue until another thread's
+    /// `Submit` takes its entries, and `Close` lets a held enqueue go (into the closed queue).
+    #[test]
+    fn a_full_queue_with_auto_submit_disabled_holds_an_enqueue_until_submit() {
+        use std::time::{Duration, Instant};
+        unsafe {
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY_X1, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let create_queue1: unsafe extern "system" fn(*mut c_void, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(10));
+            let mut desc = [0u8; 0x20];
+            desc[0..4].copy_from_slice(&1u32.to_le_bytes()); // memory source
+            desc[8..10].copy_from_slice(&2u16.to_le_bytes()); // capacity 2
+            desc[10] = 2;
+            desc[0x18..0x20].copy_from_slice(&AUTO_SUBMIT_DISABLED.to_le_bytes());
+            for close_instead in [false, true] {
+                let mut q = std::ptr::null_mut();
+                assert_eq!(create_queue1(f, desc.as_ptr(), &IID_QUEUE_X1, &mut q), S_OK);
+                let qv = *(q as *const *const usize);
+                let enqueue: unsafe extern "system" fn(*mut c_void, *const u8) = std::mem::transmute(*qv.add(3));
+                let submit: unsafe extern "system" fn(*mut c_void) = std::mem::transmute(*qv.add(6));
+
+                let src = [0x3Cu8; 64];
+                let dst = [vec![0u8; 64], vec![0u8; 64], vec![0u8; 64]];
+                let req = |k: usize| request(SOURCE_MEMORY_BIT, dst[k].as_ptr() as u64, 64, src.as_ptr() as u64, 0, 64);
+                enqueue(q, req(0).as_ptr());
+                enqueue(q, req(1).as_ptr());
+                // the queue is full: a third enqueue waits
+                let (third, qa) = (req(2), q as usize);
+                let t = std::thread::spawn(move || {
+                    let e: unsafe extern "system" fn(*mut c_void, *const u8) = enqueue;
+                    e(qa as *mut c_void, third.as_ptr());
+                });
+                std::thread::sleep(Duration::from_millis(200));
+                assert!(!t.is_finished(), "an enqueue into a full queue waits");
+                if close_instead {
+                    queue_close(q);
+                } else {
+                    submit(q);
+                }
+                let t0 = Instant::now();
+                while !t.is_finished() && t0.elapsed() < Duration::from_secs(5) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                assert!(t.is_finished(), "{} lets the held enqueue go", if close_instead { "Close" } else { "Submit" });
+                t.join().unwrap();
+                if !close_instead {
+                    submit(q);
+                    let done = || dst.iter().all(|d| d.iter().all(|b| std::ptr::read_volatile(b) == 0x3C));
+                    let t0 = Instant::now();
+                    while !done() && t0.elapsed() < Duration::from_secs(5) {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    assert!(done(), "all three requests ran");
+                    queue_close(q);
+                }
+                queue_release(q);
+            }
+        }
+    }
+
     #[test]
     fn a_refused_factory_iid_returns_e_nointerface_and_clears_out() {
         unsafe {
@@ -1518,7 +1754,10 @@ mod tests {
         let mem = Request::parse(&request(SOURCE_MEMORY_BIT | 1, 0x1000, 64, 0x2000, 0x99, 20));
         assert_eq!((mem.offset, mem.check(true)), (0, Ok(())), "a memory source has no offset");
         assert_eq!(Request::parse(&request(1, 0x1000, 20, 0x2000, 0, 20)).check(false), Err(E_DESTINATION_SIZE));
-        assert_eq!(Request::parse(&request(15, 0x1000, 64, 0x2000, 0, 20)).check(false), Err(E_DECOMPRESSION), "BCPack BC7");
+        assert_eq!(Request::parse(&request(2 << BCPACK_SHIFT, 0x1000, 64, 0x2000, 0, 20)).check(false), Err(E_DECOMPRESSION), "BCPack BC2");
+        assert_eq!(Request::parse(&request(6 << BCPACK_SHIFT, 0x1000, 64, 0x2000, 0, 20)).check(false), Ok(()), "BCPack BC6H");
+        assert_eq!(Request::parse(&request(7 << BCPACK_SHIFT, 0x1000, 24, 0x2000, 0, 20)).check(false), Err(E_DESTINATION_SIZE), "BCPack BC7 part block");
+        assert_eq!(Request::parse(&request(4 << BCPACK_SHIFT, 0x1000, 12, 0x2000, 0, 20)).check(false), Err(E_DESTINATION_SIZE), "BCPack BC4 part block");
         assert_eq!(Request::parse(&request(0, 0, 64, 0x2000, 0, 64)).check(false), Err(E_ACCESS_VIOLATION));
     }
 
@@ -1730,11 +1969,79 @@ mod tests {
         }
     }
 
+    /// A request refused at enqueue (here a file source on a memory queue) and
+    /// then cancelled by tag – submitted or still pending – is no failure: "a cancelled request
+    /// is not counted as a failure in either IDStorageStatusArray or DSTORAGE_ERROR_RECORD".
+    /// One with a tag the cancel does not match, or enqueued after it, still fails.
+    #[test]
+    fn a_refused_request_that_is_cancelled_is_no_failure() {
+        unsafe {
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let create_queue: unsafe extern "system" fn(*mut c_void, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(3));
+            let create_status: unsafe extern "system" fn(*mut c_void, u32, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(5));
+            let mut desc = [0u8; 0x18];
+            desc[0..4].copy_from_slice(&1u32.to_le_bytes()); // memory queue
+            desc[8..10].copy_from_slice(&32u16.to_le_bytes());
+            desc[10] = 2;
+            let mut q = std::ptr::null_mut();
+            assert_eq!(create_queue(f, desc.as_ptr(), &IID_QUEUE, &mut q), S_OK);
+            let mut s = std::ptr::null_mut();
+            assert_eq!(create_status(f, 3, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
+            let qv = *(q as *const *const usize);
+            let enqueue: unsafe extern "system" fn(*mut c_void, *const u8) = std::mem::transmute(*qv.add(3));
+            let status: unsafe extern "system" fn(*mut c_void, *mut c_void, u32) = std::mem::transmute(*qv.add(4));
+            let submit: unsafe extern "system" fn(*mut c_void) = std::mem::transmute(*qv.add(6));
+            let cancel: unsafe extern "system" fn(*mut c_void, u64, u64) = std::mem::transmute(*qv.add(7));
+            let record: unsafe extern "system" fn(*mut c_void, *mut u8) = std::mem::transmute(*qv.add(10));
+            let sv = *(s as *const *const usize);
+            let complete: unsafe extern "system" fn(*mut c_void, u32) -> bool = std::mem::transmute(*sv.add(3));
+            let hresult: unsafe extern "system" fn(*mut c_void, u32) -> HRESULT = std::mem::transmute(*sv.add(4));
+
+            // a file source on this memory queue: refused at enqueue with E_SOURCE_TYPE
+            let not_a_file = [0usize; 2];
+            let mut dst = [0u8; 4];
+            let dst_ptr = dst.as_mut_ptr() as u64;
+            let refused = |tag: u64| request_ex(0, dst_ptr, 0, 4, not_a_file.as_ptr() as u64, 0, 4, 0, tag);
+
+            let gate = Arc::new(std::sync::Barrier::new(2));
+            queue(q).enqueue(Entry::Gate(Arc::clone(&gate)));
+            enqueue(q, refused(0x1001).as_ptr()); // submitted, cancelled below
+            status(q, s, 0);
+            submit(q);
+            enqueue(q, refused(0x1002).as_ptr()); // pending, cancelled below
+            enqueue(q, refused(0x2001).as_ptr()); // pending, another tag: still fails
+            status(q, s, 1);
+            cancel(q, 0xF000, 0x1000);
+            enqueue(q, refused(0x1003).as_ptr()); // after the cancel: still fails
+            status(q, s, 2);
+            submit(q);
+            gate.wait();
+            let t = std::time::Instant::now();
+            while !complete(s, 2) && t.elapsed().as_secs() < 5 {
+                std::thread::yield_now();
+            }
+            assert!(complete(s, 0) && complete(s, 1) && complete(s, 2));
+            assert_eq!(hresult(s, 0), S_OK, "the cancelled submitted request is no failure");
+            assert_eq!(hresult(s, 1), E_SOURCE_TYPE, "the cancelled pending one is none; the other tag is one");
+            assert_eq!(hresult(s, 2), E_SOURCE_TYPE, "enqueued after the cancel");
+            let mut rec = [0u8; ERROR_RECORD_BYTES];
+            record(q, rec.as_mut_ptr());
+            assert_eq!(u32::from_le_bytes(rec[0..4].try_into().unwrap()), 2, "two failures: tag 0x2001 and the one after the cancel");
+
+            queue_close(q);
+            queue_release(q);
+            status_release(s);
+        }
+    }
+
     #[test]
     fn multi_stage_intermediate_size_validation_and_zlib() {
         // Validation matrix for Request::check
         let bc1 = 1u64 << BCPACK_SHIFT;
-        let bc7 = 7u64 << BCPACK_SHIFT;
+        let bc2 = 2u64 << BCPACK_SHIFT;
+        let bc6h = 6u64 << BCPACK_SHIFT;
         let swiz = 1u64 << SWIZZLE_SHIFT;
 
         // Zlib only with valid intermediate_size (== dst and < dst)
@@ -1743,14 +2050,16 @@ mod tests {
         // Zlib only with invalid intermediate_size (<= src or > dst)
         assert_eq!(Request::parse(&request_ex(ZLIB_BIT, 0x1000, 0, 128, 0x2000, 0, 20, 20, 0)).check(false), Err(E_DESTINATION_SIZE));
         assert_eq!(Request::parse(&request_ex(ZLIB_BIT, 0x1000, 0, 64, 0x2000, 0, 20, 96, 0)).check(false), Err(E_DESTINATION_SIZE));
-        // Two-stage zlib + BCPack: valid sizes -> E_DECOMPRESSION without a decoder for the mode, invalid intermediate -> E_DESTINATION_SIZE
-        assert_eq!(Request::parse(&request_ex(ZLIB_BIT | bc7, 0x1000, 0, 256, 0x2000, 0, 20, 64, 0)).check(false), Err(E_DECOMPRESSION));
+        // Two-stage zlib + BCPack: valid sizes -> Ok for a mode with a decoder, E_DECOMPRESSION for BC2; invalid intermediate -> E_DESTINATION_SIZE
+        assert_eq!(Request::parse(&request_ex(ZLIB_BIT | bc6h, 0x1000, 0, 256, 0x2000, 0, 20, 64, 0)).check(false), Ok(()));
+        assert_eq!(Request::parse(&request_ex(ZLIB_BIT | bc2, 0x1000, 0, 256, 0x2000, 0, 20, 64, 0)).check(false), Err(E_DECOMPRESSION));
         assert_eq!(Request::parse(&request_ex(ZLIB_BIT | bc1, 0x1000, 0, 256, 0x2000, 0, 20, 64, 0)).check(false), Ok(()));
         assert_eq!(Request::parse(&request_ex(ZLIB_BIT | bc1, 0x1000, 0, 256, 0x2000, 0, 20, 20, 0)).check(false), Err(E_DESTINATION_SIZE));
-        assert_eq!(Request::parse(&request_ex(ZLIB_BIT | bc7, 0x1000, 0, 256, 0x2000, 0, 20, 20, 0)).check(false), Err(E_DESTINATION_SIZE));
-        assert_eq!(Request::parse(&request_ex(ZLIB_BIT | bc7, 0x1000, 0, 64, 0x2000, 0, 20, 64, 0)).check(false), Err(E_DESTINATION_SIZE));
-        // Single-stage BCPack: intermediate must be 0, then E_DECOMPRESSION without a decoder for the mode
-        assert_eq!(Request::parse(&request_ex(bc7, 0x1000, 0, 256, 0x2000, 0, 20, 0, 0)).check(false), Err(E_DECOMPRESSION));
+        assert_eq!(Request::parse(&request_ex(ZLIB_BIT | bc6h, 0x1000, 0, 256, 0x2000, 0, 20, 20, 0)).check(false), Err(E_DESTINATION_SIZE));
+        assert_eq!(Request::parse(&request_ex(ZLIB_BIT | bc6h, 0x1000, 0, 64, 0x2000, 0, 20, 64, 0)).check(false), Err(E_DESTINATION_SIZE));
+        // Single-stage BCPack: intermediate must be 0, then E_DECOMPRESSION for BC2
+        assert_eq!(Request::parse(&request_ex(bc6h, 0x1000, 0, 256, 0x2000, 0, 20, 0, 0)).check(false), Ok(()));
+        assert_eq!(Request::parse(&request_ex(bc2, 0x1000, 0, 256, 0x2000, 0, 20, 0, 0)).check(false), Err(E_DECOMPRESSION));
         assert_eq!(Request::parse(&request_ex(bc1, 0x1000, 0, 256, 0x2000, 0, 20, 0, 0)).check(false), Ok(()));
         assert_eq!(Request::parse(&request_ex(bc1, 0x1000, 0, 256, 0x2000, 0, 20, 64, 0)).check(false), Err(E_DESTINATION_SIZE));
         // Hardware swizzle mode unsupported
@@ -1882,6 +2191,57 @@ mod tests {
         }
     }
 
+    /// The first failure carries the request's file offset, source size and cancellation tag
+    /// (DSTORAGE_ERROR_FIRST_FAILURE @0x230 / 0x240 / 0x248), not only its destination and file.
+    #[test]
+    fn error_record_has_the_failed_requests_offset_source_size_and_tag() {
+        unsafe {
+            let path = std::env::temp_dir().join(format!("xcl-dstorage-error-record-{}.bin", std::process::id()));
+            std::fs::write(&path, [0u8; 8]).unwrap();
+            let wide: Vec<u16> = path.to_str().unwrap().encode_utf16().chain(Some(0)).collect();
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let create_queue: unsafe extern "system" fn(*mut c_void, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(3));
+            let open_file: unsafe extern "system" fn(*mut c_void, *const u16, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(4));
+            let create_status: unsafe extern "system" fn(*mut c_void, u32, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(5));
+            let mut desc = [0u8; 0x18];
+            desc[8..10].copy_from_slice(&8u16.to_le_bytes());
+            desc[10] = 2;
+            let mut q = std::ptr::null_mut();
+            assert_eq!(create_queue(f, desc.as_ptr(), &IID_QUEUE, &mut q), S_OK);
+            let mut file = std::ptr::null_mut();
+            assert_eq!(open_file(f, wide.as_ptr(), &IID_FILE, &mut file), S_OK);
+            let mut s = std::ptr::null_mut();
+            assert_eq!(create_status(f, 1, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
+
+            // 16 bytes at 0x100 of an 8-byte file
+            let mut dst = [0u8; 16];
+            queue_enqueue_request(q, request_ex(0, dst.as_mut_ptr() as u64, 0, 16, file as u64, 0x100, 16, 0, 0xABCD).as_ptr());
+            queue_enqueue_status(q, s, 0);
+            queue_submit(q);
+            let start = std::time::Instant::now();
+            while !status_is_complete(s, 0) && start.elapsed().as_secs() < 5 {
+                std::thread::yield_now();
+            }
+            assert_ne!(status_get_hresult(s, 0), S_OK);
+
+            let mut rec = [0u8; ERROR_RECORD_BYTES];
+            queue_retrieve_error_record(q, rec.as_mut_ptr());
+            assert_eq!(u32::from_le_bytes(rec[0..4].try_into().unwrap()), 1);
+            assert_eq!(u32::from_le_bytes(rec[0x20..0x24].try_into().unwrap()), 16);
+            assert_eq!(u64::from_le_bytes(rec[0x230..0x238].try_into().unwrap()), 0x100, "FileOffset");
+            assert_eq!(u32::from_le_bytes(rec[0x240..0x244].try_into().unwrap()), 16, "SourceSize");
+            assert_eq!(u64::from_le_bytes(rec[0x248..0x250].try_into().unwrap()), 0xABCD, "CancellationTag");
+
+            queue_close(q);
+            queue_release(q);
+            status_release(s);
+            file_release(file);
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
     #[test]
     fn queue_release_concurrent_breaks_worker_cycle() {
         unsafe {
@@ -1974,6 +2334,23 @@ mod tests {
         }
     }
 
+    /// A slot nothing was enqueued into is complete with S_OK, so a title that waits for
+    /// IsComplete before (re)using a slot does not wait forever on its first use.
+    #[test]
+    fn a_new_status_array_slot_is_complete() {
+        unsafe {
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let create_status: unsafe extern "system" fn(*mut c_void, u32, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(5));
+            let mut s = std::ptr::null_mut();
+            assert_eq!(create_status(f, 4, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
+            assert!(status_is_complete(s, 3));
+            assert_eq!(status_get_hresult(s, 3), S_OK);
+            status_release(s);
+        }
+    }
+
     /// A destination page array whose entry is still 0 at EnqueueRequest and gets its page
     /// before the request's turn: the data arrives (a retail title's streaming).
     #[test]
@@ -2039,6 +2416,76 @@ mod tests {
             assert_eq!((hresult(s, 0), hresult(s, 1)), (S_OK, E_ACCESS_VIOLATION));
             let got = std::slice::from_raw_parts((reserved as *const u8).add(page_off as usize), data.len());
             assert_eq!(got, &data[..], "the bytes cross from the page that was there into the one filled in later");
+
+            MapTitlePhysicalPages(reserved, 2, 0, 4, std::ptr::null_mut());
+            windows_sys::Win32::System::Memory::VirtualFree(reserved, 0, windows_sys::Win32::System::Memory::MEM_RELEASE);
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 2, pages.as_mut_ptr()), 1);
+            queue_close(q);
+            queue_release(q);
+            status_release(s);
+        }
+    }
+
+    /// A title's table slot still names its previous request's page at enqueue and gets this
+    /// request's page before Submit: the data goes to the page named at execution, and the old
+    /// page (in use for something else by then) is left alone.
+    #[test]
+    fn a_destination_page_rewritten_after_enqueue() {
+        use crate::hle::kernelx::{AllocateTitlePhysicalPages, FreeTitlePhysicalPages, MapTitlePhysicalPages, PHYS_PAGE_SIZE};
+        if crate::gpu::uma::get().is_none() {
+            return;
+        }
+        unsafe {
+            let mut count = 2usize;
+            let mut pages = [0usize; 2];
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut count, pages.as_mut_ptr()), 1);
+
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let create_queue: unsafe extern "system" fn(*mut c_void, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(3));
+            let create_status: unsafe extern "system" fn(*mut c_void, u32, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(5));
+            let mut desc = [0u8; 0x18];
+            desc[0..4].copy_from_slice(&1u32.to_le_bytes());
+            desc[8..10].copy_from_slice(&16u16.to_le_bytes());
+            desc[10] = 2;
+            let mut q = std::ptr::null_mut();
+            assert_eq!(create_queue(f, desc.as_ptr(), &IID_QUEUE, &mut q), S_OK);
+            let mut s = std::ptr::null_mut();
+            assert_eq!(create_status(f, 1, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
+            let qv = *(q as *const *const usize);
+            let enqueue: unsafe extern "system" fn(*mut c_void, *const u8) = std::mem::transmute(*qv.add(3));
+            let status: unsafe extern "system" fn(*mut c_void, *mut c_void, u32) = std::mem::transmute(*qv.add(4));
+            let submit: unsafe extern "system" fn(*mut c_void) = std::mem::transmute(*qv.add(6));
+            let sv = *(s as *const *const usize);
+            let complete: unsafe extern "system" fn(*mut c_void, u32) -> bool = std::mem::transmute(*sv.add(3));
+            let hresult: unsafe extern "system" fn(*mut c_void, u32) -> HRESULT = std::mem::transmute(*sv.add(4));
+
+            let reserved = windows_sys::Win32::System::Memory::VirtualAlloc(
+                std::ptr::null(),
+                2 * PHYS_PAGE_SIZE,
+                windows_sys::Win32::System::Memory::MEM_RESERVE,
+                windows_sys::Win32::System::Memory::PAGE_READWRITE,
+            );
+            assert!(!reserved.is_null());
+            assert_eq!(MapTitlePhysicalPages(reserved, 2, 0, 4, pages.as_mut_ptr()), reserved);
+            let old_page = std::slice::from_raw_parts_mut(reserved as *mut u8, 0x100);
+            old_page.fill(0xAB);
+
+            let data: Vec<u8> = (0..0x100u32).map(|i| (i * 7 + 1) as u8).collect();
+            let mut slot = Box::new([pages[0]]);
+            enqueue(q, request_ex(SOURCE_MEMORY_BIT | DEST_PHYS_PAGES_BIT, slot.as_ptr() as u64, 0, data.len() as u32, data.as_ptr() as u64, 0, data.len() as u32, 0, 0).as_ptr());
+            std::ptr::write_volatile(&mut slot[0], pages[1]);
+            status(q, s, 0);
+            submit(q);
+            let t = std::time::Instant::now();
+            while !complete(s, 0) && t.elapsed().as_secs() < 5 {
+                std::thread::yield_now();
+            }
+            assert_eq!(hresult(s, 0), S_OK);
+            let new_page = std::slice::from_raw_parts((reserved as *const u8).add(PHYS_PAGE_SIZE), data.len());
+            assert_eq!(new_page, &data[..], "the data goes to the page the slot names at execution");
+            assert!(old_page.iter().all(|&b| b == 0xAB), "the slot's previous page is left alone");
 
             MapTitlePhysicalPages(reserved, 2, 0, 4, std::ptr::null_mut());
             windows_sys::Win32::System::Memory::VirtualFree(reserved, 0, windows_sys::Win32::System::Memory::MEM_RELEASE);
@@ -2305,39 +2752,70 @@ mod tests {
     #[test]
     fn bcpack_refusals_are_counted_per_mode_and_still_fail() {
         let counts = BcpackRefusals::new();
-        let bc7 = Request::parse(&request(SOURCE_MEMORY_BIT | 7 << BCPACK_SHIFT, 0x1000, 0x10000, 0x2000, 0, 0x4000));
-        let bc7_zlib = Request::parse(&request(SOURCE_MEMORY_BIT | ZLIB_BIT | 7 << BCPACK_SHIFT, 0x1000, 0x10000, 0x2000, 0, 0x4000));
-        let bc3 = Request::parse(&request(SOURCE_MEMORY_BIT | 3 << BCPACK_SHIFT, 0x1000, 0x8000, 0x2000, 0, 0x1000));
-        for (i, r) in [&bc7, &bc7_zlib, &bc3, &bc7].into_iter().enumerate() {
+        let bc2 = Request::parse(&request(SOURCE_MEMORY_BIT | 2 << BCPACK_SHIFT, 0x1000, 0x10000, 0x2000, 0, 0x4000));
+        let bc2_zlib = Request::parse(&request(SOURCE_MEMORY_BIT | ZLIB_BIT | 2 << BCPACK_SHIFT, 0x1000, 0x10000, 0x2000, 0, 0x4000));
+        let m8 = Request::parse(&request(SOURCE_MEMORY_BIT | 8 << BCPACK_SHIFT, 0x1000, 0x8000, 0x2000, 0, 0x1000));
+        for (i, r) in [&bc2, &bc2_zlib, &m8, &bc2].into_iter().enumerate() {
             assert_eq!(r.check(true), Err(E_DECOMPRESSION), "the request fails as before");
             assert_eq!(counts.note(r), i as u64 + 1);
         }
         let s = counts.stats();
-        assert_eq!(s.keys().collect::<Vec<_>>(), ["BC3", "BC7"]);
-        assert_eq!((s["BC7"].requests, s["BC7"].with_zlib, s["BC7"].destination_bytes), (3, 1, 0x30000));
-        assert_eq!((s["BC3"].requests, s["BC3"].with_zlib, s["BC3"].destination_bytes), (1, 0, 0x8000));
-        assert_eq!(counts.summary(), "BC3 1 (32768 bytes), BC7 3 (196608 bytes)");
-        // every mode without a block rebuild; BC1 has one (in the tests, with their tables)
+        assert_eq!(s.keys().collect::<Vec<_>>(), ["BC2", "mode 8"]);
+        assert_eq!((s["BC2"].requests, s["BC2"].with_zlib, s["BC2"].destination_bytes), (3, 1, 0x30000));
+        assert_eq!((s["mode 8"].requests, s["mode 8"].with_zlib, s["mode 8"].destination_bytes), (1, 0, 0x8000));
+        assert_eq!(counts.summary(), "BC2 3 (196608 bytes), mode 8 1 (32768 bytes)");
+        // every mode with a decoded block format; BC2 and the modes above 7 stay refused
         for m in 1..=15u64 {
             let r = Request::parse(&request(SOURCE_MEMORY_BIT | m << BCPACK_SHIFT, 0x1000, 64, 0x2000, 0, 20));
-            assert_eq!(r.check(true), if m == 1 { Ok(()) } else { Err(E_DECOMPRESSION) }, "mode {m}");
+            assert_eq!(r.check(true), if matches!(m, 1 | 3 | 4 | 5 | 6 | 7) { Ok(()) } else { Err(E_DECOMPRESSION) }, "mode {m}");
         }
     }
 
-    /// BC1 requests through a queue: BCPack alone and after zlib, against blocks built
-    /// independently of the decoder (`tests/data/bcpack`).
+    /// BC1 requests through a queue: BCPack alone and after zlib. Retail streams come from
+    /// `XCL_SAMPLE_BCPACK` (a folder of `*.bc1` with their blocks in `*.vic1`); without it
+    /// only the requests that cannot unpack run.
     #[test]
-    fn bcpack_bc1_requests_are_unpacked_alone_and_after_zlib() {
-        use crate::hle::bcpack::tests as fx;
+    fn bcpack_bc1_requests_through_the_queue() {
         let bc1 = SOURCE_MEMORY_BIT | 1 << BCPACK_SHIFT;
-        let small = fx::data("bc1-16-1.bin").unwrap();
-        let small_blocks = fx::data("bc1-16-1.bc1").unwrap();
-        // 64 KiB of blocks; zero padding after the stream (as in a title's files) lets zlib shrink it
-        let mut large = fx::data("bc1-8192-3.bin").unwrap();
-        large.resize(large.len() + 2048, 0);
-        let large_blocks = crate::hle::bcpack::bc1::assemble(&fx::large_fixture_symbols(1), fx::tables()).unwrap();
-        let zipped = miniz_oxide::deflate::compress_to_vec_zlib(&large, 6);
-        assert!(zipped.len() < large.len() && large_blocks.len() == 0x10000);
+        // Not a stream: the failure and control cases do not need one.
+        let junk: Vec<u8> = (0..194u8).map(|i| i.wrapping_mul(37).wrapping_add(11)).collect();
+        // (options, source, destination size, intermediate size) -> status, destination
+        let mut cases: Vec<(u64, Vec<u8>, usize, usize, HRESULT, Option<Vec<u8>>)> = Vec::new();
+        let mut unpacked = 0u64;
+        if let Some(dir) = std::env::var_os("XCL_SAMPLE_BCPACK").map(std::path::PathBuf::from) {
+            let mut streams: Vec<_> = std::fs::read_dir(&dir)
+                .map(|d| d.filter_map(|e| Some(e.ok()?.path())).filter(|p| p.extension().is_some_and(|x| x == "bc1")).collect())
+                .unwrap_or_default();
+            streams.sort();
+            for stream in streams.into_iter().take(2) {
+                let src = std::fs::read(&stream).unwrap();
+                let blocks = std::fs::read(stream.with_extension("vic1")).unwrap();
+                let zipped = miniz_oxide::deflate::compress_to_vec_zlib(&src, 6);
+                let n = blocks.len();
+                cases.push((bc1, src.clone(), n, 0, S_OK, Some(blocks.clone())));
+                cases.push((bc1 | ZLIB_BIT, zipped, n, 0, S_OK, Some(blocks)));
+                unpacked += 2;
+            }
+        }
+        // Bytes that are not a stream: the queue's answer is the decoder's.
+        let mut attempts = 0u64;
+        let mut failures = 0;
+        for src in [junk[..junk.len() / 2].to_vec(), junk.clone()] {
+            attempts += 1;
+            let dst: usize = if src.len() == junk.len() { 136 } else { 128 };
+            let blocks = crate::hle::bcpack::decode(1, &src, dst);
+            failures += u64::from(blocks.is_err());
+            let status = if blocks.is_ok() { S_OK } else { E_DECOMPRESSION };
+            cases.push((bc1, src, dst, 0, status, blocks.ok()));
+        }
+        // one byte cannot hold a block, whatever the stream says
+        let one = vec![0xFFu8];
+        assert!(crate::hle::bcpack::decode(1, &one, 8).is_err(), "a one-byte stream is not a block");
+        cases.push((bc1, one, 8, 0, E_DECOMPRESSION, None));
+        attempts += 1;
+        failures += 1;
+        // control: the same bytes without the BCPack stage are copied, not decoded
+        cases.push((SOURCE_MEMORY_BIT, junk[..128].to_vec(), 128, 0, S_OK, Some(junk[..128].to_vec())));
         unsafe {
             let mut f = std::ptr::null_mut();
             assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
@@ -2361,20 +2839,6 @@ mod tests {
             let hresult: unsafe extern "system" fn(*mut c_void, u32) -> HRESULT = std::mem::transmute(*sv.add(4));
             let before = stats().bcpack_unpacked.get("BC1").cloned().unwrap_or_default();
 
-            // (options, source, destination size, intermediate size) → status, destination
-            let damaged = &small[..small.len() - 1];
-            let cases: [(u64, &[u8], usize, usize, HRESULT, Option<&[u8]>); 7] = [
-                (bc1, &small, small_blocks.len(), 0, S_OK, Some(&small_blocks)),
-                (bc1 | ZLIB_BIT, &zipped, 0x10000, large.len(), S_OK, Some(&large_blocks)),
-                (bc1 | ZLIB_BIT, &zipped, 0x10000, 0, S_OK, Some(&large_blocks)),
-                // the intermediate size is zlib's output to the byte
-                (bc1 | ZLIB_BIT, &zipped, 0x10000, large.len() + 1, E_ZLIB_DATA, None),
-                // a stream that is not whole, and one for another number of blocks
-                (bc1, damaged, small_blocks.len(), 0, E_DECOMPRESSION, None),
-                (bc1, &small, small_blocks.len() + 8, 0, E_DECOMPRESSION, None),
-                // control: the same bytes without the BCPack stage are not the blocks
-                (SOURCE_MEMORY_BIT, &small[..small_blocks.len()], small_blocks.len(), 0, S_OK, Some(&small[..small_blocks.len()])),
-            ];
             let mut dsts: Vec<Vec<u8>> = cases.iter().map(|c| vec![0xCDu8; c.2 + 64]).collect();
             for (i, (c, dst)) in cases.iter().zip(dsts.iter_mut()).enumerate() {
                 enqueue(q, request_ex(c.0, dst.as_mut_ptr() as u64, 0, c.2 as u32, c.1.as_ptr() as u64, 0, c.1.len() as u32, c.3 as u32, 0).as_ptr());
@@ -2387,16 +2851,15 @@ mod tests {
             }
             for (i, (c, dst)) in cases.iter().zip(&dsts).enumerate() {
                 assert_eq!(hresult(s, i as u32), c.4, "request {i}");
-                match c.5 {
+                match &c.5 {
                     Some(want) => assert!(&dst[..c.2] == want, "request {i}: the destination has the blocks"),
                     None => assert!(dst[..c.2].iter().all(|&b| b == 0xCD), "request {i}: a failed request writes nothing"),
                 }
                 assert!(dst[c.2..].iter().all(|&b| b == 0xCD), "request {i}: nothing past the destination size");
             }
-            assert_ne!(small[..small_blocks.len()], small_blocks[..], "the control differs from the blocks");
             let after = stats().bcpack_unpacked["BC1"].clone();
-            assert!(after.requests >= before.requests + 3 && after.destination_bytes >= before.destination_bytes + 0x20000 + small_blocks.len() as u64);
-            assert!(after.failed >= before.failed + 2);
+            assert_eq!(after.requests - before.requests, unpacked + attempts - failures);
+            assert_eq!(after.failed - before.failed, failures);
             queue_close(q);
             queue_release(q);
             status_release(s);
@@ -2405,6 +2868,9 @@ mod tests {
 
     #[test]
     fn a_refused_bcpack_request_is_filled_only_under_the_switch() {
+        if bcpack_fill_from_env() {
+            return; // the switch starts on, so there is nothing to turn on
+        }
         unsafe {
             let mut f = std::ptr::null_mut();
             assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
@@ -2428,7 +2894,7 @@ mod tests {
             let hresult: unsafe extern "system" fn(*mut c_void, u32) -> HRESULT = std::mem::transmute(*sv.add(4));
             let packed = [0x5Au8; 64];
             let run = |dst: &mut [u8], n: u32, index: u32| {
-                let r = request(SOURCE_MEMORY_BIT | 7 << BCPACK_SHIFT, dst.as_mut_ptr() as u64, n, packed.as_ptr() as u64, 0, packed.len() as u32);
+                let r = request(SOURCE_MEMORY_BIT | 2 << BCPACK_SHIFT, dst.as_mut_ptr() as u64, n, packed.as_ptr() as u64, 0, packed.len() as u32);
                 enqueue(q, r.as_ptr());
                 status(q, s, index);
                 submit(q);
@@ -2438,7 +2904,7 @@ mod tests {
                 }
                 hresult(s, index)
             };
-            // a BC7 destination of 0x1008 bytes (a part block at the end), then guard bytes
+            // a BC2 destination of 0x1008 bytes, then guard bytes
             let n = 0x1008usize;
             let mut dst = vec![0xCDu8; n + 64];
             assert!(!queue(q).bcpack_fill.load(Ordering::Relaxed), "off unless XCL_DSTORAGE_BCPACK_FILL is set");
@@ -2446,12 +2912,12 @@ mod tests {
             assert!(dst.iter().all(|&b| b == 0xCD), "without the switch the destination is left as it was");
 
             queue(q).bcpack_fill.store(true, Ordering::Relaxed);
-            let before = BCPACK.filled_bytes[7].load(Ordering::Relaxed);
+            let before = BCPACK.filled_bytes[2].load(Ordering::Relaxed);
             assert_eq!(run(&mut dst, n as u32, 1), E_DECOMPRESSION, "the fill does not change the status");
-            let block = bcpack_fill_block(7).unwrap();
-            assert!(dst[..n].chunks(16).all(|c| c == &block[..c.len()]), "solid BC7 blocks up to the destination size");
+            let block = bcpack_fill_block(2).unwrap();
+            assert!(dst[..n].chunks(16).all(|c| c == &block[..c.len()]), "solid BC2 blocks up to the destination size");
             assert!(dst[n..].iter().all(|&b| b == 0xCD), "nothing past the destination size");
-            assert!(BCPACK.filled_bytes[7].load(Ordering::Relaxed) >= before + n as u64);
+            assert!(BCPACK.filled_bytes[2].load(Ordering::Relaxed) >= before + n as u64);
             queue_close(q);
             queue_release(q);
             status_release(s);

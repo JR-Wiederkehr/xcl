@@ -342,133 +342,10 @@ thread_local! {
     static COMPILER: RefCell<Option<IDxcCompiler3>> = const { RefCell::new(None) };
 }
 
-/// An `IMalloc` over a heap of its own, for one compile thread's DXC (`DxcCreateInstance2`).
-///
-/// DXC allocates and frees all the time, by default on the process heap, whose lock every
-/// compile thread then queues on: in a title with 37 GB committed, four compiles of
-/// 30 000–90 000-instruction programs shared about one core between them (their threads
-/// were found waiting in `RtlFreeHeap` → `RtlEnterCriticalSection`) and took minutes each.
-/// With a heap per compile thread they do not meet. The heap is serialized all the same –
-/// what DXC keeps for the process may be freed on another thread – and is never destroyed.
-#[repr(C)]
-struct HeapMalloc {
-    vtbl: *const HeapMallocVtbl,
-    heap: *mut c_void,
-}
-
-#[repr(C)]
-struct HeapMallocVtbl {
-    query_interface: unsafe extern "system" fn(*mut HeapMalloc, *const GUID, *mut *mut c_void) -> HRESULT,
-    add_ref: unsafe extern "system" fn(*mut HeapMalloc) -> u32,
-    release: unsafe extern "system" fn(*mut HeapMalloc) -> u32,
-    alloc: unsafe extern "system" fn(*mut HeapMalloc, usize) -> *mut c_void,
-    realloc: unsafe extern "system" fn(*mut HeapMalloc, *mut c_void, usize) -> *mut c_void,
-    free: unsafe extern "system" fn(*mut HeapMalloc, *mut c_void),
-    get_size: unsafe extern "system" fn(*mut HeapMalloc, *mut c_void) -> usize,
-    did_alloc: unsafe extern "system" fn(*mut HeapMalloc, *mut c_void) -> i32,
-    heap_minimize: unsafe extern "system" fn(*mut HeapMalloc),
-}
-
-mod heap_malloc {
-    use super::{c_void, HeapMalloc, HeapMallocVtbl, GUID, HRESULT};
-    use windows_sys::Win32::System::Memory::{HeapAlloc, HeapCompact, HeapFree, HeapReAlloc, HeapSize};
-
-    const IID_IUNKNOWN: GUID = GUID::from_u128(0x00000000_0000_0000_c000_000000000046);
-    const IID_IMALLOC: GUID = GUID::from_u128(0x00000002_0000_0000_c000_000000000046);
-
-    unsafe extern "system" fn query_interface(this: *mut HeapMalloc, iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
-        if out.is_null() {
-            return HRESULT(0x8000_4003_u32 as i32); // E_POINTER
-        }
-        if !iid.is_null() && (*iid == IID_IUNKNOWN || *iid == IID_IMALLOC) {
-            *out = this as *mut c_void;
-            return HRESULT(0);
-        }
-        *out = std::ptr::null_mut();
-        HRESULT(0x8000_4002_u32 as i32) // E_NOINTERFACE
-    }
-    // the object lives as long as the process: no count to keep
-    unsafe extern "system" fn add_ref(_this: *mut HeapMalloc) -> u32 {
-        2
-    }
-    unsafe extern "system" fn release(_this: *mut HeapMalloc) -> u32 {
-        1
-    }
-    unsafe extern "system" fn alloc(this: *mut HeapMalloc, size: usize) -> *mut c_void {
-        HeapAlloc((*this).heap, 0, size.max(1))
-    }
-    unsafe extern "system" fn realloc(this: *mut HeapMalloc, p: *mut c_void, size: usize) -> *mut c_void {
-        if p.is_null() {
-            return alloc(this, size);
-        }
-        if size == 0 {
-            HeapFree((*this).heap, 0, p);
-            return std::ptr::null_mut();
-        }
-        HeapReAlloc((*this).heap, 0, p, size)
-    }
-    unsafe extern "system" fn free(this: *mut HeapMalloc, p: *mut c_void) {
-        if !p.is_null() {
-            HeapFree((*this).heap, 0, p);
-        }
-    }
-    unsafe extern "system" fn get_size(this: *mut HeapMalloc, p: *mut c_void) -> usize {
-        if p.is_null() {
-            return usize::MAX;
-        }
-        HeapSize((*this).heap, 0, p)
-    }
-    unsafe extern "system" fn did_alloc(_this: *mut HeapMalloc, _p: *mut c_void) -> i32 {
-        -1 // cannot tell
-    }
-    unsafe extern "system" fn heap_minimize(this: *mut HeapMalloc) {
-        HeapCompact((*this).heap, 0);
-    }
-
-    pub(super) static VTBL: HeapMallocVtbl = HeapMallocVtbl { query_interface, add_ref, release, alloc, realloc, free, get_size, did_alloc, heap_minimize };
-}
-
-type CreateInstance2 = unsafe extern "system" fn(*mut HeapMalloc, *const GUID, *const GUID, *mut *mut c_void) -> HRESULT;
-
-/// A compiler whose memory is a heap of this thread's own (None: this dxcompiler.dll has no
-/// `DxcCreateInstance2`, no heap could be made, or `XCL_DXC_SHARED_HEAP=1`).
-fn compiler_on_own_heap() -> Option<IDxcCompiler3> {
-    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
-    use windows_sys::Win32::System::Memory::HeapCreate;
-    if std::env::var_os("XCL_DXC_SHARED_HEAP").is_some() {
-        return None;
-    }
-    let (dir, _) = load().ok()?;
-    unsafe {
-        let module = GetModuleHandleW(crate::util::wide(&dir.join("dxcompiler.dll").to_string_lossy()).as_ptr());
-        if module.is_null() {
-            return None;
-        }
-        let create: CreateInstance2 = std::mem::transmute(GetProcAddress(module, b"DxcCreateInstance2\0".as_ptr())?);
-        let heap = HeapCreate(0, 0, 0);
-        if heap.is_null() {
-            return None;
-        }
-        let malloc = Box::into_raw(Box::new(HeapMalloc { vtbl: &heap_malloc::VTBL, heap }));
-        let mut p = std::ptr::null_mut();
-        let hr = create(malloc, &CLSID_DxcCompiler, &IDxcCompiler3::IID, &mut p);
-        if hr.is_err() || p.is_null() {
-            return None;
-        }
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| crate::xlog_info!("DXC: each compile thread has a heap of its own"));
-        Some(IDxcCompiler3::from_raw(p))
-    }
-}
-
 fn compiler() -> Result<IDxcCompiler3, String> {
     COMPILER.with(|c| {
         if let Some(x) = c.borrow().as_ref() {
             return Ok(x.clone());
-        }
-        if let Some(x) = compiler_on_own_heap() {
-            *c.borrow_mut() = Some(x.clone());
-            return Ok(x);
         }
         let create = create_fn()?;
         let mut p = std::ptr::null_mut();
@@ -493,7 +370,16 @@ struct Job {
     profile: String,
     extra: Vec<String>,
     reply: std::sync::mpsc::Sender<Result<Vec<u8>, String>>,
+    /// one of the title's threads waits for it
+    wanted: Wanted,
 }
+
+/// Whether one of the title's threads waits for a compile (asked again while it is held back).
+pub type Wanted = Box<dyn Fn() -> bool + Send>;
+
+/// Compiles the title waits for that go on at once however little commit is left (each takes
+/// 0.1 – 0.7 GB).
+const WANTED_AT_ONCE: usize = 6;
 
 /// Compile threads (DXC workers, and the PSO workers of `pso_async` that feed them): every core
 /// but one, `XCL_DXC_THREADS` to choose. Memory is what `wait_for_memory` watches: a retail
@@ -534,8 +420,11 @@ impl Drop for MemorySlot {
 /// running (each can still grow to ~0.7 GB), at once; with less, one compile at a
 /// time – it goes when no other is running (and after a minute in any case). Each compile used
 /// to wait the minute while commit was short: with XDefiant's own 10 GB committed, 4 GB were
-/// left, and its last cold-cache shaders came a few a minute.
-pub fn wait_for_memory() -> MemorySlot {
+/// left, and its last cold-cache shaders came a few a minute. One that the title waits for
+/// (`wanted`) goes on at once too, up to `WANTED_AT_ONCE`: at a retail title's world loading five
+/// of its threads waited for cold compiles, four of which stood in this queue, until its watchdog
+/// ended it.
+pub fn wait_for_memory(wanted: &Wanted) -> MemorySlot {
     use std::sync::atomic::Ordering;
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     let start = std::time::Instant::now();
@@ -544,7 +433,7 @@ pub fn wait_for_memory() -> MemorySlot {
         m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
         let need = (RESERVE_GB.load(Ordering::Relaxed) << 30) + ((WORKING.load(Ordering::Acquire) as u64) << 30);
         let plenty = unsafe { GlobalMemoryStatusEx(&mut m) } == 0 || m.ullAvailPageFile >= need;
-        if plenty || start.elapsed().as_secs() >= 60 {
+        if plenty || start.elapsed().as_secs() >= 60 || (WORKING.load(Ordering::Acquire) < WANTED_AT_ONCE && wanted()) {
             WORKING.fetch_add(1, Ordering::AcqRel);
             return MemorySlot;
         }
@@ -569,7 +458,7 @@ fn pool() -> &'static std::sync::Mutex<std::sync::mpsc::Sender<Job>> {
                     Ok(j) => j,
                     Err(_) => return,
                 };
-                let _slot = wait_for_memory();
+                let _slot = wait_for_memory(&job.wanted);
                 let extra: Vec<&str> = job.extra.iter().map(|s| s.as_str()).collect();
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compile_here(&job.src, &job.entry, &job.profile, &extra)))
                     .unwrap_or_else(|_| Err("DXC: panic in the compile thread".into()));
@@ -583,7 +472,7 @@ fn pool() -> &'static std::sync::Mutex<std::sync::mpsc::Sender<Job>> {
 /// Compile HLSL to signed DXIL. `profile` e.g. "cs_6_6"; `extra` are dxc arguments.
 pub fn compile(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
     let (reply, rx) = std::sync::mpsc::channel();
-    let job = Job { src: src.into(), entry: entry.into(), profile: profile.into(), extra: extra.iter().map(|s| s.to_string()).collect(), reply };
+    let job = Job { src: src.into(), entry: entry.into(), profile: profile.into(), extra: extra.iter().map(|s| s.to_string()).collect(), reply, wanted: crate::hle::d3d12x::pso_async::wanted_here() };
     pool().lock().unwrap().send(job).map_err(|_| "DXC: no compile threads".to_string())?;
     rx.recv().map_err(|_| "DXC: the compile thread exited".to_string())?
 }

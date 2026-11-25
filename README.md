@@ -5,7 +5,7 @@
 <h1 align="center">XCL – modified build</h1>
 
 <p align="center">
-  <b>An installer and a handful of fixes on top of <a href="https://github.com/ivall/xcl">ivall/xcl</a>,<br>the Xbox Series X|S → Windows compatibility layer.</b>
+  <b>An installer and a handful of fixes on top of <a href="https://github.com/xcl-dev/xcl">xcl-dev/xcl</a>,<br>the Xbox Series X|S → Windows compatibility layer.</b>
 </p>
 
 <p align="center">
@@ -43,15 +43,15 @@ XCL is a research project and this is a snapshot of it. Please read this before 
 
 - **What upstream reports as working** (see the table further down): a few retail titles are
   listed as playable. Those claims are upstream's; they were not re-tested with this build.
-- **Large, new games: do not expect them to be playable.** With build 12 the game this build
-  was tested against gets **through its menus, plays its intro video and shows its loading
-  screen, and gets past it to the title card of its opening** on an RTX 5090. It stops there
-  (the card is drawn with its right colours, a few frames are shown, then the picture stands
-  still and the game ends about 40 s later):
-  nothing playable has been reached. The video plays at about its real speed, with sound. Still open:
-  the console's texture compression (BCPack) is decoded for BC1 only; pipelines that take the
-  NVIDIA driver long to compile are skipped until they are ready; compute writes to depth
-  buffers are lost.
+- **Large, new games: do not expect them to be playable.** With build 13 the game this build
+  was tested against starts in about 4 s, runs its menus and intro at 30 frames a second,
+  loads its world and reaches its **opening scene and the first controls prompt**; two runs of
+  five minutes ended without a hang or a crash, with **5 – 10 frames a second** in the world on
+  an RTX 5090. **The 3D world itself is still grey**: the pipelines of its geometry are refused,
+  and part of the memory its shaders read cannot be reached yet. The picture also stands still
+  for long stretches while big graphics pipelines are compiled. The settings of those runs are in
+  [`installer/CHANGES.txt`](installer/CHANGES.txt); they need a graphics card with a lot of
+  memory.
 
 - **Network:** XCL has no networking code of its own and does not phone home. The *game* does
   try to use the network – name lookups, and its crash reporter uploads a memory dump when it
@@ -145,7 +145,7 @@ What changed against upstream is listed in [`installer/CHANGES.txt`](installer/C
 ## Licence and credits
 
 **GPL-2.0-only**, as upstream ([`LICENSE`](LICENSE), [`THIRD_PARTY.md`](THIRD_PARTY.md)). XCL is
-written by its upstream authors at <https://github.com/ivall/xcl>; please send compatibility
+written by its upstream authors at <https://github.com/xcl-dev/xcl>; please send compatibility
 reports and thanks there. Product names are trademarks of their owners and are used only to
 say what the software is compatible with.
 
@@ -262,14 +262,14 @@ next to `xcl.exe`, directly next to `xcl.exe`, in `%LOCALAPPDATA%\XCL\D3D12\`, o
   and point `XCL_DXC_DIR` at its `bin\x64`. A Windows SDK may hold an older one (the same `10.0.26100.0`
   folder has DXC 1.7.2308 or 1.8.2502, depending on the SDK's revision). DXC 1.7's DXIL was 2–2.7 times the
   size of 1.9's for translated compute programs and took an NVIDIA driver 1.4–2.2 times as long to build
-  pipelines from ([#156](https://github.com/ivall/xcl/issues/156)). `xcl run` prints the DXC it loaded, and
+  pipelines from ([#156](https://github.com/xcl-dev/xcl/issues/156)). `xcl run` prints the DXC it loaded, and
   `report.json` has it under `dxc`.
 - **GPU:** developed on AMD RDNA4. The console's geometry and NGG programs run as a compute pass plus a
   mesh pass, so a GPU without mesh shaders draws none of them. On GPUs with 32-lane waves only
   (NVIDIA) console wave64 compute, geometry and mesh programs run as two 32-lane halves that exchange
   masks and lane values ([`docs/wave64-on-wave32.md`](docs/wave64-on-wave32.md)) – slower than
   64-lane waves, most for groups of several waves; wave64 vertex and pixel shaders that read lanes 32–63
-  can still differ there. Test results on other GPUs: [#42](https://github.com/ivall/xcl/issues/42).
+  can still differ there. Test results on other GPUs: [#42](https://github.com/xcl-dev/xcl/issues/42).
 
 ```powershell
 cargo build --release --workspace          # target\release\xcl.exe

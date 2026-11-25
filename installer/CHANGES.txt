@@ -1,48 +1,57 @@
-XCL - modified build 12
+XCL - modified build 13
 ======================
 
-This is NOT an official XCL release. It is XCL (https://github.com/ivall/xcl, GPL-2.0-only)
-built from upstream commit f4ce27c (2026-11-24) plus the changes listed below. The complete
-source of this build is at https://github.com/theaustinayers/xcl (tag v0.1.0-mod.12, branch
+This is NOT an official XCL release. It is XCL (https://github.com/xcl-dev/xcl, GPL-2.0-only)
+built from upstream commit 7f7e768 (2026-11-24) plus the changes listed below. The complete
+source of this build is at https://github.com/theaustinayers/xcl (tag v0.1.0-mod.13, branch
 modified-build). The licence is in LICENSE.txt, third-party notices in THIRD_PARTY.md.
 
-What changed since build 11
+What changed since build 12
 ---------------------------
-- The tested game's opening title card is drawn with its right colours, and the crash that
-  ended every run 2 - 8 s after its loading screen did not come back in two runs. It is still
-  not playable: a few frames are shown, then the picture stands still and the game ends about
-  40 s later.
-- Why: waits for pipelines that are still being built now share an allowance of time (1.5 s,
-  refilled by 0.5 s a second). Before, one pipeline that missed its 100 ms stopped all waits
-  for 2 s, a frame's other new pipelines were left out on the spot, and the game read what
-  their dispatches would have computed.
-- Built on upstream's current main: its faster texture uploads and detiling (60 frames a
-  second on the loading screen here, the game's world reached after about 80 s instead of
-  130), its kept driver compiles (#634, #636) and pipelines built ahead (#690), release builds
-  with line tables (xcl.pdb).
-- XCL_SHORT_MOVIES=1 (upstream pull request #681, taken as it is): the game's videos end
-  after their first frame - the world is reached after about 60 s.
-- A copy the game asks for out of memory it has reserved and not written yet is carried out
-  (what is there when the list is submitted, else zeros) instead of being left out; on top of
-  upstream pull request #473, taken as it is.
-- Two big driver compiles at once at most (eight stopped the driver for everything else).
-- XCL_SPARSE_SYNC=1 is an experiment (off by default) and can stop the game: leave it off.
+- The tested game reaches its opening scene in the 3D world and its first controls prompt and
+  keeps running: two runs of five minutes on an RTX 5090 ended without a hang, a crash or a
+  driver error (2,446 and 2,012 frames). In the world it shows 5 - 10 frames a second; menus
+  and intro 30. It is still NOT PLAYABLE: the picture of the 3D world is grey, because the
+  pipelines of its geometry are refused and part of the memory its shaders read cannot be
+  reached yet; and the picture stands still for long stretches while the game's big graphics
+  pipelines are compiled one after another (5 - 7 s each in the NVIDIA driver). Both are the
+  next thing.
+- The freeze after about 30 s in the world: command lists that had been split kept old pieces and
+  sent them again every frame (upstream pull request #929); waits were taken for deadlocks and
+  released too early (#2052); the console's cache flushes are real barriers; garbage indirect
+  draw and dispatch counts are not run.
+- Loading: the memory a game maps a page at a time is mapped together (upstream pull requests
+  #1517, #1792, #1184 and two fixes on top): 142 -> 3.2 microseconds a page in a test of 8,192
+  pages; the gap without a picture on the first loading screen went from 8 - 10 s to 4 s.
+- Submits: small writes of the CPU go up in one dispatch, only what changed of a texture goes up,
+  what each recorded call looks up has its own lock, releases are left to a thread. In the world
+  2 - 3 times the work a second of the build before.
+- A copy of the committed memory window and the game's big heaps in video memory (upstream pull
+  requests #1329 and the settings below).
+- Textures whose memory is not all there yet are read region by region: the world loads with
+  12 - 56 frames every 2 s where the build before showed 0 - 7.
 
-What this build has that upstream does not
-------------------------------------------
-- Launcher menu: "Add a game folder..." picks the folder with a game's unpacked files.
-- Keyboard / mouse: the mouse is taken only by a click inside the picture and released by F8,
-  by the title bar / borders and by switching windows. Page Up / Page Down hold the right
-  stick up / down (scrolling long menu text).
-- Shader compiler: each DXC compile thread allocates from a heap of its own.
-- Textures: threaded detile of tiled levels; unchanged textures are not uploaded again.
-- Pipelines: kept driver compiles, pipelines built ahead, several big compiles at once,
-  short waits (see above).
-- A 1 ms timer for the process.
-- D3D12.X: a pipeline still being built is waited for once, with a limit (XCL_PSO_WAIT_MS,
-  XCL_PSO_DRAW_WAIT_MS); its draws / dispatches are skipped until it is ready.
-- Installer (installer/xcl.iss), build.ps1, BUILDING.md and a GitHub Actions workflow that
-  builds the installer from the release tag and attests its provenance.
+Settings of the run above (environment variables, set them before starting XCL):
+  XCL_DIRECT_DXIL=1  XCL_HEAP_WINDOWS=1  XCL_UMA_SHADOW=1  XCL_COHERENT_HEAPS=sparse:16
+  XCL_LOOK_SKIP=1  XCL_DSTORAGE_PARALLEL_DECOMPRESS=1  XCL_DSTORAGE_WORKERS=8
+  XCL_DSTORAGE_MEMORY_BUDGET_MIB=512  XCL_COPY_THREADS=8
+They need a lot of video memory (28 GB were in use); without them the build runs as upstream's.
+
+What this build has that upstream's commit does not
+---------------------------------------------------
+- Launcher: "Add a game folder..." in the menu (a folder picker).
+- Keyboard and mouse: the cursor is taken by a click in the picture and let go by F8, the title
+  bar or Alt+Tab; Page Up / Page Down hold the right stick up / down.
+- Open upstream pull requests, taken with their authors' commits: #1329, #1850, #1993, #1766,
+  #1983, #1599, #929, #2052, #1453, #1422, #605, #1747, #1791, #1358 and #1517, #1792, #1184,
+  with fixes on top where they met each other.
+- The own changes above (the history of the branch has one commit each), diagnostics
+  (XCL_ACTIVITY, XCL_GPU_PROFILE, XCL_LOOK_STATS) and XCL_LOOK_AHEAD=ms (off).
+- Installer (installer/xcl.iss): per-user setup that bundles dxcompiler.dll and dxil.dll from
+  the Windows SDK next to xcl.exe, option to set XCL_NETWORK=0; build.ps1, BUILDING.md and a
+  GitHub Actions workflow that builds the installer from the release tag and attests it.
+
+Several of these are workarounds that keep a title going rather than correct implementations.
 
 What this is and is not
 -----------------------

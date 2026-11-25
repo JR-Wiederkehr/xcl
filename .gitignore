@@ -43,7 +43,3 @@ frame_*.bmp
 
 # Python bytecode of the scripts
 __pycache__/
-
-# this fork's installer output and local precompile copies
-dist/
-precompile-bin/

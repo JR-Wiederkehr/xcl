@@ -9,7 +9,7 @@
 
 #![allow(non_snake_case)]
 
-pub mod alloc_pool;
+mod alloc_pool;
 pub mod bind;
 pub mod console_heap;
 pub mod console_list;
@@ -17,20 +17,29 @@ pub mod device_x;
 pub mod dxgi_device;
 mod cpu_writes;
 mod fence_x;
+pub mod file_reads;
 pub mod frame;
+mod gpu_profile;
 pub mod guard;
-pub mod late_release;
+mod indirect_guard;
+mod late_release;
 pub mod layout;
 pub mod list_x;
+mod look_stats;
 pub mod null;
 pub mod present;
 pub mod pso_async;
 pub mod real;
+mod scatter;
+mod shader_cache_session;
+mod sharded;
 pub mod sparse;
-mod sync_trace;
 pub mod title_list;
+mod submit_cost;
+mod texture_upload;
 pub mod title_textures;
 pub mod vram;
+mod worker_pool;
 
 use std::ffi::c_void;
 use std::sync::OnceLock;
