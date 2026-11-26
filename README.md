@@ -43,14 +43,16 @@ XCL is a research project and this is a snapshot of it. Please read this before 
 
 - **What upstream reports as working** (see the table further down): a few retail titles are
   listed as playable. Those claims are upstream's; they were not re-tested with this build.
-- **Large, new games: do not expect them to be playable.** With build 15 the game this build
-  was tested against runs its menus and intro, reaches play (the game's own control prompts
-  are up) and **draws its world with the right colours and lighting**: static scenery is close
-  to correct. It is **not playable**: about **3 to 4 frames a second** in the world, **animated
-  models are broken up** (blocks missing, surfaces pulled into wedges), and in about one run in
-  four the graphics driver stops answering half a minute into the world. It needed 27 GB of
-  video memory, and on NVIDIA a driver profile setting that raises the reserve for pipeline
-  code. The settings of those runs, and the diagnostic switches this build adds, are in
+- **Large, new games: do not expect them to be playable.** With build 16 the game this build
+  was tested against runs its menus and intro, reaches play and draws its world with the right
+  colours; as an **Xbox Series S** (chosen in the start menu) it starts, needs less video
+  memory, and its characters are drawn whole. It is **not playable**: about **5 frames a
+  second**, hair is missing and soft surfaces show a dot pattern, square patches of the
+  picture are not redrawn, interiors are too dark (no working ray tracing), and in about one
+  run in four the graphics driver stops answering or scenery goes missing shortly after the
+  world appears. It needed 20 to 24 GB of video memory as a Series S and about 27 GB as a
+  Series X, and on NVIDIA a driver profile setting that raises the reserve for pipeline code.
+  The settings of those runs, and the diagnostic switches this build adds, are in
   [`installer/CHANGES.txt`](installer/CHANGES.txt).
 
 - **Network:** XCL has no networking code of its own and does not phone home. The *game* does
