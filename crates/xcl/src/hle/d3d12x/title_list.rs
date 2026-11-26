@@ -134,6 +134,7 @@ unsafe extern "system" fn close(this: *mut c_void) -> HRESULT {
     let pc = *((this as usize + F_BACKING) as *const *mut c_void);
     let f: unsafe extern "system" fn(*mut c_void) -> HRESULT = std::mem::transmute(pc_slot(pc, 9));
     let hr = f(pc);
+    super::capture::list_end(this as usize);
     super::title_textures::note_list_closed(this as usize);
     let n = *((this as usize + F_RING_AT) as *const usize);
     if hr < 0 && n > 0 {
@@ -198,6 +199,7 @@ pub(super) unsafe extern "system" fn reset(this: *mut c_void, alloc: usize, pso:
             }
         }
         *((this as usize + F_RING_AT) as *mut usize) = 0;
+        super::capture::list_begin(this as usize, pso);
     }
     hr
 }
@@ -417,6 +419,7 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(pc_slot(pc, 2));
     let n = f(pc);
     if n == 0 {
+        super::capture::forget(this as usize);
         let book = SEGMENTS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
         {
             let mut wg = WRAPPER_OF.lock().unwrap();

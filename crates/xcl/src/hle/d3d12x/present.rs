@@ -118,6 +118,8 @@ fn source_uv_rect(rect: Option<[i32; 4]>, w: u32, h: u32) -> [f32; 4] {
 unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u8) {
     let frames = BOUNDARIES.fetch_add(1, Ordering::Relaxed) + 1;
     super::targets::frame_end();
+    super::gpu_times::present(frames);
+    super::bvh_want::frame();
     if frames % 300 == 0 {
         // the title's frame rate, for comparing runs (every 300 frames)
         static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
@@ -141,6 +143,9 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
         }
     }
     let extracted = extract_planes(plane_count, planes);
+    if super::capture::enabled() {
+        super::capture::present(queue as usize, &extracted.iter().map(|e| e.0).collect::<Vec<_>>(), frames);
+    }
     if extracted.is_empty() || !enabled() {
         return;
     }

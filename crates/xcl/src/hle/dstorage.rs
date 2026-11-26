@@ -810,7 +810,9 @@ unsafe fn snapshot_page_array(ptr: u64, offset: u16, byte_len: u32) -> Result<Ve
     Ok(pages)
 }
 
-unsafe fn read_own(at: usize, out: *mut u8, len: usize) -> bool {
+/// `len` bytes of this process at `at` into `out`, false when any cannot be read (a page not
+/// committed, or decommitted meanwhile: the kernel's copy fails, nothing faults)
+pub(crate) unsafe fn read_own(at: usize, out: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0usize;

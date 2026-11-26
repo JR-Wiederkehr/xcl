@@ -88,7 +88,7 @@ thread_local! {
 /// when the title decommits its source may be asked for again, and must be when the title
 /// commits and binds that memory again: a thread that still remembered asking for it left the
 /// tile unmapped, and the draw read zeros through the view (a mesh without vertices).
-fn generation() -> (u64, u64) {
+pub(super) fn generation() -> (u64, u64) {
     (crate::hle::kernelx::gpu_view_map_gen(), super::sparse::mirror_asks_forgotten())
 }
 
@@ -124,6 +124,7 @@ pub fn want(path: Path, va: u64, len: u64) -> bool {
         return false;
     }
     CALLS[path as usize].fetch_add(1, Ordering::Relaxed);
+    let len = reach(path, va, len);
     if !asked_lately(va, len, generation()) {
         let queued = super::sparse::map_mirror(va as usize, len as usize) as u64;
         if queued != 0 {
@@ -131,6 +132,51 @@ pub fn want(path: Path, va: u64, len: u64) -> bool {
         }
     }
     true
+}
+
+/// A view whose size the title does not give – a root view, a mesh stage's root view, an
+/// acceleration structure – is asked for more than 64 KiB from its address on, as far as that
+/// still lies in a view window. Tiles whose CPU pages are not committed get no video memory
+/// (`sparse::fill_later`), so the cost is what the title really has there.
+///
+/// By default mesh stage views reach 1 MiB: a mesh stage reads vertex and
+/// index data through them, and a detailed mesh's buffers are longer than 64 KiB (the rest
+/// read as zero: its vertices collapsed onto a few points and the mesh drew as a slab).
+/// Root views of other stages keep 64 KiB: with 1 MiB a title's character lighting read
+/// tiles not yet filled and went black.
+/// `XCL_VIEW_REACH_MB=n`: `n` MiB instead, for all three kinds; 0: 64 KiB as before.
+/// `XCL_VIEW_REACH=bvh,root,mesh`: only those kinds.
+fn reach(path: Path, va: u64, len: u64) -> u64 {
+    static SET: std::sync::OnceLock<(u64, [bool; 3])> = std::sync::OnceLock::new();
+    let (mb, kinds) = *SET.get_or_init(|| {
+        let set = reach_setting(std::env::var("XCL_VIEW_REACH_MB").ok().as_deref(), std::env::var("XCL_VIEW_REACH").ok().as_deref());
+        crate::xlog_info!("D3D12.X: views without a size are asked for {} MiB from their address on (acceleration structures {}, root views {}, mesh stage views {}; XCL_VIEW_REACH_MB, XCL_VIEW_REACH)", set.0, set.1[0], set.1[1], set.1[2]);
+        set
+    });
+    let sizeless = match path {
+        Path::Bvh => kinds[0],
+        Path::RootView => kinds[1],
+        Path::MeshStage => kinds[2],
+        _ => false,
+    };
+    longer(sizeless, mb, len, |end| is_view(va.saturating_add(end - 1)))
+}
+
+/// The MiB a sizeless view reaches and the kinds that do (acceleration structure, root view,
+/// mesh stage view), from `XCL_VIEW_REACH_MB` and `XCL_VIEW_REACH`.
+fn reach_setting(mb: Option<&str>, kinds: Option<&str>) -> (u64, [bool; 3]) {
+    let named = kinds.map(|v| ["bvh", "root", "mesh"].map(|k| v.split(',').any(|x| x.trim().eq_ignore_ascii_case(k))));
+    match mb.and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(mb) => (mb.min(4096), named.unwrap_or([true; 3])),
+        None => (1, named.unwrap_or([false, false, true])),
+    }
+}
+
+/// `len`, or `mb` MiB when that is more, the path has no size (`sizeless`) and the last byte
+/// of the longer range is still in a view window (`in_view`, by the length).
+fn longer(sizeless: bool, mb: u64, len: u64, in_view: impl Fn(u64) -> bool) -> u64 {
+    let want = mb << 20;
+    if sizeless && want > len && in_view(want) { want } else { len }
 }
 
 /// The CPU address behind `va` (itself unless `va` lies in a GPU view of the title's memory,
@@ -170,6 +216,33 @@ pub fn line(now: &[(u64, u64); PATHS], before: &[(u64, u64); PATHS]) -> Option<S
         .map(|i| format!("{} {} ({} KB new)", now[i].0 - before[i].0, NAMES[i], (now[i].1 - before[i].1) >> 10))
         .collect();
     (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+#[cfg(test)]
+mod reach_tests {
+    /// Only a view without a size reaches further, only when asked to, and never past the
+    /// view window it is in.
+    #[test]
+    fn a_sizeless_view_reaches_further_inside_its_window_only() {
+        let all = |_: u64| true;
+        assert_eq!(super::longer(true, 0, 0x1_0000, all), 0x1_0000, "off");
+        assert_eq!(super::longer(true, 64, 0x1_0000, all), 64 << 20);
+        assert_eq!(super::longer(false, 64, 0x1_0000, all), 0x1_0000, "a view with a size keeps it");
+        assert_eq!(super::longer(true, 1, 8 << 20, all), 8 << 20, "never shorter");
+        assert_eq!(super::longer(true, 64, 0x1_0000, |end| end <= 32 << 20), 0x1_0000, "past the window");
+    }
+
+    /// Mesh stage views reach 1 MiB unless told otherwise; a number sets the
+    /// reach of all three kinds, 0 turns it off, and the kinds can be named.
+    #[test]
+    fn mesh_stage_views_reach_a_mebibyte_by_default() {
+        assert_eq!(super::reach_setting(None, None), (1, [false, false, true]));
+        assert_eq!(super::reach_setting(Some("4"), None), (4, [true; 3]));
+        assert_eq!(super::reach_setting(Some(" 0 "), None), (0, [true; 3]), "off");
+        assert_eq!(super::reach_setting(None, Some("mesh")), (1, [false, false, true]));
+        assert_eq!(super::reach_setting(Some("2"), Some("bvh, Root")), (2, [true, true, false]));
+        assert_eq!(super::longer(true, super::reach_setting(None, None).0, 0x1_0000, |_| true), 1 << 20);
+    }
 }
 
 #[cfg(test)]

@@ -307,6 +307,14 @@ impl Ir for DxilIr {
         }
         self.read_lane(v, lane)
     }
+    fn before_lanes_leave(&mut self, threads: [u32; 3], groups: [Value; 3], last: [Value; 3]) {
+        // the split form's halves meet counting their lanes (#1426's `kernel::compute_gate`):
+        // the other half's that stay
+        if let (true, Some((tid, _))) = (self.lw.split, self.ids) {
+            let w = crate::gpu::dxil::kernel::partner_word(&mut self.lw, threads, groups, last, tid);
+            self.lw.xn = self.lw.s.bit_count(crate::gpu::dxil::ops::BitCount::Countbits, w);
+        }
+    }
     fn count_bits(&mut self, v: Value) -> Value {
         self.lw.s.bit_count(crate::gpu::dxil::ops::BitCount::Countbits, v)
     }

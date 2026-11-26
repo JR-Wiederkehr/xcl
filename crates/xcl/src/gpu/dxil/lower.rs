@@ -29,6 +29,8 @@ pub const VAR_WIN: u32 = VAR_BUDGET + 2;
 /// never arrived" flag (`xcl_xk`, `xcl_x_dead`)
 pub const VAR_XK: u32 = VAR_BUDGET + 3;
 pub const VAR_XDEAD: u32 = VAR_BUDGET + 4;
+/// split form: LDS written since the halves last met (the recompiler's `xcl_x_lw`, `Lw::lds_in_order`)
+pub const VAR_XLW: u32 = VAR_BUDGET + 6;
 /// `tw0 + 1` of the last image store / atomic through the k-th T# of `Lw::img_writes` (16
 /// slots; the recompiler's `xcl_iw{srsrc}`)
 pub const VAR_IMG_WRITE: u32 = VAR_BUDGET + 8;
@@ -127,7 +129,7 @@ impl Init {
         if var == super::lower_round::VAR_F32_MODE {
             return s.m.i32c(super::lower_round::MODE_INIT);
         }
-        if var == VAR_FP16_RM || var == VAR_WIN || var == VAR_XK || var == VAR_XDEAD || (VAR_IMG_WRITE..VAR_IMG_WRITE + 16).contains(&var) {
+        if var == VAR_FP16_RM || var == VAR_WIN || var == VAR_XK || var == VAR_XDEAD || var == VAR_XLW || (VAR_IMG_WRITE..VAR_IMG_WRITE + 16).contains(&var) {
             return s.m.i32c(0);
         }
         if var >= super::lower_mem::VAR_TMP {
@@ -248,6 +250,9 @@ pub struct Lw {
     pub waves: u32,
     pub cw: Value,
     pub xn: Value,
+    /// a compute program whose lanes outside the launch EXEC have left (`kernel::compute_gate`):
+    /// that EXEC (lo, hi), every running lane's bit of which is set
+    pub live_exec: Option<(Value, Value)>,
     /// words per half in an exchange
     pub xslot: u32,
     /// the program's LDS (`xcl_lds`, 8192 dwords) and its last usable dword
@@ -282,6 +287,9 @@ pub struct Lw {
     /// when it is never read whole. Set by a caller that reads back only each lane's own bit
     /// (the per-lane form's bridge), so no exchange meets the other half.
     pub local_masks: bool,
+    /// split form: the program writes LDS (`recomp::emit::writes_lds`), so its LDS reads and
+    /// atomics keep the console wave's order (`VAR_XLW`)
+    pub writes_lds: bool,
 }
 
 impl Lw {
@@ -1047,6 +1055,8 @@ impl Lw {
                     return err(d, "s_barrier in a group of several hardware waves");
                 }
                 self.s.barrier(super::ops::barrier::GROUP_SYNC);
+                // (split form: both halves made their LDS writes before it)
+                self.lds_met();
                 Ok(())
             }
             "s_round_mode" => {

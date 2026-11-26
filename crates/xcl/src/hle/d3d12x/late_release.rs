@@ -31,6 +31,9 @@ enum Dead {
     Pipeline(usize),
     /// a heap XCL owns (`hold_heap`)
     Heap(usize),
+    /// a reference of XCL's own to a superseded target, whose tiles then leave the shared pages
+    /// (`hold_unmap`)
+    Unmap(usize),
 }
 
 struct Batch {
@@ -200,6 +203,18 @@ pub fn hold_heap(heap: ID3D12Heap) {
     start_thread();
 }
 
+/// A target superseded by a newer placement over its pages (`placements`) leaves the shared pages
+/// once every queue is past a fence value signalled after this: work submitted before may still
+/// draw to it or read it. `XCL_LATE_RELEASE=0`: now.
+pub fn hold_unmap(res: ID3D12Resource) {
+    if !enabled() {
+        unsafe { super::placements::unmap_if_superseded(&res) };
+        return drop(res);
+    }
+    HELD.lock().unwrap().get_or_insert_with(Held::default).open.push(Dead::Unmap(res.into_raw() as usize));
+    start_thread();
+}
+
 /// Release what every queue XCL knows of is past: the title's, the tile-mapping one, the
 /// upload ones.
 pub unsafe fn drain_known(seal_now: bool) {
@@ -231,6 +246,12 @@ pub unsafe fn drain_known(seal_now: bool) {
                 drop(ID3D12Heap::from_raw(h as *mut c_void));
                 continue;
             }
+            Dead::Unmap(r) => {
+                // (then the reference goes: the title's last one may have gone meanwhile)
+                let r = ID3D12Resource::from_raw(r as *mut c_void);
+                super::placements::unmap_if_superseded(&r);
+                continue;
+            }
         };
         // (its views in the shared heap become null views before the object goes)
         super::real::resource_ending(res);
@@ -240,6 +261,7 @@ pub unsafe fn drain_known(seal_now: bool) {
         // buffer at the same address, whose tiles this would unpin. (`forget_buffer` takes no
         // lock of this module's and does not wait for the sparse state's.)
         super::sparse::forget_buffer(res);
+        super::placements::gone(res);
         let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(super::real::orig_fn(res as *mut c_void, 2));
         f(res as *mut c_void);
     }

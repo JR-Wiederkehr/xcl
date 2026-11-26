@@ -545,15 +545,30 @@ unsafe fn title_memory(u: &crate::gpu::uma::Uma, bytes: usize) -> Option<usize> 
     use crate::hle::kernelx::{runtime_alloc, runtime_free, D3D_DESCRIPTOR_HEAP};
     let p = runtime_alloc(bytes, D3D_DESCRIPTOR_HEAP)?;
     let readable = crate::gpu::shader::readable(p, bytes);
-    if readable && u.window_of(p) == Some(0) && u.window_of(p + bytes - 1) == Some(0) {
+    if title_memory_fits(u, p, bytes, readable) {
         return Some(p);
     }
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
-        crate::xlog_warn!("console descriptor heap: the title's memory {p:#x} ({bytes:#x} bytes) not used (window {:?}, committed {readable})", u.window_of(p));
+        let (free, largest) = u.sparse_free_in(0);
+        crate::xlog_warn!(
+            "console descriptor heap: the title's memory {p:#x} ({bytes:#x} bytes) not used (window {:?}, committed {readable}; window 0 has {} MB free, {} MB at most in one run)",
+            u.window_of(p),
+            free >> 20,
+            largest >> 20
+        );
     }
     runtime_free(p, D3D_DESCRIPTOR_HEAP);
     None
+}
+
+/// Whether the title's `[p, p + bytes)` can hold a heap's slots: committed (`readable`) and all
+/// in window 0. A descriptor table is a 32-bit address, high half 0, which shaders and
+/// `words_at` read in window 0 – at `base + (p as u32)`. In another window the tables would name
+/// other bytes, and the substitute heap the title then gets does not start at its memory (a
+/// retail game asserts that it does).
+fn title_memory_fits(u: &crate::gpu::uma::Uma, p: usize, bytes: usize, readable: bool) -> bool {
+    readable && bytes > 0 && u.window_of(p) == Some(0) && p.checked_add(bytes - 1).is_some_and(|e| u.window_of(e) == Some(0))
 }
 
 /// PC samplers of a console sampler heap of `n` slots: a shader-visible one gets the 2 048 a
@@ -802,7 +817,7 @@ static RES: Mutex<Option<std::collections::HashMap<usize, usize>>> = Mutex::new(
 
 /// The view in slot `s` names `res` (0: none).
 pub fn note_resource(s: &Slot, res: usize) {
-    if s.sampler || !(super::present::trace_frame() || super::targets::enabled()) {
+    if s.sampler || !(super::present::trace_frame() || super::targets::enabled() || super::capture::enabled()) {
         return;
     }
     let mut g = RES.lock().unwrap();
@@ -1105,6 +1120,27 @@ mod tests {
         let bound = crate::gpu::dxil::lower_image::VIEW_HEAP_MAX_SRV;
         // accepted: tw0 < bound, so the highest UAV index is bound - 1 + 1 = bound
         assert!(bound < cap, "shaders accept indices up to {bound}, the shared heap holds {cap}");
+    }
+
+    /// The title's memory holds a heap only when committed and all in window 0: where a Series X
+    /// run's view heap was (0xf2e00000 into window 0), not where a Series S run's was (window 1,
+    /// 0x1400000 in), nor across the end of window 0, nor outside unified memory.
+    #[test]
+    fn title_memory_holds_a_heap_only_in_window_0() {
+        use crate::gpu::uma::{Uma, WINDOW};
+        let u = Uma::for_runtime_windows(16 << 20, 512 << 20, 16).expect("16-window aperture");
+        let b = u.base();
+        let view_heap = (1_245_184 * SLOT) as usize; // 0x2600000
+        assert!(title_memory_fits(&u, b + 0xf2e0_0000, view_heap, true));
+        assert!(!title_memory_fits(&u, b + 0xf2e0_0000, view_heap, false), "not committed");
+        assert!(!title_memory_fits(&u, b + WINDOW + 0x140_0000, view_heap, true));
+        assert!(!title_memory_fits(&u, b + WINDOW - 0x1_0000, view_heap, true), "into window 1");
+        assert!(title_memory_fits(&u, b + WINDOW - view_heap, view_heap, true), "the end of window 0");
+        // the coherent window, a view window, plain memory
+        for p in [b + 3 * WINDOW, b + 4 * WINDOW, 0xf2e0_0000] {
+            assert!(!title_memory_fits(&u, p, 0x1_0000, true), "{p:#x}");
+        }
+        assert!(!title_memory_fits(&u, b + 0x2001_0000, 0, true));
     }
 
     /// Ranges of the shared heap: released ones first (first fit, split), then new ones, and

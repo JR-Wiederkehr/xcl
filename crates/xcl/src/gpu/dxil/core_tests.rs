@@ -102,6 +102,65 @@ fn a_single_split_wave_of_a_compute_group_exchanges_without_a_group_barrier() {
 {d}");
 }
 
+/// The split form keeps the console wave's order of LDS accesses (`Lw::lds_in_order`): an LDS
+/// read after a write, and a write after a read, meet the other half first (the kernel form's
+/// group barrier, a compute group's counters); a read with no write since the last meet does
+/// not, and a half without a partner and the native form never do. In a loop the meet is
+/// conditional on the bits, and still validates.
+#[test]
+fn split_lds_reads_meet_after_writes() {
+    use crate::gpu::recomp::CsInterface;
+    type Inst<'a> = (&'a str, &'a str, &'a [(&'a str, u64)], Option<u32>);
+    let write: Inst = ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 0)], None);
+    let read: Inst = ("DS_READ_B32", "ENC_DS", &[("VDST", 2), ("ADDR", 1)], None);
+    let syncs = |d: &str| d.matches("@dx.op.barrier(i32 80, i32 9)").count();
+    let kernel = |list: &[Inst], split: bool| {
+        let o = KernelOptions { wave64: true, split, mem_windows: 1, sampler_base: 0 };
+        super::validate::disassemble(&translate(&prog(list), o).unwrap_or_else(|e| panic!("{e}")))
+    };
+    let Ok(rw) = kernel(&[write, read], true) else {
+        crate::gpu::recomp::runner::skip_test("no DXC");
+        return;
+    };
+    let w = syncs(&kernel(&[write], true).unwrap());
+    assert_eq!(syncs(&rw), w + 1, "the read meets after the write:\n{rw}");
+    assert_eq!(syncs(&kernel(&[write, write], true).unwrap()), w, "a write after a write");
+    assert_eq!(syncs(&kernel(&[read, write], true).unwrap()), w + 1, "the write meets after the read");
+    assert_eq!(syncs(&kernel(&[write, read, read], true).unwrap()), w + 1, "the second read: the halves met since the write");
+    assert_eq!(syncs(&kernel(&[write, read, write], true).unwrap()), w + 2, "a meet before the read and before the second write");
+    let native = |list: &[Inst]| syncs(&kernel(list, false).unwrap());
+    assert_eq!(native(&[write, read]), native(&[write]), "the native form");
+    // a loop: read, write, three times – each waits for the other from the second pass on
+    let looped = |body: &[Inst]| {
+        let mut l: Vec<Inst> = vec![("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 131)], None)];
+        l.extend_from_slice(body);
+        // back to the loop's first instruction: the DS instructions are 2 words each
+        let back = 0x1_0000 - (2 * body.len() as u64 + 3);
+        l.extend_from_slice(&[
+            ("S_SUB_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)], None),
+            ("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128)], None),
+        ]);
+        let mut code = prog(&l);
+        code.truncate(code.len() - 4);
+        code.extend(encode("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", back)], None).unwrap());
+        code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        let o = KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
+        syncs(&super::validate::disassemble(&translate(&code, o).unwrap_or_else(|e| panic!("{e}"))).unwrap())
+    };
+    assert!(looped(&[read, write]) >= looped(&[read]) + 2, "the loop's read and write meet when the bits are set");
+    // compute groups: the counters' meet (two more atomics), none without a partner half
+    let atomics = |threads: u32, list: &[Inst]| {
+        let cs = CsInterface { threads: [threads, 1, 1], user_sgprs: 0, tgid: [false; 3], tg_size: false, tid_components: 1 };
+        let o = KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
+        let d = super::validate::disassemble(&super::kernel::translate_compute(&prog(list), o, &cs).unwrap_or_else(|e| panic!("{threads} threads: {e}")).dxil).unwrap();
+        d.matches("atomicrmw").count()
+    };
+    for threads in [64, 128] {
+        assert_eq!(atomics(threads, &[write, read]), atomics(threads, &[write]) + 2, "{threads} threads");
+    }
+    assert_eq!(atomics(32, &[write, read]), atomics(32, &[write]), "32 threads: no partner half");
+}
+
 #[test]
 fn straight_line_and_loop_kernels_validate() {
     let code = prog(&[
@@ -854,6 +913,50 @@ fn direct_compute_loops_count_each_entry() {
         assert_eq!(loop_counts(&none), (0, 0, None), "wave64 {wave64}:\n{none}");
         let kernel = super::validate::disassemble(&translate(&endless_loop(), o).unwrap()).unwrap();
         assert_eq!(loop_counts(&kernel), (0, 1, None), "wave64 {wave64}:\n{kernel}");
+    }
+}
+
+/// The compute entry loads the dispatch's thread limits (`recomp::IO_THREAD_LIMIT`) in one
+/// 3-dword load and lets only the lanes below them into the program. Without a group barrier the
+/// lanes past them leave at once and the running lanes' vector writes stay unguarded, as before
+/// (the one conditional branch is the entry's); with one they stay, out of EXEC, and the store
+/// is guarded. Wave32, wave64 and the split form (with and without a partner half).
+#[test]
+fn the_compute_entry_lets_only_the_lanes_below_the_thread_limits_in() {
+    use crate::gpu::recomp::{CsInterface, IO_THREAD_LIMIT};
+    let code = |barrier: bool| {
+        let mut l: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = vec![
+            ("V_LSHL_ADD_U32", "ENC_VOP3", &[("VDST", 4), ("SRC0", 2), ("SRC1", 134), ("SRC2", 256)], None),
+            ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 130), ("VSRC1", 4)], None),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 128)], None),
+            ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 6), ("DATA", 4), ("SADDR", 0x7D)], None),
+        ];
+        if barrier {
+            l.insert(0, ("S_BARRIER", "ENC_SOPP", &[], None));
+        }
+        prog(&l)
+    };
+    let load = format!("i32 {}, i32 undef, i8 7, i32 4)", IO_THREAD_LIMIT[0] * 4);
+    for (wave64, split, threads) in [(false, false, 32), (true, false, 64), (true, true, 64), (true, true, 32)] {
+        let o = KernelOptions { wave64, split, mem_windows: 1, sampler_base: 0 };
+        let cs = CsInterface { threads: [threads, 1, 1], user_sgprs: 2, tgid: [true, false, false], tg_size: false, tid_components: 1 };
+        // (a split wave64 of 64 threads is two hardware waves: its barrier is the HLSL path's)
+        for barrier in [false, true].into_iter().filter(|&b| !(b && split && threads == 64)) {
+            let what = format!("wave64 {wave64}, split {split}, {threads} threads, barrier {barrier}");
+            let k = super::kernel::translate_compute(&code(barrier), o, &cs).unwrap_or_else(|e| panic!("{what}: {e}"));
+            let Ok(dis) = super::validate::disassemble(&k.dxil) else {
+                return crate::gpu::recomp::runner::skip_test("no DXC");
+            };
+            assert_eq!(dis.matches(&load).count(), 1, "{what}: the limits in one load\n{dis}");
+            if !split || threads == 32 {
+                assert_eq!(dis.matches("br i1 ").count(), if barrier { 2 } else { 1 }, "{what}\n{dis}");
+                // the entry's branch: on the group (a folded count) and, without a barrier, the
+                // lane's place inside the limits too
+                let cond = dis.lines().find_map(|l| l.trim().strip_prefix("br i1 ")).and_then(|r| r.split(',').next()).unwrap();
+                let def = dis.lines().find(|l| l.trim().starts_with(&format!("{cond} = "))).unwrap();
+                assert_eq!(def.contains("= and i1 "), !barrier, "{what}: {def}\n{dis}");
+            }
+        }
     }
 }
 

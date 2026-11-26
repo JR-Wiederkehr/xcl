@@ -609,6 +609,32 @@ impl Uma {
         }
     }
 
+    /// `sparse_alloc` for memory shaders never address with 32 bits: windows 1+ first (as
+    /// `sparse_reserve`), window 0 only when they have no room – it stands for the console's low
+    /// 4 GiB, where a title's own descriptor heaps must lie (`console_heap::title_memory`).
+    /// Above a window the same as `sparse_alloc`.
+    pub fn sparse_alloc_above(&self, size: usize, align: usize) -> Option<(usize, usize)> {
+        if size <= WINDOW && self.has_sparse() {
+            let size = size.max(1).checked_next_multiple_of(GRAIN)?;
+            let align = align.max(GRAIN).checked_next_power_of_two()?;
+            let above_0 = (self.base + WINDOW).max(self.title_sparse_start());
+            if let Some(at) = take_sparse_in(&mut self.sparse_free.lock().unwrap(), above_0, self.sparse_end(), size, align, true) {
+                return Some((at, size));
+            }
+        }
+        self.sparse_alloc(size, align)
+    }
+
+    /// Diagnostic: the free bytes of sparse window `k` the title may take (not `desc_range`), in
+    /// all and the largest run.
+    pub fn sparse_free_in(&self, k: usize) -> (usize, usize) {
+        let (lo, hi) = (self.base + k * WINDOW, self.base + (k + 1) * WINDOW);
+        let lo = if k == 0 { lo.max(self.title_sparse_start()) } else { lo };
+        let g = self.sparse_free.lock().unwrap();
+        let runs = g.0.iter().map(|(&o, &l)| (o.max(lo), (o + l).min(hi))).filter(|&(a, e)| a < e).map(|(a, e)| e - a);
+        runs.fold((0, 0), |(all, big), n| (all + n, big.max(n)))
+    }
+
     /// The bytes of the sparse reservation starting at `p` (it is gone after this).
     pub fn sparse_release(&self, p: usize) -> Option<usize> {
         give_back(&mut self.sparse_free.lock().unwrap(), p)
@@ -940,6 +966,13 @@ impl Arena {
 
 static GLOBAL: OnceLock<Option<Uma>> = OnceLock::new();
 
+/// A process that holds no title memory (a shader preparation worker): `get` is None from here
+/// on, and nothing is reserved or committed for it (a run's region commits its coherent window).
+/// Before any `get`.
+pub fn leave_out() {
+    let _ = GLOBAL.set(None);
+}
+
 /// The title's graphics memory XCL places in the coherent window (`note_coherent_need`) is
 /// known only once it asks for it, and the window is committed when it is made: its size is
 /// what the title put in it in its last run (`<data>/cache/uma_coherent*.txt`) and XCL's own
@@ -947,12 +980,12 @@ static GLOBAL: OnceLock<Option<Uma>> = OnceLock::new();
 ///
 /// Which of the title's GPU heaps go there is `XCL_COHERENT_HEAPS`'s
 /// (`kernelx::coherent_heaps_route`), so a size is kept for each setting, in a file of its own
-/// (`coherent_file_name`): a size measured with every heap in the window does not apply to a
+/// (`coherent_file_name`, and per console): a size measured with every heap in the window does not apply to a
 /// run that sends them to the sparse windows. A retail title's 4582 MB of heaps, stored once,
 /// made windows of 4095 + 998 MB in runs that put at most 105 MB in them, each shadowed by as
 /// much video memory with `XCL_UMA_SHADOW=1`.
 fn coherent_file(route: &str) -> std::path::PathBuf {
-    crate::state::data_dir().join("cache").join(coherent_file_name(route))
+    crate::state::data_dir().join("cache").join(coherent_file_name(route, crate::state::config().is_series_s()))
 }
 
 /// The file in `<data>/cache` that keeps the coherent window's size for `route`, one number:
@@ -960,11 +993,15 @@ fn coherent_file(route: &str) -> std::path::PathBuf {
 /// per-setting sizes read and write in the same data folder (a text they cannot parse gave them
 /// a 512 MB window, too small for a retail title's heaps), and `uma_coherent_<setting>.txt`
 /// (`:` as `_`) for the other settings, which those builds never read.
-fn coherent_file_name(route: &str) -> String {
+/// The Series S profile has files of its own (`_lockhart` before `.txt`, as xcl-dev/xcl#1110):
+/// a title makes smaller heaps there (a retail game 2.9 GB for 4.5), and the Series X size kept
+/// in the same data folder committed a window it never filled.
+fn coherent_file_name(route: &str, series_s: bool) -> String {
+    let device = if series_s { "_lockhart" } else { "" };
     if route == ALL_HEAPS {
-        return "uma_coherent.txt".into();
+        return format!("uma_coherent{device}.txt");
     }
-    format!("uma_coherent_{}.txt", route.replace(':', "_"))
+    format!("uma_coherent_{}{device}.txt", route.replace(':', "_"))
 }
 
 /// The setting of `XCL_COHERENT_HEAPS` that puts every GPU heap in the coherent window (none),
@@ -1414,6 +1451,63 @@ mod tests {
         }
     }
 
+    /// The Series X run's plan (`XCL_UMA_WINDOWS=16`, 4095 MB, a 512 MB coherent window) and where
+    /// its first graphics memory goes: 3 sparse windows, the coherent one, 6 view windows, 6
+    /// empty, and its GPU heaps of 1172 / 2199 / 563 / 596 MB and its 38 MB view heap at the
+    /// addresses that run logged (0xf2e00000 into window 0). Nothing of the title memory size
+    /// goes into the plan: the Series S profile gets the same one.
+    #[test]
+    fn the_series_x_plan_is_pinned() {
+        let u = Uma::for_runtime_windows(4095 << 20, RUNTIME_COMMITTED_CAP, MAX_HEAP_WINDOWS).expect("16-window aperture");
+        let b = u.base();
+        assert_eq!(b % (MAX_HEAP_WINDOWS * WINDOW), 0);
+        use WindowKind::*;
+        let mut kinds = vec![Sparse, Sparse, Sparse, Committed(512 << 20)];
+        kinds.extend([View; VIEW_WINDOWS]);
+        kinds.extend([None; 6]);
+        assert_eq!(u.kinds, kinds);
+        assert_eq!((u.shader_windows(), u.windows(), u.size()), (16, 1, 512 << 20));
+        assert_eq!(u.desc_range(), Some((b + GRAIN, b + GRAIN + DESC_HEADROOM)));
+        assert_eq!((u.title_sparse_start(), u.sparse_end()), (b + 0x2001_0000, b + 3 * WINDOW));
+        for (p, k) in [(0xf2e0_0000, Some(0)), (WINDOW + 0x140_0000, Some(1)), (3 * WINDOW, Some(3)), (3 * WINDOW + (512 << 20), Option::None), (4 * WINDOW, Some(4)), (10 * WINDOW, Option::None)] {
+            assert_eq!(u.window_of(b + p), k, "{p:#x}");
+        }
+        // the GPU heaps (2 MB pages, rounded as `kernelx::VirtualAlloc` does), then the view heap
+        let at: Vec<usize> = [1172usize, 2199, 563, 596].iter().map(|&mb| u.sparse_alloc((mb << 20).next_multiple_of(2 << 20), 2 << 20).unwrap().0 - b).collect();
+        assert_eq!(at, [0x2020_0000, 0x6960_0000, WINDOW, WINDOW + (564 << 20)]);
+        assert_eq!(u.sparse_alloc(0x260_0000, GRAIN).map(|(a, _)| a - b), Some(0xf2e0_0000));
+        // the home of the Series X run's page pool (99776 pages: more than a window) goes where it went
+        let pool = 99776 * GRAIN;
+        let above = u.sparse_alloc_above(pool, GRAIN);
+        assert_eq!(above.map(|(a, n)| (a - b, n)), Some((WINDOW + (1160 << 20), pool)));
+        assert_eq!(u.sparse_release(above.unwrap().0), Some(pool));
+        assert_eq!(u.sparse_alloc(pool, GRAIN), above);
+    }
+
+    /// Memory no shader addresses with 32 bits keeps out of window 0 while windows 1+ have room,
+    /// and gets window 0 when they have none; above a window it goes as `sparse_alloc`'s.
+    #[test]
+    fn sparse_alloc_above_keeps_window_0_for_the_title() {
+        let u = Uma::for_runtime_windows(16 << 20, RUNTIME_COMMITTED_CAP, MAX_HEAP_WINDOWS).expect("16-window aperture");
+        let b = u.base();
+        let (h, n) = u.sparse_alloc_above(664 << 20, GRAIN).unwrap();
+        assert_eq!((h, n), (b + WINDOW, 664 << 20));
+        // window 0 still has the room a 38 MB view heap needs after 2.9 GB of GPU heaps
+        let heaps = u.sparse_alloc(2892 << 20, 2 << 20).unwrap();
+        assert_eq!(u.window_of(heaps.0), Some(0));
+        assert_eq!(u.sparse_alloc(0x260_0000, GRAIN).map(|(a, _)| u.window_of(a)), Some(Some(0)));
+        let used = (2892 << 20) + 0x260_0000;
+        assert_eq!(u.sparse_free_in(0), (WINDOW - 0x2001_0000 - used, WINDOW - 0x2020_0000 - used));
+        assert_eq!(u.sparse_free_in(1), (WINDOW - (664 << 20), WINDOW - (664 << 20)));
+        // windows 1..2 full: window 0
+        let rest = u.sparse_reserve(2 * WINDOW - (664 << 20)).unwrap();
+        assert_eq!(u.window_of(rest), Some(1));
+        let (w0, _) = u.sparse_alloc_above(GRAIN, GRAIN).unwrap();
+        assert_eq!(u.window_of(w0), Some(0));
+        assert!(w0 >= u.title_sparse_start(), "never the descriptor headroom");
+        assert!(u.sparse_alloc_above(WINDOW + GRAIN, GRAIN).is_none(), "no room above a window");
+    }
+
     /// With 16 windows nothing of Windows' lands in the aperture: shaders read every window of
     /// it, and a window without memory of its own once read whatever Windows had put there.
     #[test]
@@ -1527,12 +1621,16 @@ mod tests {
     /// heap stays one number, the only text builds before this one read in the same data folder.
     #[test]
     fn the_stored_coherent_need_is_the_one_of_the_heaps_setting() {
-        assert_eq!(coherent_file_name(ALL_HEAPS), "uma_coherent.txt", "the file builds before read and write");
-        assert_eq!(coherent_file_name("sparse:16"), "uma_coherent_sparse_16.txt", "no ':' in a Windows file name");
-        assert_eq!(coherent_file_name("sparse"), "uma_coherent_sparse.txt");
-        assert_eq!(coherent_file_name("off"), "uma_coherent_off.txt");
-        let names = [ALL_HEAPS, "off", "sparse", "sparse:16", "sparse:64"].map(coherent_file_name);
-        assert!(names.iter().enumerate().all(|(i, n)| !names[..i].contains(n)), "one file per setting: {names:?}");
+        let x = |route| coherent_file_name(route, false);
+        assert_eq!(x(ALL_HEAPS), "uma_coherent.txt", "the file builds before read and write");
+        assert_eq!(x("sparse:16"), "uma_coherent_sparse_16.txt", "no ':' in a Windows file name");
+        assert_eq!(x("sparse"), "uma_coherent_sparse.txt");
+        assert_eq!(x("off"), "uma_coherent_off.txt");
+        // the Series S profile's own files, beside the Series X ones
+        assert_eq!(coherent_file_name(ALL_HEAPS, true), "uma_coherent_lockhart.txt");
+        assert_eq!(coherent_file_name("sparse:16", true), "uma_coherent_sparse_16_lockhart.txt");
+        let names: Vec<String> = [false, true].iter().flat_map(|&s| [ALL_HEAPS, "off", "sparse", "sparse:16", "sparse:64"].map(|r| coherent_file_name(r, s))).collect();
+        assert!(names.iter().enumerate().all(|(i, n)| !names[..i].contains(n)), "one file per setting and console: {names:?}");
         // what is written is what builds before wrote (`bytes.to_string()`) and parse
         // (`s.trim().parse::<usize>()`)
         let stored = (4582usize << 20).to_string();

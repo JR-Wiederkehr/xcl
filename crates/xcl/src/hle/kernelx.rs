@@ -2284,8 +2284,14 @@ unsafe fn move_away(away: &mut Away, old: usize, at: usize, page: usize, in_uma:
 /// only when this `Uma` has no sparse windows (so overflow on runtime layouts never eats the
 /// coherent window's `KEEP` headroom or creates non-lazy homes), and finally plain
 /// `MEM_RESERVE` memory committed on first use (`home_again`).
+/// In the sparse windows from window 1 on while they have room (`sparse_alloc_above`): homes are
+/// never 32-bit addressed, window 0 is the console's low 4 GiB. A retail game on the Series S
+/// profile had 664+ MB of pages (its page numbers) before it made its view heap; with their homes
+/// first-fit in window 0, beside the GPU heaps of `XCL_COHERENT_HEAPS=sparse`, the memory it gave
+/// the heap was in window 1, which descriptor tables cannot reach (`console_heap::title_memory`),
+/// and it stopped on its own breakpoint.
 unsafe fn alloc_physical_home(u: &crate::gpu::uma::Uma, bytes: usize) -> Option<usize> {
-    if let Some((p, _)) = u.sparse_alloc(bytes, PHYS_PAGE) {
+    if let Some((p, _)) = u.sparse_alloc_above(bytes, PHYS_PAGE) {
         return Some(p);
     }
     if !u.has_sparse() {
@@ -5219,6 +5225,25 @@ mod tests {
         }
         for p in held {
             assert!(u.sparse_release(p).is_some());
+        }
+    }
+
+    /// Homes of physical pages leave window 0 – the console's low 4 GiB – to the title: after
+    /// the Series S run's 2.9 GB of sparse GPU heaps and 664 MB of pages, its 38 MB view heap still
+    /// fits there (the homes in window 0 left it none, and the heap went to window 1).
+    #[test]
+    fn physical_homes_leave_window_0_to_the_title() {
+        let u = crate::gpu::uma::Uma::for_runtime(16 << 20).unwrap();
+        unsafe {
+            let heaps = u.sparse_alloc(2892 << 20, 2 << 20).unwrap().0;
+            let home = alloc_physical_home(&u, 664 << 20).unwrap();
+            assert_eq!(u.window_of(home), Some(1), "the home keeps out of window 0");
+            assert!(lazy_home(home));
+            let view_heap = u.sparse_alloc(0x260_0000, crate::gpu::uma::GRAIN).unwrap().0;
+            assert_eq!(u.window_of(view_heap), Some(0));
+            for p in [view_heap, home, heaps] {
+                assert!(u.sparse_release(p).is_some());
+            }
         }
     }
 

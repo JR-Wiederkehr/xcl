@@ -583,6 +583,10 @@ pub(super) unsafe extern "system" fn ia_set_topology_x(this: *mut c_void, t: u32
 
 /// console #21 RSSetViewports (PC #21)
 pub(super) unsafe extern "system" fn rs_set_viewports_x(this: *mut c_void, n: u32, v: *const D3D12_VIEWPORT) {
+    let _c = super::capture::op(this, || {
+        let vs = if v.is_null() { &[][..] } else { std::slice::from_raw_parts(v, n as usize) };
+        Some(super::capture::Op::Viewports(vs.iter().map(|v| [v.TopLeftX, v.TopLeftY, v.Width, v.Height, v.MinDepth, v.MaxDepth]).collect()))
+    });
     if !v.is_null() {
         let vs = std::slice::from_raw_parts(v, n as usize).to_vec();
         with_bindings(this, |b| b.viewports = vs);
@@ -592,6 +596,10 @@ pub(super) unsafe extern "system" fn rs_set_viewports_x(this: *mut c_void, n: u3
 
 /// console #22 RSSetScissorRects (PC #22)
 pub(super) unsafe extern "system" fn rs_set_scissors_x(this: *mut c_void, n: u32, r: *const windows::Win32::Foundation::RECT) {
+    let _c = super::capture::op(this, || {
+        let rs = if r.is_null() { &[][..] } else { std::slice::from_raw_parts(r, n as usize) };
+        Some(super::capture::Op::Scissors(rs.iter().map(|r| [r.left, r.top, r.right, r.bottom]).collect()))
+    });
     if !r.is_null() {
         let rs = std::slice::from_raw_parts(r, n as usize).to_vec();
         with_bindings(this, |b| b.scissors = rs);
@@ -739,7 +747,8 @@ struct ListState {
 
 /// A `Dispatch` or a dispatching `ExecuteIndirect` put off to the submit, with its arguments.
 pub(super) enum Deferred {
-    Dispatch(u32, u32, u32),
+    /// x, y, z and `DispatchX`'s flags (0 for `Dispatch`)
+    Dispatch(u32, u32, u32, u32),
     Indirect(usize, u32, usize, u64, usize, u64),
 }
 
@@ -2356,11 +2365,14 @@ unsafe fn try_gpu_wait(queue: *mut c_void, w: &PendingWait, list_writes: &[(u64,
     GpuWaitOutcome::Handled
 }
 
-unsafe fn wait_all_on(queue: *mut c_void, waits: &[PendingWait], list_writes: &[(u64, u64)]) {
+/// The waits of a list before it goes: on the GPU where they can be, else on the CPU. Whether one
+/// was waited for on the CPU.
+unsafe fn wait_all_on(queue: *mut c_void, waits: &[PendingWait], list_writes: &[(u64, u64)]) -> bool {
     static TIMEOUTS: AtomicU64 = AtomicU64::new(0);
     static RING_DUMPED: AtomicU64 = AtomicU64::new(0);
     let timeout = wait_timeout();
     let q_ty = queue_device_and_type(queue).map_or(-1, |(_, _, t)| t.0);
+    let mut on_cpu = false;
     for w in waits {
         if w.is_satisfied() {
             sync_trace(|| format!("q{} wait {:#x} >= {:#x}: memory holds it", queue_id(queue as usize), w.va, w.value));
@@ -2370,6 +2382,7 @@ unsafe fn wait_all_on(queue: *mut c_void, waits: &[PendingWait], list_writes: &[
             GpuWaitOutcome::Handled | GpuWaitOutcome::CycleSkip => continue,
             GpuWaitOutcome::FallbackCpu => {}
         }
+        on_cpu = true;
         sync_trace(|| format!("q{} wait {:#x} (op {}) {:#x}: on the CPU", queue_id(queue as usize), w.va, w.comparison, w.value));
         if !w.wait_until_satisfied(timeout) && once(&TIMEOUTS, 40) {
             let cell_diag = {
@@ -2404,6 +2417,7 @@ unsafe fn wait_all_on(queue: *mut c_void, waits: &[PendingWait], list_writes: &[
             }
         }
     }
+    on_cpu
 }
 
 /// Copy any GPU memory writes into sparse VRAM windows recorded by `lists` back into their
@@ -2446,6 +2460,22 @@ unsafe fn mapped_after_wait(queue: *mut c_void) {
     if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) {
         super::sparse::before_execute(q, &[], 0x1000);
     }
+}
+
+/// `XCL_SPLIT_SPARSE=cpu` (off unless set): after a split at waits that all went to the GPU (or
+/// held already), the sparse windows are not brought up to date again (`mapped_after_wait`): the
+/// lists before and after the split went out within the submit, as an unsplit submit's do. A
+/// retail title's world split many of its ~19 submits a frame at Wait64BitValueX waits bridged to
+/// the GPU, and each split took the sparse state's lock again.
+fn split_sparse_after_cpu_waits_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_SPLIT_SPARSE").is_ok_and(|v| v.trim().eq_ignore_ascii_case("cpu")))
+}
+
+/// Whether a split, whose waits were (`on_cpu`) or were not waited for on the CPU, brings the
+/// sparse windows up to date again (`only_after_cpu`: `XCL_SPLIT_SPARSE=cpu`).
+fn sparse_again_after_split(on_cpu: bool, only_after_cpu: bool) -> bool {
+    on_cpu || !only_after_cpu
 }
 
 /// Submit `lists` through `submit`, splitting the batch before any list whose `Wait32/64BitValueX`
@@ -2493,8 +2523,13 @@ pub(super) unsafe fn execute_with_waits_on(queue: *mut c_void, lists: &[*mut c_v
             sync_trace(|| format!("q{} submit lists {start}..{i}", queue_id(queue as usize)));
             submit(&lists[start..i]);
         }
-        wait_all_on(queue, waits, list_writes);
-        mapped_after_wait(queue);
+        let t = Instant::now();
+        let on_cpu = wait_all_on(queue, waits, list_writes);
+        let t_waited = Instant::now();
+        if sparse_again_after_split(on_cpu, split_sparse_after_cpu_waits_only()) {
+            mapped_after_wait(queue);
+        }
+        super::submit_cost::split(t_waited - t, t_waited.elapsed());
         start = i;
     }
     if start < lists.len() {
@@ -2516,7 +2551,12 @@ pub(super) unsafe fn execute_with_waits(lists: &[*mut c_void], submit: impl FnMu
 pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, src: u64, size: u64, _flags: u32) {
     static N: AtomicU64 = AtomicU64::new(0);
     const W: &str = "CopyMemoryToMemoryX";
-    if size == 0 || !size.is_multiple_of(4) {
+    let refused = size == 0 || !size.is_multiple_of(4);
+    let _c = super::capture::op(this, || {
+        use super::capture as c;
+        Some(c::Op::Copy { kind: "memory", dst: c::Loc::Address(dst), src: c::Loc::Address(src), at: [0; 3], bx: None, bytes: Some(size), refused })
+    });
+    if refused {
         return warn(&N, W, format_args!("size {size:#x} is not a non-zero multiple of 4"));
     }
     // In a GPU view: its tiles, asked for here, are filled from the CPU view before the list runs,
@@ -3138,11 +3178,13 @@ pub(super) unsafe fn record_deferred(wrapper: *mut c_void) {
             super::dred::mark_pipeline(seg, p, super::pso_async::peek(p));
         }
         match what {
-            Deferred::Dispatch(x, y, z) => super::bind::dispatch(seg, x, y, z),
+            Deferred::Dispatch(x, y, z, flags) => super::bind::dispatch_flags(seg, x, y, z, flags),
             Deferred::Indirect(sig, max, args, args_off, count_buf, count_off) => super::bind::execute_indirect(seg, sig, max, args, args_off, count_buf, count_off),
         }
         let built = super::pso_async::has_real(super::bind::bound_pso(seg));
         super::pso_async::note_put_off(if built { super::pso_async::PutOff::Recorded } else { super::pso_async::PutOff::Skipped });
+        super::bind::flush_two_pass(seg, super::bind::RunEnd::Segment);
+        super::gpu_times::before_close(seg);
         let ext = *(seg as *const usize);
         pc::<unsafe extern "system" fn(*mut c_void) -> i32>(seg, PC_CLOSE)(seg);
         real::preserve_vtable(seg, ext);
@@ -3209,6 +3251,7 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
         )
     };
 
+    super::bind::flush_two_pass(list, super::bind::RunEnd::Segment);
     if let Some(((h, i), qty)) = active_query {
         pc::<QueryFn>(list, PC_END_QUERY)(list, h, qty, i);
     }
@@ -3218,6 +3261,7 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
         }
     }
 
+    super::gpu_times::before_close(list);
     let ext = *(list as *const usize);
     let close_hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(list, PC_CLOSE)(list);
     real::preserve_vtable(list, ext);
@@ -3512,8 +3556,8 @@ pub(super) unsafe extern "system" fn set_depth_bounds_x(this: *mut c_void, min: 
 }
 
 /// command list #78 DispatchX(x, y, z, flags)
-pub(super) unsafe extern "system" fn dispatch_x(this: *mut c_void, x: u32, y: u32, z: u32, _flags: u32) {
-    super::bind::dispatch(this, x, y, z);
+pub(super) unsafe extern "system" fn dispatch_x(this: *mut c_void, x: u32, y: u32, z: u32, flags: u32) {
+    super::bind::dispatch_flags(this, x, y, z, flags);
 }
 
 /// command list #146 console compute/UAV barrier (used by `XboxBvhBuilder.dll` between BVH
@@ -3776,6 +3820,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     };
     let (sparse_writes, write64_signals, cpu_writes) = sparse_writes;
 
+    super::bind::flush_two_pass(this, super::bind::RunEnd::Segment);
     // End any active occlusion query before Close (PC forbids closing with an open query).
     if let Some(((h, i), qty)) = active_query {
         pc::<QueryFn>(this, PC_END_QUERY)(this, h, qty, i);
@@ -3786,6 +3831,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         }
     }
 
+    super::gpu_times::before_close(this);
     let ext = *(this as *const usize);
     let close_hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(this, PC_CLOSE)(this);
     real::preserve_vtable(this, ext);
@@ -3795,6 +3841,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     if let Some(wrapper) = super::title_list::wrapper_of(this) {
         record_deferred(wrapper);
     }
+    super::capture::kickoff(this, queue);
 
     let q_raw = queue as *mut c_void;
     super::title_textures::refresh(q_raw);
@@ -3809,6 +3856,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         if !prior.is_empty() {
             execute_with_waits_on(q_raw, prior, |chunk| {
                 exec(q_raw, chunk.len() as u32, chunk.as_ptr());
+                super::gpu_times::executed(q_raw, chunk);
                 copy_scratch_submitted(q_raw, chunk);
                 super::alloc_pool::executed(q_raw, chunk);
                 signal_write64_fences(q_raw, chunk);
@@ -3823,13 +3871,13 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         }
     }
 
-    if !waits.is_empty() {
-        wait_all_on(q_raw, &waits, &write64_signals);
+    if !waits.is_empty() && sparse_again_after_split(wait_all_on(q_raw, &waits, &write64_signals), split_sparse_after_cpu_waits_only()) {
         mapped_after_wait(q_raw);
     }
 
     let one = [this];
     exec(q_raw, 1, one.as_ptr());
+    super::gpu_times::executed(q_raw, &one);
     copy_scratch_submitted(q_raw, &one);
     super::alloc_pool::executed(q_raw, &one);
     signal_write64_pairs(q_raw, &write64_signals);
@@ -4424,6 +4472,10 @@ pub(super) unsafe fn ensure_view_heap(this: *mut c_void) {
 pub(super) unsafe extern "system" fn set_descriptor_heaps_x(this: *mut c_void, n: u32, heaps: *const usize) {
     const PC_SET_DESCRIPTOR_HEAPS: usize = 28;
     let f = pc::<unsafe extern "system" fn(*mut c_void, u32, *const usize)>(this, PC_SET_DESCRIPTOR_HEAPS);
+    let _c = super::capture::op(this, || {
+        let given = if heaps.is_null() { &[][..] } else { std::slice::from_raw_parts(heaps, n as usize) };
+        Some(super::capture::Op::Heaps(given.iter().map(|&h| super::console_heap::base(h).map_or((h, 0, false), |(s, b)| (h, b, s))).collect()))
+    });
     super::bind::heaps_changed(this);
     super::bind::set_heaps(this, if heaps.is_null() { &[] } else { std::slice::from_raw_parts(heaps, n as usize) });
     if heaps.is_null() || n == 0 {
@@ -4530,6 +4582,7 @@ pub(super) unsafe extern "system" fn ia_set_index_buffer_x(this: *mut c_void, vi
 /// command list #81 DrawIndexedX(index address, index format, index count, flags): one
 /// instance of `count` indices read from that address; the bound index buffer stays
 pub(super) unsafe extern "system" fn draw_indexed_x(this: *mut c_void, va: u64, format: DXGI_FORMAT, count: u32, _flags: u32) {
+    let _c = super::bind::capture_work(this, || super::capture::WorkKind::DrawIndexedX { va, format: format.0, indices: count }, true);
     static N: AtomicU64 = AtomicU64::new(0);
     let stride = match format {
         DXGI_FORMAT_R16_UINT => 2,
@@ -4580,7 +4633,11 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
     if let Some(w) = super::title_list::wrapper_of(this) {
         return super::title_list::reset(w, alloc, pso);
     }
-    reset_pc(this, alloc, pso)
+    let hr = reset_pc(this, alloc, pso);
+    if hr >= 0 {
+        super::capture::list_begin(this as usize, pso);
+    }
+    hr
 }
 
 /// Reset of the PC list `this` (allocator, initial pipeline): updates allocator/pipeline and
@@ -4656,6 +4713,7 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
     if barriers.is_null() || n == 0 {
         return;
     }
+    let capture = super::capture::op(this, || Some(super::capture::barrier(&(0..n as usize).map(|k| barriers.add(k).read_unaligned()).collect::<Vec<_>>())));
     let mut out: Vec<[u32; 8]> = Vec::with_capacity(n as usize + 1);
     // a UAV barrier for all resources is in `out` / a transition from or to UNORDERED_ACCESS
     let (mut any_uav, mut uav_transition) = (false, false);
@@ -4741,6 +4799,16 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
             out.iter().filter(|b| b[0] == 0).map(|b| ((b[2] as u64 | (b[3] as u64) << 32) as usize, b[4], D3D12_RESOURCE_STATES(b[6] as i32))).collect();
         super::title_textures::note_transitions(this as usize, &t);
     }
+    // (a superseded target the title moves is used again: `placements`)
+    for b in out.iter().filter(|b| b[0] == 0) {
+        super::placements::note_use((b[2] as u64 | (b[3] as u64) << 32) as usize);
+    }
+    capture.amend(|op| {
+        if let super::capture::Op::Barrier { sent, plane_copies: copies, .. } = op {
+            sent.clone_from(&out);
+            *copies = plane_copies.as_ref().map_or(0, |p| p.to_plane.len() + p.to_twin.len());
+        }
+    });
     if let Some(p) = &plane_copies {
         plane_copies_on(this, &p.to_plane, false);
     }
@@ -4833,6 +4901,10 @@ fn note_gpu_write(what: &str, va: usize, n: u64) {
 }
 
 pub(super) unsafe extern "system" fn copy_buffer_region_x(this: *mut c_void, dst: usize, dst_off: u64, src: usize, src_off: u64, n: u64) {
+    let _c = super::capture::op(this, || {
+        use super::capture as c;
+        Some(c::Op::Copy { kind: "buffer_region", dst: c::buffer(dst, dst_off), src: c::buffer(src, src_off), at: [0; 3], bx: None, bytes: Some(n), refused: false })
+    });
     if super::present::trace_frame() {
         if let Some(a) = real::title_address(dst) {
             note_gpu_write("CopyBufferRegion", a + dst_off as usize, n);
@@ -4868,9 +4940,18 @@ unsafe fn trace_watched_copy(what: &str, dst: usize, src: usize) {
 
 /// CopyTextureRegion(dst, x, y, z, src, box) (PC #16; DMA list #12)
 pub(super) unsafe extern "system" fn copy_texture_region_x(this: *mut c_void, dst: *const D3D12_TEXTURE_COPY_LOCATION, x: u32, y: u32, z: u32, src: *const D3D12_TEXTURE_COPY_LOCATION, bx: *const D3D12_BOX) {
+    let _c = super::capture::op(this, || {
+        use super::capture as c;
+        let b = bx.as_ref().map(|b| [b.left, b.top, b.front, b.right, b.bottom, b.back]);
+        Some(c::Op::Copy { kind: "texture_region", dst: c::location(dst), src: c::location(src), at: [x, y, z], bx: b, bytes: None, refused: dst.is_null() || src.is_null() })
+    });
     if let Some(d) = dst.as_ref() {
         let r: usize = transmute_copy(&d.pResource);
         super::present::note_use(r, super::present::USE_COPY);
+        super::placements::note_use(r);
+        if let Some(s) = src.as_ref() {
+            super::placements::note_use(transmute_copy(&s.pResource));
+        }
         super::title_textures::note_gpu_write(this as usize, r);
         super::lut3d::wrote(r, true, || {
             let from = src.as_ref().map_or("nothing".to_string(), |sl| {
@@ -4972,6 +5053,7 @@ const PC_CLEAR_DEPTH_STENCIL_VIEW: usize = 47;
 
 /// command list #51 ClearDepthStencilView(dsv, flags, depth, stencil, rects, rect list) (PC #47)
 pub(super) unsafe extern "system" fn clear_depth_stencil_x(this: *mut c_void, dsv: usize, flags: u32, depth: f32, stencil: u8, n: u32, rects: *const windows::Win32::Foundation::RECT) {
+    let _c = super::capture::op(this, || Some(super::capture::clear("dsv", dsv as u64, None, [depth.to_bits(), stencil as u32, 0, 0], flags, n)));
     if super::present::trace_frame() {
         static N: AtomicU64 = AtomicU64::new(0);
         static W: AtomicU64 = AtomicU64::new(0);
@@ -5030,6 +5112,11 @@ pub(super) fn uav_clear_resource(res: usize, gpu: Option<super::console_heap::Sl
 /// console heap slots (heap #9 / #10), not PC descriptors. A depth buffer whose UAV views are
 /// views of its twin (`depth_uav`) is cleared through the twin the GPU slot's view names.
 unsafe fn clear_uav(this: *mut c_void, slot: usize, gpu: u64, cpu: u64, res: usize, values: *const c_void, n: u32, rects: *const windows::Win32::Foundation::RECT) {
+    let capture = super::capture::op(this, || {
+        let v = values.cast::<[u32; 4]>().as_ref().copied().unwrap_or_default();
+        Some(super::capture::clear(if slot == PC_CLEAR_UAV_UINT { "uav_uint" } else { "uav_float" }, gpu, Some(res), v, 0, n))
+    });
+    let refused = || capture.amend(|op| if let super::capture::Op::Clear { refused, .. } = op { *refused = true });
     let gpu_slot = super::console_heap::slot(gpu);
     let (gpu, cpu) = match uav_clear_handles(gpu_slot, super::console_heap::slot(cpu)) {
         UavClearHandles::Console { gpu, cpu } => (gpu, cpu),
@@ -5039,10 +5126,10 @@ unsafe fn clear_uav(this: *mut c_void, slot: usize, gpu: u64, cpu: u64, res: usi
             if once(&N, 1) {
                 crate::xlog_warn!("D3D12.X: ClearUnorderedAccessView with GPU handle {gpu:#x} / CPU handle {cpu:#x}: not both a console slot with a shader-visible UAV – not done");
             }
-            return;
+            return refused();
         }
     };
-    let Some(res) = uav_clear_resource(res, gpu_slot) else { return };
+    let Some(res) = uav_clear_resource(res, gpu_slot) else { return refused() };
     pc::<unsafe extern "system" fn(*mut c_void, u64, u64, usize, *const c_void, u32, *const windows::Win32::Foundation::RECT)>(this, slot)(this, gpu, cpu, res, values, n, rects)
 }
 
@@ -5084,6 +5171,10 @@ unsafe fn trace_resolve(what: &str, dst: usize, src: usize, format: i32, extra: 
 
 /// command list #19 ResolveSubresource(dst, dst sub, src, src sub, format) (PC #19)
 pub(super) unsafe extern "system" fn resolve_subresource_x(this: *mut c_void, dst: usize, dst_sub: u32, src: usize, src_sub: u32, format: i32) {
+    let _c = super::capture::op(this, || {
+        use super::capture as c;
+        Some(c::Op::Resolve { dst: c::describe(dst), dst_sub, src: c::describe(src), src_sub, format, region: None })
+    });
     super::present::note_use(dst, super::present::USE_COPY);
     super::title_textures::note_gpu_write(this as usize, dst);
     trace_resolve("ResolveSubresource", dst, src, format, "");
@@ -5094,6 +5185,11 @@ pub(super) unsafe extern "system" fn resolve_subresource_x(this: *mut c_void, ds
 /// mode) (PC #64)
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe extern "system" fn resolve_subresource_region_x(this: *mut c_void, dst: usize, dst_sub: u32, x: u32, y: u32, src: usize, src_sub: u32, rect: *const windows::Win32::Foundation::RECT, format: i32, mode: i32) {
+    let _c = super::capture::op(this, || {
+        use super::capture as c;
+        let r = rect.as_ref().map(|r| [r.left, r.top, r.right, r.bottom]);
+        Some(c::Op::Resolve { dst: c::describe(dst), dst_sub, src: c::describe(src), src_sub, format, region: Some((x, y, r, mode)) })
+    });
     super::present::note_use(dst, super::present::USE_COPY);
     super::title_textures::note_gpu_write(this as usize, dst);
     if super::present::trace_frame() {
@@ -5105,7 +5201,13 @@ pub(super) unsafe extern "system" fn resolve_subresource_region_x(this: *mut c_v
 /// CopyResource(dst, src) (PC #17; DMA list #13): buffers placed below their console address
 /// are copied as their own bytes (the PC resources also hold what lies before them)
 pub(super) unsafe extern "system" fn copy_resource_x(this: *mut c_void, dst: usize, src: usize) {
+    let _c = super::capture::op(this, || {
+        use super::capture as c;
+        Some(c::Op::Copy { kind: "resource", dst: c::buffer(dst, 0), src: c::buffer(src, 0), at: [0; 3], bx: None, bytes: None, refused: false })
+    });
     super::present::note_use(dst, super::present::USE_COPY);
+    super::placements::note_use(dst);
+    super::placements::note_use(src);
     super::title_textures::note_gpu_write(this as usize, dst);
     super::lut3d::wrote(dst, true, || format!("CopyResource from {src:#x}"));
     if super::present::trace_frame() {
@@ -5551,6 +5653,35 @@ mod tests {
             cell64.store(0x0000_0002_0000_0001, Ordering::Release);
             assert!(w64.is_satisfied());
         }
+    }
+
+    /// `wait_all_on` says whether it waited on the CPU: not for waits that held already, yes for
+    /// one it had to wait for there (no queue: no GPU wait); the split's sparse update follows it
+    /// only with `XCL_SPLIT_SPARSE=cpu`.
+    #[test]
+    fn a_split_brings_the_sparse_windows_up_to_date_after_a_cpu_wait() {
+        let cell = Arc::new(AtomicU64::new(7));
+        let w = |value: u64| PendingWait {
+            va: Arc::as_ptr(&cell) as u64,
+            width: 8,
+            comparison: D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32,
+            value,
+            mask: u64::MAX,
+            after_write64: false,
+        };
+        unsafe {
+            assert!(!wait_all_on(std::ptr::null_mut(), &[w(5), w(7)], &[]), "held already: no CPU wait");
+            let writer = cell.clone();
+            let t = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(5));
+                writer.store(9, Ordering::Release);
+            });
+            assert!(wait_all_on(std::ptr::null_mut(), &[w(5), w(9)], &[]), "waited on the CPU");
+            t.join().unwrap();
+        }
+        assert!(sparse_again_after_split(true, true));
+        assert!(!sparse_again_after_split(false, true));
+        assert!(sparse_again_after_split(false, false) && sparse_again_after_split(true, false), "as before without the switch");
     }
 
     #[test]

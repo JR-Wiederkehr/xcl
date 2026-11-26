@@ -11,6 +11,8 @@
 
 mod alloc_pool;
 pub mod bind;
+mod bvh_want;
+mod capture;
 pub mod console_heap;
 pub mod console_list;
 pub mod clamp;
@@ -22,7 +24,9 @@ pub mod dred;
 mod fence_x;
 pub mod file_reads;
 pub mod frame;
+pub(crate) mod gfx_records;
 mod gpu_profile;
+mod gpu_times;
 pub mod guard;
 mod indirect_guard;
 mod late_release;
@@ -31,6 +35,7 @@ pub mod list_x;
 mod look_stats;
 mod lut3d;
 pub mod null;
+mod placements;
 pub mod present;
 pub mod pso_async;
 pub mod real;

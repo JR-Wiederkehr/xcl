@@ -1722,6 +1722,7 @@ unsafe fn refresh_parts(queue: *mut c_void, look: bool) {
     if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) {
         DIRTY_BUF.with(|dcell| {
             let dirty = dcell.borrow();
+            super::bvh_want::written(&dirty, page as usize);
             super::sparse::before_execute(q, &dirty, page as usize);
             super::vram::before_execute(q);
         });

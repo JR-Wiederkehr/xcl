@@ -80,8 +80,21 @@ pub fn fspx(blob: &[u8]) -> Option<Fspx<'_>> {
 /// Memory windows of the title's unified memory (1 without it), with `HEAP_WINDOWS` when
 /// shaders take them from the descriptor heap (`heap_windows`).
 pub fn mem_windows() -> u32 {
+    let title = TITLE_WINDOWS.load(std::sync::atomic::Ordering::Relaxed);
+    if title != 0 {
+        return windows_for(title & !super::HEAP_WINDOWS, title & super::HEAP_WINDOWS != 0 && !SWITCH_FORM.with(|s| s.get()));
+    }
     let n = crate::gpu::uma::get().map_or(1, |u| u.shader_windows() as u32);
     windows_for(n, heap_windows() && !SWITCH_FORM.with(|s| s.get()))
+}
+
+/// The title's windows (`mem_windows` with `HEAP_WINDOWS`) for a process without its memory: a
+/// shader preparation worker builds the title's pipelines with them (0: none given).
+static TITLE_WINDOWS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// `mem_windows` is `windows` from here on (a preparation worker: `uma::leave_out`).
+pub fn set_title_windows(windows: u32) {
+    TITLE_WINDOWS.store(windows, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// `n` windows as shaders take them: from the descriptor heap (`heap`), or in the switch form
@@ -280,6 +293,8 @@ mod translated {
             let id = if Backend::current() != Backend::Hlsl {
                 identity_for(&id.to_string(), &format!("dispatch-split-{}", crate::gpu::dxil::kernel::dispatch_piece_limit()))
             } else { id };
+            // `XCL_X_LDS_ORDER=0`: the split wave64 form without its LDS order, in both translators
+            let id = if crate::gpu::recomp::emit::lds_order_wanted() { id } else { identity_for(&id.to_string(), "xcl-x-lds-order-0") };
             // `XCL_PER_LANE=1` (direct compute only): its entries under their own identity
             if Backend::current() != Backend::Hlsl && crate::gpu::recomp::lower_dxil::enabled() {
                 identity_for(&id.to_string(), concat!("xcl-per-lane-", env!("XCL_PER_LANE_SOURCE_ID")))
@@ -989,13 +1004,19 @@ fn cache_allowed(stage: Stage, present: impl Fn(&str) -> bool) -> bool {
 /// s0…s3 are the driver's, so what is above 4 is the root arguments its compiler passed in
 /// registers. None: not a console compute shader.
 pub fn compute_user_sgprs(blob: &[u8]) -> Option<u32> {
+    compute_interface(blob).map(|cs| cs.user_sgprs)
+}
+
+/// The dispatch ABI of a console compute program: its user SGPRs and the console's group shape
+/// (`numthreads`). None: not a console compute program.
+pub fn compute_interface(blob: &[u8]) -> Option<super::CsInterface> {
     if let Some(f) = fspx(blob) {
-        return Some(super::CsInterface::from_rsrc2(f.threads, f.rsrc2).user_sgprs);
+        return Some(super::CsInterface::from_rsrc2(f.threads, f.rsrc2));
     }
     let sh = xbox::parse(blob)?;
     let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 6))?;
     match interface(blob, &sh, f)? {
-        Mode::Compute(cs) => Some(cs.user_sgprs),
+        Mode::Compute(cs) => Some(cs),
         _ => None,
     }
 }

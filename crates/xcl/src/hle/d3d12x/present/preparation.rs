@@ -72,11 +72,13 @@ pub(crate) fn before_guest(boot: &Boot) -> Result<(), String> {
             if said.elapsed() >= Duration::from_secs(5) {
                 said = Instant::now();
                 let workers = progress.workers.load(Ordering::Relaxed);
+                let graphics = progress.graphics.load(Ordering::Relaxed);
                 crate::xlog_info!(
-                    "Shader preparation: {} of {} records {} after {} s",
+                    "Shader preparation: {} of {} {} {} after {} s",
                     progress.done.load(Ordering::Relaxed),
                     progress.total.load(Ordering::Relaxed),
-                    if workers != 0 { format!("checked for pipelines by {workers} workers") } else { "translated".to_string() },
+                    if graphics { "graphics pipelines" } else { "records" },
+                    if graphics { format!("built by {workers} workers") } else if workers != 0 { format!("checked for pipelines by {workers} workers") } else { "translated".to_string() },
                     began.elapsed().as_secs()
                 );
             }
@@ -174,7 +176,8 @@ unsafe fn paint(hwnd: HWND, s: &mut Screen) {
         let pct = percent(done, total, s.ready);
         let (quiet, last) = s.clock.sample(done, s.start.elapsed());
         let workers = s.progress.workers.load(Ordering::Relaxed);
-        let heading = if s.progress.cancel.load(Ordering::Relaxed) { "Cancelling preparation" } else if workers != 0 { "Building pipelines" } else { "Preparing shaders" };
+        let graphics = workers != 0 && s.progress.graphics.load(Ordering::Relaxed);
+        let heading = if s.progress.cancel.load(Ordering::Relaxed) { "Cancelling preparation" } else if graphics { "Building graphics pipelines" } else if workers != 0 { "Building pipelines" } else { "Preparing shaders" };
         let mut title = row(0,48);
         title.right -= scale(84);
         text(dc, title, heading, scale(31), 600, 0xf7f5f1, DT_LEFT);
@@ -183,6 +186,7 @@ unsafe fn paint(hwnd: HWND, s: &mut Screen) {
         fill(dc, bar, 0x4b4038);
         fill(dc, RECT {right: x+(width as i64 * pct as i64/100) as i32, ..bar}, 0xbdb458);
         let count = if total == 0 { "Reading shader records…".into() }
+            else if graphics { format!("{done} of {total} graphics pipelines built by {workers} worker processes") }
             else if workers != 0 { format!("{done} of {total} records checked by {workers} worker processes") }
             else { format!("{done} of {total} records processed") };
         text(dc, row(87,112), &count, scale(17), 400, 0xe1dcd7, DT_LEFT);

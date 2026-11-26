@@ -120,6 +120,7 @@ unsafe fn create_list(this: *mut c_void, node: u32, ty: u32, alloc: usize, pso: 
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() && !super::console_list::enabled() {
         super::bind::reset(*ppv, alloc, pso);
         *ppv = super::title_list::wrap(*ppv);
+        super::capture::list_begin(*ppv as usize, pso);
     }
     hr
 }
@@ -1322,6 +1323,9 @@ pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_voi
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
         super::bind::note_signature_dispatches(*ppv as usize, list.iter().any(|a| a[0] == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0 as u32));
         super::indirect_guard::note_signature(*ppv as usize, &list.iter().map(|a| a[0] as i32).collect::<Vec<_>>());
+        if super::capture::enabled() {
+            super::capture::note_signature(*ppv as usize, u32::from_le_bytes(pc[0..4].try_into().unwrap()), &list.iter().map(|a| a[0] as i32).collect::<Vec<_>>());
+        }
     }
     hr
 }

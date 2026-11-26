@@ -12,7 +12,7 @@
 //! Lane reads the ISA keeps inside a 32-lane half (DPP, `ds_swizzle`,
 //! permlane) need no exchange.
 
-use super::lower::{Lw, Partner};
+use super::lower::{Lw, Partner, VAR_XLW};
 use super::module::{BinOp, Pred, RmwOp, Value};
 use super::ops::barrier;
 
@@ -183,6 +183,10 @@ impl Lw {
 
     /// This lane's bit of the mask (lo, hi), cached per block.
     pub fn lanebit(&mut self, lo: Value, hi: Value) -> Value {
+        // the launch EXEC once the lanes outside it have left: set in every lane still here
+        if self.live_exec == Some((lo, hi)) {
+            return self.b(true);
+        }
         let key = (self.cur(), lo, hi);
         if let Some(&v) = self.exec_cache.get(&key) {
             return v;
@@ -218,6 +222,67 @@ impl Lw {
     /// Group barrier for the split form's exchanges.
     fn meet(&mut self) {
         self.s.barrier(barrier::GROUP_SYNC);
+        self.lds_met();
+    }
+
+    /// The halves met (an exchange, a group barrier): each has made its LDS writes so far.
+    pub fn lds_met(&mut self) {
+        if self.writes_lds {
+            let z = self.c(0);
+            self.wr(VAR_XLW, z);
+        }
+    }
+
+    /// Split form, before the LDS access `name` (lower case): the console runs a wave's LDS
+    /// accesses in order for all 64 lanes, the halves do not. A read first meets the other half
+    /// when either may have written LDS since they last met, a write when either may have read
+    /// it (`VAR_XLW`'s bits: the same in both halves, which run the same instructions; every
+    /// meet clears them; `recomp::emit::x64_lds_order`, the HLSL `xcl_x_lw`). Not in the
+    /// per-lane form's bridge (`local_masks`), whose blocks one half may enter alone.
+    pub fn lds_in_order(&mut self, name: &str) -> super::lower::LResult<()> {
+        if !self.writes_lds || self.local_masks || matches!(self.partner, Partner::Missing) {
+            return Ok(());
+        }
+        let (wait, set) = crate::gpu::recomp::emit::x64_lds_order(name);
+        if wait != 0 {
+            let w = self.rd(VAR_XLW);
+            // known while lowering in straight-line code: no test
+            match self.s.m.const_u64(w) {
+                Some(v) if v as u32 & wait == 0 => {}
+                Some(_) => self.meet_only(),
+                None => {
+                    let b = self.andc(w, wait);
+                    let c = self.nz(b);
+                    self.guarded(c, &mut |lw| {
+                        lw.meet_only();
+                        Ok(())
+                    })?;
+                }
+            }
+        }
+        if set != 0 {
+            let w = self.rd(VAR_XLW);
+            let v = match self.s.m.const_u64(w) {
+                Some(v) => self.c(v as u32 | set),
+                None => {
+                    let k = self.c(set);
+                    self.or(w, k)
+                }
+            };
+            self.wr(VAR_XLW, v);
+        }
+        Ok(())
+    }
+
+    /// The halves meet with nothing to exchange.
+    fn meet_only(&mut self) {
+        match self.partner {
+            Partner::Present => self.meet(),
+            Partner::Spin => {
+                let _ = self.spin_exchange(&[], &[]);
+            }
+            _ => {}
+        }
     }
 
     /// Split form: this half gives `vals` (uniform in the half), gets the other half's.
@@ -279,6 +344,8 @@ impl Lw {
         let k = self.rd(VAR_XK);
         let k1 = self.addc(k, 1);
         self.wr(VAR_XK, k1);
+        // (whether or not the partner is there: one that is not has nothing to wait for)
+        self.lds_met();
         let (cw, h, xn) = (self.cw, self.half, self.xn);
         let par = self.andc(k, 1);
         let at = |lw: &mut Lw, half: Value| -> Value {

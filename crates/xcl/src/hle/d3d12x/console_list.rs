@@ -869,6 +869,9 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                             b.chunks_exact(4).filter(|c| c[0] as u32 == 0).map(|c| (c[1] as usize, c[2] as u32, D3D12_RESOURCE_STATES(c[3] as u32 as i32))).collect();
                         super::title_textures::note_transitions(st.pc, &t);
                     }
+                    for c in b.chunks_exact(4).filter(|c| c[0] as u32 == 0) {
+                        super::placements::note_use(c[1] as usize);
+                    }
                     list.ResourceBarrier(std::slice::from_raw_parts(b.as_ptr() as *const D3D12_RESOURCE_BARRIER, m));
                 }
                 out.barriers += n as u32;

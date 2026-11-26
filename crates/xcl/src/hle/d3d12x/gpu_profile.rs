@@ -97,7 +97,7 @@ struct Total {
 
 /// What a pair of readback words holds.
 #[derive(Debug, PartialEq)]
-enum Stamps {
+pub(super) enum Stamps {
     /// not both written yet
     Pending,
     /// the end before the begin: the GPU wrote an earlier op's pair over the slot
@@ -105,7 +105,7 @@ enum Stamps {
     Span(u64),
 }
 
-fn stamps(begin: u64, end: u64) -> Stamps {
+pub(super) fn stamps(begin: u64, end: u64) -> Stamps {
     match (begin, end) {
         (0, _) | (_, 0) => Stamps::Pending,
         (b, e) if e < b => Stamps::Bad,
@@ -148,7 +148,7 @@ static SHAPES: Mutex<Option<HashMap<u64, Shape>>> = Mutex::new(None);
 /// A translated compute pipeline of console shader `blob` (hash `hash`, `dxil` bytes of DXIL)
 /// was made, on a device that runs wave64 programs split (`split_device`).
 pub(super) fn note_compute(hash: u64, blob: &[u8], dxil: usize, split_device: bool) {
-    if !on() {
+    if !on() && !super::gpu_times::enabled() {
         return;
     }
     let mut g = SHAPES.lock().unwrap();
@@ -159,6 +159,12 @@ pub(super) fn note_compute(hash: u64, blob: &[u8], dxil: usize, split_device: bo
     if let Some((threads, wave64, code)) = crate::gpu::recomp::pso::compute_shape(blob) {
         m.insert(hash, Shape { threads, wave64, split: wave64 && split_device, code, dxil });
     }
+}
+
+/// The wave size console compute program `hash` runs with (None: not noted).
+pub(super) fn wave_of(hash: u64) -> Option<&'static str> {
+    let s = *SHAPES.lock().unwrap().as_ref()?.get(&hash)?;
+    Some(if s.split { "wave64 split in halves" } else if s.wave64 { "wave64" } else { "wave32" })
 }
 
 /// ticks a second of the title queues' timestamps (0: no queue seen yet)
@@ -313,7 +319,7 @@ unsafe fn mark_done(list: *mut c_void, va: u64) {
 }
 
 /// The PC method in `slot` of `obj` (an adopted object's own, not XCL's console-layout entry).
-unsafe fn pc_fn(obj: *mut c_void, slot: usize) -> usize {
+pub(super) unsafe fn pc_fn(obj: *mut c_void, slot: usize) -> usize {
     if real::is_adopted(obj) {
         real::orig_fn(obj, slot)
     } else {
@@ -338,6 +344,7 @@ pub(super) struct Pair {
 pub(super) unsafe fn begin(list: *mut c_void, pso: usize, kind: Kind, size: [u32; 3]) -> Option<Pair> {
     // (every draw and dispatch with a translated pipeline comes by here: the ring of the last ones)
     super::watch::note(pso, kind as u8 + 1, size);
+    super::gpu_times::before_op(list, pso, kind, size);
     if !on() || list.is_null() {
         return None;
     }
@@ -390,6 +397,7 @@ pub(super) fn note_counts(pair: &Option<Pair>, slot: u32) {
 
 /// After the PC call of the op `begin` gave `pair` for.
 pub(super) unsafe fn end(list: *mut c_void, pair: Option<Pair>) {
+    super::gpu_times::after(list);
     let Some(p) = pair else { return };
     (p.end_query)(list, p.heap, D3D12_QUERY_TYPE_TIMESTAMP, 2 * p.k + 1);
     mark_done(list, p.marks_va + 8 * p.k as u64 + 4);

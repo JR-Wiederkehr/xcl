@@ -137,6 +137,7 @@ pub(super) fn forget(resource: usize) {
         if let Some(id) = ARENA_OF.lock().unwrap().as_mut().and_then(|m| m.remove(&resource)) {
             ARENAS.lock().unwrap().release(id, std::time::Instant::now());
         }
+        super::placements::released(resource);
     }
 }
 
@@ -1045,12 +1046,29 @@ unsafe fn place_on_pages(
         return None;
     }
     PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(raw as usize);
+    let (first, own) = owned_pages(va, console_bytes, total as usize).unwrap_or((va, 0));
+    let kind = if gpu_owned(desc.Flags.0 as u32) { super::placements::Kind::Target } else { super::placements::Kind::Sampled };
+    // (the older targets it supersedes leave the shared pages once the work before is done)
+    for r in super::placements::placed(raw as usize, va, (first, first + own * PAGE), super::placements::Backing::Pages(dev_key), kind, desc) {
+        super::late_release::hold_unmap(r);
+    }
     Some(hr)
 }
 
 /// Unmap a placed texture superseded by a placement with a different address range, returning its
 /// unshared tiles (`extra_pages` and unshared tail pages) to the cooling pool immediately.
 pub(super) unsafe fn unmap_superseded(res: &ID3D12Resource) {
+    unmap_placed(res, true);
+}
+
+/// `unmap_superseded` for a target superseded by a newer placement over other pages of it
+/// (`placements`): its pages no other texture uses stay for `IDLE` with what they hold, as a
+/// released target's do – the title may use it again, and it then gets them back.
+pub(super) unsafe fn unmap_superseded_target(res: &ID3D12Resource) {
+    unmap_placed(res, false);
+}
+
+unsafe fn unmap_placed(res: &ID3D12Resource, immediate_cool: bool) {
     let key = res.as_raw() as usize;
     let mut g = PAGES.lock().unwrap();
     let now = std::time::Instant::now();
@@ -1068,7 +1086,7 @@ pub(super) unsafe fn unmap_superseded(res: &ID3D12Resource) {
             l.groups.iter_mut().for_each(|g| g.3 = false);
         }
         pages.unmap(res, total);
-        pages.release_tiles(used, used_extra, now, true);
+        pages.release_tiles(used, used_extra, now, immediate_cool);
         return;
     }
 }
@@ -1329,6 +1347,12 @@ pub unsafe fn place_pages(
     }
     // (one slice: the tiles of an array's packed levels are not asked about here)
     let lazy = level_pages() && desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.DepthOrArraySize == 1 && desc.SampleDesc.Count == 1 && desc.Flags == D3D12_RESOURCE_FLAG_NONE;
+    // (as `place`: without a size every PC tile went on the title's pages from `va` on)
+    let console_bytes = console_bytes.or_else(|| {
+        let least = least_texture_bytes(desc);
+        note_unknown_size(desc, least);
+        least
+    });
     place_on_pages(dev, this, va, desc, state, clear, console_bytes, false, lazy, riid, ppv)
 }
 
@@ -1409,14 +1433,43 @@ fn console_has_packed_3d_mips(desc: &D3D12_RESOURCE_DESC) -> bool {
         .unwrap_or(false)
 }
 
-/// The least a 3D texture of `desc` takes on the console – the texels of its first level, one
-/// after the other – for a 3D texture whose size there is not known: the pages it has to itself
-/// at its address. None: not a 3D texture. The PC's tiles past those pages are its own
-/// (`owned_pages`), not the pages of what the title placed behind it.
-fn least_volume_bytes(desc: &D3D12_RESOURCE_DESC) -> Option<u64> {
-    (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D)
-        .then(|| desc.Width * desc.Height as u64 * desc.DepthOrArraySize as u64 * super::targets::texel_bytes(desc.Format) as u64)
-        .filter(|&b| b != 0)
+/// The least a texture of `desc` takes on the console – the texels of its first level, one
+/// after the other (a block-compressed format's by its blocks, a multisampled one's once) – for
+/// a texture whose size there is not known: the pages it has to itself at its address. The PC's
+/// tiles past those pages are its own (`owned_pages`), not the pages of what the title placed
+/// behind it. None: a buffer, or a 1D texture.
+fn least_texture_bytes(desc: &D3D12_RESOURCE_DESC) -> Option<u64> {
+    if desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+        return None;
+    }
+    let (w, h, d) = (desc.Width, desc.Height as u64, desc.DepthOrArraySize as u64);
+    let bytes = match desc.Format.0 {
+        // BC1 and BC4: 8 bytes a 4x4 block; BC2, BC3, BC5, BC6H and BC7: 16
+        f @ (70..=84 | 94..=99) => w.div_ceil(4) * h.div_ceil(4) * if matches!(f, 70..=72 | 79..=81) { 8 } else { 16 } * d,
+        _ => w * h * d * super::targets::texel_bytes(desc.Format) as u64,
+    };
+    Some(bytes).filter(|&b| b != 0)
+}
+
+/// A texture placed without a known console size, once for each kind: what `least_texture_bytes`
+/// stands in for.
+fn note_unknown_size(desc: &D3D12_RESOURCE_DESC, least: Option<u64>) {
+    static SEEN: Mutex<Option<HashSet<(i32, i32, i32, u32)>>> = Mutex::new(None);
+    let kind = (desc.Dimension.0, desc.Format.0, desc.Flags.0, desc.SampleDesc.Count);
+    if SEEN.lock().unwrap().get_or_insert_with(HashSet::new).insert(kind) {
+        crate::xlog_info!(
+            "D3D12.X: a texture's size on the console is not known (dimension {}, {}x{}x{}, {} mips, format {}, flags {:#x}, {} samples): it keeps {} of the title's pages to itself",
+            desc.Dimension.0,
+            desc.Width,
+            desc.Height,
+            desc.DepthOrArraySize,
+            desc.MipLevels,
+            desc.Format.0,
+            desc.Flags.0,
+            desc.SampleDesc.Count,
+            least.map_or("none".to_string(), |b| format!("{} KiB", b >> 10))
+        );
+    }
 }
 
 /// A GPU-owned texture of the title at `va` (`desc`: the PC description, `console_bytes` its
@@ -1432,7 +1485,11 @@ pub unsafe fn place(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, st
     // (a 3D render target's size on the console is not modelled: without one, every PC tile of
     // it went on the title's pages from `va` on – more of them than the console's texture takes,
     // so the last ones were the first pages of the title's next texture)
-    let console_bytes = console_bytes.or_else(|| least_volume_bytes(desc));
+    let console_bytes = console_bytes.or_else(|| {
+        let least = least_texture_bytes(desc);
+        note_unknown_size(desc, least);
+        least
+    });
     if std::env::var_os("XCL_VRAM_ARENAS").is_none() {
         if let Some(hr) = place_on_pages(dev, this, va, desc, state, clear, console_bytes, true, false, riid, ppv) {
             return Some(hr);
@@ -1457,6 +1514,8 @@ pub unsafe fn place(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, st
     }
     PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
     ARENA_OF.lock().unwrap().get_or_insert_with(std::collections::HashMap::new).insert(*ppv as usize, id);
+    // (an arena has no tiles to unmap: nothing is superseded)
+    drop(super::placements::placed(*ppv as usize, va, (va, va + info.SizeInBytes as usize), super::placements::Backing::Arena(id), super::placements::Kind::Target, desc));
     Some(hr)
 }
 
@@ -1957,7 +2016,7 @@ mod tests {
             Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
             ..Default::default()
         };
-        let bytes = least_volume_bytes(&desc);
+        let bytes = least_texture_bytes(&desc);
         assert_eq!(bytes, Some(33 * 33 * 33 * 8));
         let (a, b, pc_tiles) = (0x12_31f1_0000usize, 0x12_31f9_0000usize, 18);
         let (first_a, n_a) = owned_pages(a, bytes, pc_tiles).unwrap();
@@ -1967,8 +2026,12 @@ mod tests {
         // as it was: every tile on the title's pages
         let (_, all) = owned_pages(a, None, pc_tiles).unwrap();
         assert!(a + all * PAGE > b);
-        // a 2D texture's size is the caller's to know
-        assert_eq!(least_volume_bytes(&D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, ..desc }), None);
+        // a 2D target of unknown size the same way; a block-compressed texture by its blocks
+        let d2 = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 2560, Height: 1440, DepthOrArraySize: 1, ..desc };
+        assert_eq!(least_texture_bytes(&d2), Some(2560 * 1440 * 8));
+        let bc1 = D3D12_RESOURCE_DESC { Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_BC1_UNORM, Width: 1024, Height: 1024, ..d2 };
+        assert_eq!(least_texture_bytes(&bc1), Some(256 * 256 * 8));
+        assert_eq!(least_texture_bytes(&D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, ..desc }), None);
     }
 
     /// Reserved only with TILED support, and for MSAA a tiled sample count (#940: the driver

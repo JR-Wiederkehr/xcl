@@ -2138,6 +2138,7 @@ impl Lw {
         if f("GDS") != 0 {
             return err(d, "GDS");
         }
+        self.lds_in_order(name)?;
         let act = self.act();
         if matches!(name, "ds_write_addtid_b32" | "ds_read_addtid_b32") {
             let m0 = self.sreg(124);

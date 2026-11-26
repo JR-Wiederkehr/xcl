@@ -221,6 +221,14 @@ pub const FOLD_X: u32 = 65_535;
 /// address a title can have (user space ends at 0x7FFF_FFFF_FFFF), so a load from the data is
 /// told from a load of the title's memory at the same low dword (descriptor tables in window 0).
 pub const CODE_ADDRESS_HI: u32 = 0xC0DE;
+/// io slots (trap-temp range, after `IO_GROUP_LIMIT`) of a `DispatchX` with thread dimensions
+/// (flag 0x20): the thread count of each axis when it is not a whole number of groups (0: the
+/// last group is whole), so the program can leave the lanes past it out of EXEC. Written by
+/// D3D12.X; every compute prologue reads the three at once (one 12-byte load: they must stay
+/// consecutive) and leaves a lane out of its EXEC when its thread along an axis (the console's
+/// group, unfolded, times the group size plus its thread in the group) is at or past the count.
+pub const IO_THREAD_LIMIT: [usize; 3] = [115, 116, 117];
+const _: () = assert!(IO_THREAD_LIMIT[1] == IO_THREAD_LIMIT[0] + 1 && IO_THREAD_LIMIT[2] == IO_THREAD_LIMIT[0] + 2);
 
 impl GsInterface {
     /// bytes of one ES vertex in LDS (ESGS item: 16 per ES output register)
@@ -1511,6 +1519,13 @@ pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>, foll
                         let v = scalar_constant(d, c).unwrap() as i32 as i64;
                         vec![(r, v as u32), (r + 1, (v >> 32) as u32)]
                     }
+                    // a 32-bit literal, zero-extended: `s_mov_b64 s[18:19], 0x18500000`
+                    (Some(r), Some(255)) => d.literal.map(|v| vec![(r, v), (r + 1, 0)]).unwrap_or_default(),
+                    _ => Vec::new(),
+                },
+                // a run of set bits: `s_bfm_b32 s17, 12, 12` is 0x00fff000
+                "S_BFM_B32" => match (f("SDST"), f("SSRC0").and_then(|c| scalar_constant(d, c)), f("SSRC1").and_then(|c| scalar_constant(d, c))) {
+                    (Some(r), Some(a), Some(b)) => vec![(r, ((1u32 << (a & 31)) - 1) << (b & 31))],
                     _ => Vec::new(),
                 },
                 _ => Vec::new(),
@@ -1668,6 +1683,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     let mut em = emit::Em::new(opt.clone());
     em.coherent_mem = matches!(opt.mode, Mode::Compute(_)) && needs_coherent_mem(&insts);
     em.configure_round_modes(&insts, branches == 0);
+    em.writes_lds = emit::lds_order_wanted() && emit::writes_lds(&insts);
     em.static_ss = constant_samplers(&insts, &leaders, matches!(opt.mode, Mode::Vertex(_) | Mode::Pixel(_)));
     // split wave64: masks only read lane by lane skip the halves' exchange (geometry mode
     // continues from the ES into the GS through s_setpc: left as it is); pixel shaders: they

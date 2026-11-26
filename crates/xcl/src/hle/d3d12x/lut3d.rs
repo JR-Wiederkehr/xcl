@@ -32,6 +32,11 @@ pub fn on() -> bool {
     super::targets::enabled()
 }
 
+/// Whether `created` is to be told of a resource made (`on`, or `XCL_CAPTURE_FRAME`).
+pub fn created_on() -> bool {
+    on() || super::capture::enabled()
+}
+
 struct Vol {
     n: u64,
     /// the state the title's submitted work leaves it in: one for all subresources, or one each
@@ -54,6 +59,7 @@ unsafe fn desc_of(res: usize) -> Option<D3D12_RESOURCE_DESC> {
 /// Texture `res` was made by `how` (from the console description `console`, at the title's
 /// address `va`, kept in step with that memory or not) in `state`: noted if it is a 3D one.
 pub unsafe fn created(how: &str, res: *mut c_void, console: Option<&[u8; 0x38]>, va: Option<usize>, kept: bool, state: u32) {
+    super::capture::created(how, res, console, va, kept);
     if !on() || res.is_null() {
         return;
     }

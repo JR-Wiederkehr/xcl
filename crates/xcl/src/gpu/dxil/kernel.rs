@@ -376,12 +376,15 @@ fn translate_on_this_thread(
         lw.s.m.set_block(gate);
         let up = lw.upper;
         lw.cond_br(up, exit, h0);
-    } else if let Some(runs) = group_runs {
+    } else if let Some(st) = group_runs {
         // a folded dispatch's groups past the console's count leave at once (the whole group:
-        // no barrier waits on them)
+        // no barrier waits on them), and the lanes past a thread limit (`compute_gate`) unless
+        // the program has a group barrier
         let gate = lw.block(Some(1));
         lw.edge(Block(0), gate);
         lw.s.m.set_block(gate);
+        let leave = !cfg.insts.iter().any(|d| d.inst.name == "S_BARRIER");
+        let runs = compute_gate(&mut lw, &st, leave);
         lw.cond_br(runs, h0, exit);
         first = gate;
     } else {
@@ -620,6 +623,7 @@ impl Lw {
             waves: 1,
             cw: z,
             xn: z,
+            live_exec: None,
             xslot: 1,
             lds: None,
             lds_top: 8191,
@@ -633,6 +637,7 @@ impl Lw {
             guard_override: None,
             mask_override: None,
             local_masks: false,
+            writes_lds: split && crate::gpu::recomp::emit::lds_order_wanted() && crate::gpu::recomp::emit::writes_lds(insts),
             exchange_error: None,
             pc: 0,
         };
@@ -832,6 +837,83 @@ fn a_split_wave64_compute_program_stays_whole() {
     super::validate::validate(&program.dxil).expect("valid split wave64 whole shader");
 }
 
+/// A compute program cut into a dispatch chain applies the thread limits (`compute_gate`) once,
+/// in its first piece: a lane past one leaves there with the continuation tag 0, which the later
+/// pieces take to their end, and EXEC reaches them as any other value. Each thread adds to its
+/// word in 40 blocks the optimiser cannot merge, then stores EXEC's count after them.
+#[cfg(test)]
+#[test]
+fn a_dispatch_chain_leaves_the_lanes_past_a_thread_limit_out() {
+    use crate::gpu::recomp::{runner, IO_THREAD_LIMIT};
+    let threads = [32, 1, 1];
+    let cs = CsInterface { threads, user_sgprs: 2, tgid: [true, false, false], tg_size: false, tid_components: 1 };
+    let options = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+    let mut lw = Lw::new(&[], &Default::default(), options, &Entry::Compute(cs.clone()));
+    let (tid, gtid) = lw.setup_lanes_compute(threads, false);
+    let st = compute_init(&mut lw, &cs, tid, gtid);
+    let gate = lw.block(Some(1));
+    lw.edge(Block(0), gate);
+    lw.s.m.set_block(gate);
+    let runs = compute_gate(&mut lw, &st, true);
+    let exec = lw.rd(126);
+    let count = lw.s.bit_count(super::ops::BitCount::Countbits, exec);
+    let (body, out) = (lw.s.m.new_block(), lw.s.m.new_block());
+    lw.s.m.cond_br(runs, body, out);
+    lw.s.m.set_block(out);
+    lw.s.m.ret();
+    lw.s.m.set_block(body);
+    let group = lw.s.group_id(0);
+    let k = lw.c(32);
+    let first = lw.mul(group, k);
+    let index = lw.add(first, tid);
+    let offset = lw.shlc(index, 2);
+    let mem = lw.mems[0];
+    for _ in 0..40 {
+        let (update, join) = (lw.s.m.new_block(), lw.s.m.new_block());
+        let taken = lw.cmpc(Pred::ULt, tid, 32);
+        lw.s.m.cond_br(taken, update, join);
+        lw.s.m.set_block(update);
+        let old = lw.s.raw_load(mem, offset, 1)[0];
+        let new = lw.addc(old, 1);
+        lw.s.raw_store(mem, offset, &[new]);
+        lw.s.m.br(join);
+        lw.s.m.set_block(join);
+    }
+    let at = lw.addc(offset, 4 * 32 * 4);
+    lw.s.raw_store(mem, at, &[count]);
+    lw.s.m.ret();
+    lw.s.m.set_block(Block(0));
+    lw.s.m.br(gate);
+    lw.s.m.optimize();
+    let chain = lw.s.split_compute(threads, None, 64).expect("a chain of pieces");
+    assert!(chain.pieces.len() >= 2);
+    // the limits are read once, by the first piece
+    let load = format!("i32 {}, i32 undef, i8 7, i32 4)", IO_THREAD_LIMIT[0] * 4);
+    for (i, piece) in chain.pieces.iter().enumerate() {
+        super::validate::validate(piece).unwrap_or_else(|e| panic!("piece {i}: {e}"));
+        let Ok(dis) = super::validate::disassemble(piece) else {
+            return runner::skip_test("no DXC");
+        };
+        assert_eq!(dis.matches(&load).count(), (i == 0) as usize, "piece {i}\n{dis}");
+    }
+    if runner::wave32_supported() != Ok(true) {
+        return runner::skip_test("no wave32 GPU");
+    }
+    // 4 groups: 128 counters, then 128 counts
+    for l in [3 * 32 + 9, 0] {
+        let mut io = vec![0u32; 128];
+        io[IO_THREAD_LIMIT[0]] = l;
+        let (mem, _) = runner::dispatch_split_samples(&chain, [4, 1, 1], &io, &[7u32; 256], u64::MAX, 1, false).unwrap();
+        let l = if l == 0 { 128 } else { l };
+        for t in 0..128u32 {
+            let ran = t < l;
+            assert_eq!(mem[t as usize], if ran { 47 } else { 7 }, "limit {l}: thread {t}");
+            let n = (l.saturating_sub(t / 32 * 32)).min(32);
+            assert_eq!(mem[128 + t as usize], if ran { n } else { 7 }, "limit {l}: thread {t}'s EXEC");
+        }
+    }
+}
+
 /// The kernel's epilogue: SGPRs and SCC from lane 0, every touched VGPR per lane.
 fn store_registers(lw: &mut Lw, res: super::shader::RawUav) {
     let touched: Vec<u32> = lw.init.touched.iter().copied().collect();
@@ -860,12 +942,83 @@ fn store_registers(lw: &mut Lw, res: super::shader::RawUav) {
     }
 }
 
+/// What the compute entry leaves to the block after the entry block (`compute_gate`).
+pub struct ComputeStart {
+    /// this group runs (not past a folded dispatch's count)
+    pub runs: Value,
+    /// this lane's thread is below every thread limit of the dispatch (`IO_THREAD_LIMIT`)
+    pub inside: Value,
+    /// split form: the other half's lanes inside the limits
+    pub partner_lanes: Option<Value>,
+}
+
+/// The dispatch's thread limits (`recomp::IO_THREAD_LIMIT`, in one load), each less 1: the last
+/// thread of an axis that runs. A count of 0 (no limit) wraps around and passes every thread.
+pub fn thread_limits(lw: &mut Lw) -> [Value; 3] {
+    let io = lw.init.io.expect("the I/O buffer");
+    let o = lw.c((crate::gpu::recomp::IO_THREAD_LIMIT[0] * 4) as u32);
+    let l = lw.s.raw_load(io, o, 0b111);
+    [0, 1, 2].map(|k| lw.addc(l[k], u32::MAX))
+}
+
+/// Whether the thread `coords` of the group (x, y, z) is inside the thread limits `last`
+/// (`thread_limits`): along each axis the console's group (`groups`, unfolded) times the group
+/// size plus its coordinate is at most the last thread that runs.
+pub fn inside_limits(lw: &mut Lw, threads: [u32; 3], groups: [Value; 3], last: [Value; 3], coords: [Value; 3]) -> Value {
+    let mut inside = lw.b(true);
+    for k in 0..3 {
+        let n = lw.c(threads[k]);
+        let t = lw.mul(groups[k], n);
+        let t = lw.add(t, coords[k]);
+        let ok = lw.cmp(Pred::ULe, t, last[k]);
+        inside = lw.land(inside, ok);
+    }
+    inside
+}
+
+/// Split form: the other half's word of its threads inside the thread limits, from this half
+/// alone (an exchange would meet the other half while its lanes are still all there, and count
+/// them): lane j of this half tests the other half's j-th thread – in rounds of `r` lanes when
+/// this half may have only `r` (a group's last console wave's upper half of 32 + `r` threads)
+/// and the other half 32. `tid`: this lane's console thread in the group.
+pub fn partner_word(lw: &mut Lw, threads: [u32; 3], groups: [Value; 3], last: [Value; 3], tid: Value) -> Value {
+    let [x, y, _] = threads;
+    let total: u32 = threads.iter().product();
+    let r = match total % 64 {
+        m if m > 32 => m - 32,
+        _ => 32,
+    };
+    // the other half's first thread and its count (`Lw::xn`)
+    let other = lw.andc(tid, !31);
+    let k32 = lw.c(32);
+    let other = lw.xor(other, k32);
+    let (xn, lane) = (lw.xn, lw.lane31);
+    let mut word = lw.c(0);
+    for round in 0..32u32.div_ceil(r) {
+        let i = lw.addc(lane, round * r);
+        let t = lw.add(other, i);
+        let (kx, kxy, ky) = (lw.c(x), lw.c(x * y), lw.c(y));
+        let cx = lw.bin(super::module::BinOp::URem, t, kx);
+        let q = lw.bin(super::module::BinOp::UDiv, t, kx);
+        let cy = lw.bin(super::module::BinOp::URem, q, ky);
+        let cz = lw.bin(super::module::BinOp::UDiv, t, kxy);
+        let inside = inside_limits(lw, threads, groups, last, [cx, cy, cz]);
+        let there = lw.cmp(Pred::ULt, i, xn);
+        let bit = lw.land(inside, there);
+        let w = lw.s.wave_ballot(bit)[0];
+        let w = lw.shlc(w, round * r);
+        word = lw.or(word, w);
+    }
+    word
+}
+
 /// The compute entry's fixed registers (the HLSL compute mode's prologue): group ids
-/// after the user SGPRs, TG_SIZE, SCC = 0, EXEC = the wave's threads, v0..v2 = thread id.
-/// Returns whether this group runs: a dispatch folded into Y (`recomp::IO_GROUP_LIMIT` in `io`
-/// not 0, the console's group count in X) takes its group in X from both ids, and the groups
-/// past that count do not run.
-pub fn compute_init(lw: &mut Lw, cs: &CsInterface, tid: Value, gtid: [Value; 3]) -> Value {
+/// after the user SGPRs, TG_SIZE, SCC = 0, EXEC = the wave's threads below the dispatch's thread
+/// limits (`thread_limits`), v0..v2 = thread id. Returns whether this group runs: a dispatch
+/// folded into Y (`recomp::IO_GROUP_LIMIT` in `io` not 0, the console's group count in X) takes
+/// its group in X from both ids, and the groups past that count do not run; and which lanes are
+/// inside the thread limits (`compute_gate` leaves the others out).
+pub fn compute_init(lw: &mut Lw, cs: &CsInterface, tid: Value, gtid: [Value; 3]) -> ComputeStart {
     let io = lw.init.io.expect("the I/O buffer");
     let o = lw.c((crate::gpu::recomp::IO_GROUP_LIMIT * 4) as u32);
     let limit = lw.s.raw_load(io, o, 1)[0];
@@ -879,6 +1032,9 @@ pub fn compute_init(lw: &mut Lw, cs: &CsInterface, tid: Value, gtid: [Value; 3])
     let inside = lw.cmp(Pred::ULt, flat, limit);
     let t = lw.b(true);
     let runs = lw.sel(folded, inside, t);
+    let groups = [ids[0], ids[1], lw.s.group_id(2)];
+    let last = thread_limits(lw);
+    let inside = inside_limits(lw, cs.threads, groups, last, gtid);
     let mut sgpr = HashMap::new();
     let mut next = cs.user_sgprs;
     for k in 0..3 {
@@ -902,6 +1058,19 @@ pub fn compute_init(lw: &mut Lw, cs: &CsInterface, tid: Value, gtid: [Value; 3])
     let zero = lw.c(0);
     sgpr.insert(VAR_SCC, zero);
     let (lo, hi) = entry_exec(lw, total, tid);
+    // the wave's threads inside the thread limits: this hardware wave's ballot (all its lanes
+    // are here yet), in the split form this half's word and the other half's (`partner_word`)
+    let w = lw.s.wave_ballot(inside);
+    let (lo, hi, partner_lanes) = if lw.split {
+        let partner = partner_word(lw, cs.threads, groups, last, tid);
+        let n = lw.s.bit_count(super::ops::BitCount::Countbits, partner);
+        let up = lw.upper;
+        (lw.sel(up, partner, w[0]), lw.sel(up, w[0], partner), Some(n))
+    } else if lw.wave64 {
+        (lw.and(lo, w[0]), lw.and(hi, w[1]), None)
+    } else {
+        (lw.and(lo, w[0]), hi, None)
+    };
     sgpr.insert(126, lo);
     sgpr.insert(127, hi);
     let mut vgpr = HashMap::new();
@@ -911,7 +1080,28 @@ pub fn compute_init(lw: &mut Lw, cs: &CsInterface, tid: Value, gtid: [Value; 3])
         }
     }
     lw.init.compute = Some(ComputeInit { sgpr, vgpr, zero });
-    runs
+    ComputeStart { runs, inside, partner_lanes }
+}
+
+/// The block after a compute entry's: with `leave` the lanes outside the thread limits go there
+/// (the caller branches on the returned condition): they take part in nothing after, as threads
+/// the console never started – no memory, no LDS, no ballot, no lane read. EXEC is then the
+/// running lanes' bits: every running lane has its bit set (`Lw::live_exec`: the lane bit needs
+/// no test, the program's vector writes no guard where they had none before), and a split
+/// half meets the other one counting the lanes that run there (`Lw::xn`). Without `leave` (a
+/// program with a group barrier, which a lane that left would not reach) they run on with their
+/// EXEC bits clear. Returns whether this lane goes on into the program.
+pub fn compute_gate(lw: &mut Lw, st: &ComputeStart, leave: bool) -> Value {
+    if !leave {
+        return st.runs;
+    }
+    if let Some(n) = st.partner_lanes {
+        lw.xn = n;
+    }
+    let lo = lw.rd(126);
+    let hi = if lw.wave64 { lw.rd(127) } else { lw.c(0) };
+    lw.live_exec = Some((lo, hi));
+    lw.land(st.runs, st.inside)
 }
 
 /// A compute program's count of passes for each entry of a loop (the HLSL compute mode's

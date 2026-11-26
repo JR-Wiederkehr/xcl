@@ -52,6 +52,8 @@ struct Pending {
     warned: std::sync::atomic::AtomicBool,
     /// its translation and DXC compile on their own, until the backlog runs them (`Warm`)
     warm: Mutex<Option<Warm>>,
+    /// what its first use tells besides `used::note` (`on_first_use`)
+    on_use: Mutex<Option<OnUse>>,
 }
 
 /// Whether one of the title's threads waits for the pipeline, and the preload worker building it.
@@ -226,6 +228,10 @@ impl Pending {
     fn note_use(&self) {
         if self.key != 0 && !self.used.swap(true, Ordering::Relaxed) {
             used::note(self.key);
+            let on_use = self.on_use.lock().unwrap().take();
+            if let Some(f) = on_use {
+                f();
+            }
         }
     }
 }
@@ -779,6 +785,7 @@ impl Pending {
             huge: Default::default(),
             warned: Default::default(),
             warm: Mutex::new(warm),
+            on_use: Default::default(),
         }
     }
 
@@ -821,6 +828,18 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64, warm
         b.push(p, known);
         BACKLOG.store(b.len(), Ordering::Relaxed);
         q.cv.notify_one();
+    }
+}
+
+/// Run on the thread of a lazy pipeline's first use, once (it is to hand work to another).
+pub type OnUse = Box<dyn FnOnce() + Send>;
+
+/// What the first use of lazy pipeline `standin` tells besides `used::note`: a graphics one's
+/// description for the next run's preparation (`gfx_records::note`). Told before the title has
+/// the stand-in.
+pub(super) fn on_first_use(standin: usize, f: OnUse) {
+    if let Some(p) = entry(standin) {
+        *p.on_use.lock().unwrap() = Some(f);
     }
 }
 
@@ -2110,6 +2129,25 @@ mod used_tests {
         assert!(used::noted(unknown_key) && used::noted(known_key), "a first use is kept for the next run");
         released(known);
         released(unknown);
+    }
+
+    /// What a pipeline's first use tells (a graphics one's description: `gfx_records`) is told
+    /// once, at that use, not when it is made or built.
+    #[test]
+    fn a_first_use_is_told_once() {
+        let (standin, key) = (0x7E57_7011usize, 0x5EED_0011u64);
+        let told = Arc::new(AtomicUsize::new(0));
+        submit_lazy(standin, true, Box::new(|| 0x4331), key);
+        let t = told.clone();
+        on_first_use(standin, Box::new(move || { t.fetch_add(1, Ordering::SeqCst); }));
+        assert_eq!(told.load(Ordering::SeqCst), 0, "not at its making");
+        assert_eq!(resolve_wait(standin), 0x4331);
+        assert_eq!(told.load(Ordering::SeqCst), 1);
+        assert_eq!(resolve(standin), 0x4331);
+        assert_eq!(resolve_wait(standin), 0x4331);
+        assert_eq!(told.load(Ordering::SeqCst), 1, "once");
+        on_first_use(0x7E57_7012, Box::new(|| unreachable!("no such pipeline")));
+        released(standin);
     }
 
     static WORKER_SATURATION_LOCK: Mutex<()> = Mutex::new(());
