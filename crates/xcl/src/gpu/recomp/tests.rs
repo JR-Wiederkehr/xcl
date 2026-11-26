@@ -8393,7 +8393,7 @@ fn gpu_compute_thread_limits_leave_the_lanes_past_them_out() {
     // (name, wave64, the form's DXIL for a program and its group), on this adapter
     type Form = (&'static str, bool, fn(&[I], &CsInterface) -> Vec<u8>);
     let mut forms: Vec<Form> = vec![
-        ("HLSL wave32", false, |l, cs| super::dxc::compile(&translate(&code_of(l), &Options { mode: Mode::Compute(cs.clone()), ..Default::default() }).unwrap().hlsl, "main", "cs_6_6", &[]).unwrap()),
+        ("HLSL wave32", false, |l, cs| super::dxc::compile(&translate(&code_of(l), &Options { mode: Mode::Compute(cs.clone()), wave64: false, ..Default::default() }).unwrap().hlsl, "main", "cs_6_6", &[]).unwrap()),
         ("HLSL split wave64", true, |l, cs| super::dxc::compile(&translate(&code_of(l), &Options { mode: Mode::Compute(cs.clone()), wave64: true, split_wave64: true, ..Default::default() }).unwrap().hlsl, "main", "cs_6_6", &[]).unwrap()),
         ("direct wave32", false, |l, cs| translate_compute(&code_of(l), KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 }, cs).unwrap().dxil),
         ("direct split wave64", true, |l, cs| translate_compute(&code_of(l), KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 }, cs).unwrap().dxil),

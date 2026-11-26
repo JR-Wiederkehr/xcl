@@ -119,6 +119,13 @@ pub(super) fn build_is_wanted() -> bool {
     BUILDING.with(|b| b.borrow().as_ref().is_some_and(|p| p.demand.lock().unwrap().wanted()))
 }
 
+/// This thread is a worker building a pipeline a bind waited for and went on without
+/// (`resolve_within`): nobody waits for it now, but the title's draws or dispatches with it are
+/// left out until it is built (`real::huge_compile_turn`).
+pub(super) fn build_is_late() -> bool {
+    BUILDING.with(|b| b.borrow().as_ref().is_some_and(|p| p.late.load(Ordering::Acquire)))
+}
+
 /// This thread is a backlog worker building a pipeline nobody has used yet: its huge driver
 /// compile gives its turn to any other (`real::big_compile_turn`).
 pub(super) fn build_is_ahead() -> bool {
@@ -2626,6 +2633,13 @@ fn gfx_wait_budget() -> Option<std::time::Duration> {
 /// (`indirect_guard` zeroes only counts out of range). A retail title's thread spent 57 s in the
 /// driver's compiler on one program no earlier run had used, and another of its threads waited
 /// for it all that time: no frame for 57 s.
+/// A compute pipeline's dispatches go on without it while it is built (`XCL_CS_PSO_WAIT_MS`):
+/// what builds one on a title's thread hands it to a thread of its own instead
+/// (`real::dispatch_chain::whole_ready`).
+pub(super) fn cs_goes_on() -> bool {
+    cs_wait_budget().is_some()
+}
+
 fn cs_wait_budget() -> Option<std::time::Duration> {
     static B: OnceLock<Option<std::time::Duration>> = OnceLock::new();
     *B.get_or_init(|| budget_of(std::env::var("XCL_CS_PSO_WAIT_MS").ok().as_deref()))
