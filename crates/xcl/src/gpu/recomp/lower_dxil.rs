@@ -1169,6 +1169,11 @@ mod tests {
         // and no barrier of another mode
         let all = text.lines().filter(|l| l.contains("call void @dx.op.barrier")).count();
         assert_eq!(all, barriers + fences, "a barrier of another mode in the program:\n{text}");
+        let (_, after_entry) = text.split_once("\n  br ").unwrap_or_else(|| panic!("expected branch in program:\n{text}"));
+        let divergent_barriers = after_entry.lines().filter(|l| l.contains("call void @dx.op.barrier(i32 80, i32 9)")).count();
+        // after the entry whole-wave branch, only one half reaches the body so no group barrier may
+        // appear there (the spin exchange's fences, mode 8, wait for no other thread)
+        assert_eq!(divergent_barriers, 0, "group barriers after entry branch:\n{text}");
         if !gpu() {
             return;
         }

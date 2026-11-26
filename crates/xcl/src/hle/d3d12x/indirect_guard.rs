@@ -104,6 +104,11 @@ pub(super) fn note_signature(sig: usize, types: &[i32]) {
     }
 }
 
+/// Whether `sig` is a signature of one dispatch and nothing else (its group counts first).
+pub(super) fn plain_dispatch(sig: usize) -> bool {
+    PLAIN.lock().unwrap().as_ref().and_then(|g| g.get(&sig).copied()) == Some(Counts::Dispatch)
+}
+
 fn program() -> String {
     format!(
         r#"

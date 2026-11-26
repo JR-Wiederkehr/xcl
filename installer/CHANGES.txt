@@ -1,40 +1,83 @@
-XCL - modified build 14
+XCL - modified build 15
 ======================
 
 This is NOT an official XCL release. It is XCL (https://github.com/xcl-dev/xcl, GPL-2.0-only)
-built from upstream commit 68a284a (2026-11-25) plus the changes listed below. The complete
-source of this build is at https://github.com/theaustinayers/xcl (tag v0.1.0-mod.14, branch
-build-14). The licence is in LICENSE.txt, third-party notices in THIRD_PARTY.md.
+built from upstream commit b49be18 (2026-11-25) plus the changes listed below. The complete
+source of this build is at https://github.com/theaustinayers/xcl (tag v0.1.0-mod.15, branch
+build-15). The licence is in LICENSE.txt, third-party notices in THIRD_PARTY.md.
 
-What changed since build 13
+What changed since build 14
 ---------------------------
-- The 3D world of the tested game is no longer grey: its geometry and its textures are drawn.
-  One run of 9 minutes on an RTX 5090 (7.5 of them in the world) ended without a hang, a crash
-  or a driver error. It is still NOT PLAYABLE: about 3 frames a second in the world (XCL's work
-  on the CPU for each submit is the limit), and the colours are wrong - flattened into a few
-  hard bands with a tint. Both are the next thing.
-- Textures: the queue's CopyPageMappingsBatchX maps pages into GPU views (on upstream pull
-  request #1031), a texture over such pages is read where they are kept and goes up again when
-  a mapping under it changes.
-- Geometry: the argument pass of a two-pass ExecuteIndirect(DispatchMesh) sets every view it
-  declares (a fault of the GPU at the start of the world came from one left unset); depth
-  buffers with unordered access get a stencil twin behind XCL_DEPTH_UAV_TWIN=1.
-- NVIDIA: the driver keeps the machine code of the pipelines in use in a reserve of 512 MiB.
-  This game fills it, and the device is then lost without a message (0x887a0005). The reserve
-  can be raised in the driver's profile for xcl.exe: setting 0x001ABC0F (a size in bytes), set
-  here to 2048 MiB with a profile tool run as administrator. The run above was made with it.
-- A device removal says what the list the GPU was in had left, the state of the device and the
-  system's commit; the frame trace names depth buffers and holds a render target only while a
-  view holds it (a crash of traced runs).
-- Memory: about 31 of 32 GB of video memory and 46 - 54 GB of committed memory were in use in
-  the world. A card with less video memory is not expected to get there.
+- Colours: the tested game's world is drawn with the right colours. Its run-time colour-grading
+  volumes (3D render targets, placed 512 KiB apart) wrote over each other: the size of a 3D
+  render target on the console was not known, so every tile of the larger PC texture went on
+  the game's pages, into the next volume. The picture was teal and close to a negative.
+- Lighting and missing scenery: most of the dark, unlit rectangles were mesh draws XCL had
+  skipped because the two-pass buffers were at their cap. With XCL_TWO_PASS_MB=8192 none is
+  skipped: a daylight scene then measures as bright as the console's screenshots (interiors
+  are still too dark).
+  The default is still 1024: set it (see the settings below).
+- Still wrong: 3 to 4 frames a second in the world; animated models are broken up (a fault in
+  the positions of their vertices, being traced); in about one run in four the graphics driver
+  stops answering about half a minute into the world, and also when a run is ended while the
+  world loads. NOT PLAYABLE.
+- Banding: a static sampler set before a branch or a loop is recognised in vertex and pixel
+  shaders (before, those samples used point / wrap / mip 0).
+- Upstream: main merged up to b49be18 (with #2338, #174, #2371); the open pull requests #2555
+  (shaders are prepared in the game's window before the title runs) and #2377.
 
-Settings of the run above (environment variables, set them before starting XCL):
+Starting faster
+---------------
+The first screen of a game is now "Preparing shaders", with a count. What it does, and how to
+steer it (environment variables, set before starting XCL):
+- Only what was used. A run keeps a list of the shaders of the pipelines it really used
+  (used-shaders.txt and used-pipelines.txt beside the shader cache). The next start translates
+  and builds only those: about 24 s for the tested game instead of half an hour for every
+  record of its shader pack. What a later scene needs for the first time is built as it goes.
+- XCL_PREPARE_ALL=1     prepare every record of the pack once (slow, complete).
+- XCL_PREPARE=0         skip the preparation: the game starts at once and builds as it goes.
+- XCL_PREPARE_WORKERS=n the compute pipelines are built by n worker processes (default: the
+                        logical processors less four, 3 GB of free memory each; 1 = one
+                        process). The driver builds about two pipelines at a time for one
+                        process; a cold pass took 929 s with 28 workers.
+- A worker now claims a pipeline before it builds it and reads the cache again after waiting:
+  several workers no longer build the same pipeline at the same time (found by a tester).
+- XCL_PRESS_AT=s:BUTTON,...  presses gamepad buttons at the given seconds ("14:A,18.5:DOWN"),
+                        to take a start through its menus unattended. There is no switch that
+                        skips a game's intro itself.
+- XCL_RUN_SECONDS=n, XCL_STOP_FILE=path   end a run after n seconds, or when the file appears.
+
+Looking inside a frame (diagnostics, all off unless set)
+--------------------------------------------------------
+- XCL_FRAME_DUMP=n            every n-th presented frame as a .bmp in the title's logs folder.
+- XCL_DUMP_TARGETS=work[,frames[,targets]] with XCL_DUMP_AFTER_S=s: for a busy frame, every
+  render target as a picture, the pipelines that drew into each (shader keys, blend state),
+  their translated HLSL and console listing as files, every compute pipeline the frame ran
+  (dispatch counts, group counts, indirect arguments where readable) with its HLSL and
+  listing, and every small 3D texture's corner values and slices.
+- XCL_DEBUG_PS_SUB=hash:from=>to||from=>to   replace text in ONE pixel shader's HLSL at start
+  (hash: the "dump hash" the dump prints). With it a shader can show its own registers in the
+  picture; the colour fault above was found that way, without a rebuild per question.
+  XCL_DEBUG_CS_SUB: the same for one compute shader. XCL_DEBUG_PS_EXPR=hash:expression.
+- XCL_VIEW_STATS=1            how many tiles of the game's memory the shaders' views asked
+  for, got and waited for, every 2 s. XCL_VIEW_KEEP=1 never gives a filled tile back;
+  XCL_VIEW_POISON=1 shows a marker value (not zero) wherever a view has no memory behind it.
+- XCL_DEPTH_UAV_TWIN=1        a depth buffer's depth plane can be read and written by compute
+  shaders through a twin texture (off: it made no visible difference for the tested game).
+- XCL_ZERO_SAMPLER_LINEAR=1   the fallback sampler is linear / clamp (a test for banding).
+- scripts/diag/perfreport.py <log>   where a frame's time goes, ranked, from a run's log.
+  scripts/diag/runhistory.py [dir]   one row per run: time to the world, frames a second,
+                                     errors, memory growth; marks what got worse.
+  scripts/diag/memtrack.py <log>     every memory figure of a run over time, ramps flagged.
+
+Settings of the runs above (environment variables, set them before starting XCL):
   XCL_UMA_WINDOWS=16  XCL_COPY_THREADS=8  XCL_TEXTURE_SAFE_READ=1
   XCL_GFX_PSO_WAIT_MS=100  XCL_HUGE_PSO_CONCURRENCY=3  XCL_PSO_IMAGE_SKIP=1
-  XCL_TWO_PASS_MB=4096  XCL_DIRECT_SPLIT_INSTRUCTIONS=0  XCL_NETWORK=0
-The shaders were built ahead of the run (xcl shaders <pack> --precompile, see the README);
-without that the first minutes in the world stand still while they are compiled.
+  XCL_TWO_PASS_MB=8192  XCL_DIRECT_SPLIT_INSTRUCTIONS=0  XCL_PSO_DISK_CACHE_MIN_MS=0
+  XCL_NETWORK=0
+RTX 5090 (32 GB, driver 621.14), Ryzen 9 9950X3D, 128 GB, Windows 11. About 27 GB of video
+memory and 48 - 50 GB of committed memory were in use in the world. NVIDIA: the driver profile
+setting 0x001ABC0F (reserve for pipeline code) is still needed, as for build 14.
 
 What this build has that upstream's commit does not
 ---------------------------------------------------

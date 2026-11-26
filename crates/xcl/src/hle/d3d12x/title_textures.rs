@@ -896,6 +896,7 @@ pub fn any() -> bool {
 /// The title recorded `transitions` on PC list `list`: those of textures kept in step are noted
 /// for when the list is submitted.
 pub fn note_transitions(list: usize, transitions: &[Transition]) {
+    super::lut3d::note_transitions(list, transitions);
     if !any() || transitions.is_empty() {
         return;
     }
@@ -911,6 +912,7 @@ pub fn note_transitions(list: usize, transitions: &[Transition]) {
 /// PC list `list` starts a new recording (made, reset, released): its noted transitions and
 /// writes go.
 pub fn list_reset(list: usize) {
+    super::lut3d::list_reset(list);
     {
         let mut g = LIST_NOTES.lock().unwrap();
         if !g.is_empty() {
@@ -927,6 +929,7 @@ pub fn list_reset(list: usize) {
 /// states their transitions leave them in, and those they write are the GPU's from this submit
 /// on (`Entry::written_call`).
 pub fn submitted(lists: &[*mut c_void]) {
+    super::lut3d::submitted(lists);
     let notes: Vec<Transition> = {
         let g = LIST_NOTES.lock().unwrap();
         if g.is_empty() { Vec::new() } else { lists.iter().filter_map(|&l| g.get(&(l as usize))).flatten().copied().collect() }
@@ -962,7 +965,7 @@ fn subresource_count(tex: &xg::Texture) -> usize {
 
 /// `states` (one for all `n` subresources, or one each) after a transition of subresource `sub`
 /// (or all of them) to `after`; a subresource the texture does not have is ignored.
-fn apply_transition(states: &mut Vec<D3D12_RESOURCE_STATES>, n: usize, sub: u32, after: D3D12_RESOURCE_STATES) {
+pub(super) fn apply_transition(states: &mut Vec<D3D12_RESOURCE_STATES>, n: usize, sub: u32, after: D3D12_RESOURCE_STATES) {
     if sub == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES || (n <= 1 && sub == 0) {
         *states = vec![after];
         return;
@@ -3023,8 +3026,8 @@ pub(super) mod tests {
         use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC};
         use windows_sys::Win32::System::Memory as mem;
 
-        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap();
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         if super::super::backend() != super::super::Backend::Real {
             crate::gpu::recomp::runner::skip_test("no GPU");
             return;
@@ -3582,7 +3585,7 @@ pub(super) mod tests {
     /// submission order, each time it is; a Reset forgets them; other resources are not noted.
     #[test]
     fn transitions_apply_when_their_list_is_submitted() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // RGBA8 64×64, 3 mips, 2 slices (6 subresources), 4KB_S
         let mut d = [0u8; 0x38];
         d[0..4].copy_from_slice(&3u32.to_le_bytes());
@@ -3759,8 +3762,8 @@ pub(super) mod tests {
     /// chains (including packed mips), cubemap arrays (`extra_pages`) and 3D volumes upload intact.
     #[test]
     fn placed_title_textures_share_vram_and_preserve_pixels() {
-        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap();
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
         use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
         use windows::Win32::Graphics::Dxgi::*;
@@ -3970,8 +3973,27 @@ pub(super) mod tests {
                 assert_eq!(read_sub(r, 0), subresources(base + off, &xg::Texture::new(&d).unwrap())[0].data, "4 KiB neighbour at +{off:#x} crosstalk");
             }
             let pages_before_reuse = dev_pages();
+            // Binding sweeps pages idle for two seconds, so the device-wide count can fall
+            // here even when this placement shares the extra tile it already has.
+            let first = adj[1].as_raw() as usize;
+            let before = super::super::vram::mapped_tiles_for(dev_key, first);
             let reused = place_tex(base + 0x4000, &d16);
-            assert_eq!(dev_pages(), pages_before_reuse, "reusing unaligned va must share extra_pages tile");
+            if super::super::vram::is_placed_texture(first) {
+                let before = before.expect("the first unaligned placement is mapped");
+                assert!(!before.1.is_empty(), "a 16 KiB texture in a 64 KiB page uses an extra tile");
+                assert_eq!(
+                    super::super::vram::mapped_tiles_for(dev_key, first).as_ref(),
+                    Some(&before),
+                    "the first placement keeps its tiles when the va is placed again",
+                );
+                assert_eq!(
+                    super::super::vram::mapped_tiles_for(dev_key, reused.as_raw() as usize).as_ref().map(|t| &t.1),
+                    Some(&before.1),
+                    "reusing unaligned va must share extra_pages tile",
+                );
+            } else {
+                assert_eq!(dev_pages(), pages_before_reuse, "reusing unaligned va must share extra_pages tile");
+            }
             // Overwrite the first 64 KiB (covering +0x0000, +0x4000 (both adj[1] & reused), +0x8000, +0xC000)
             // WITHOUT releasing adj/reused: dead extra_pages (+0x4000, +0x8000) must drop immediately!
             let cover = place_tex(base, &d64);
@@ -4030,9 +4052,16 @@ pub(super) mod tests {
                 }
                 // Placing a second cubemap at the same va must reuse every tile including extra_pages.
                 if label.contains("cubemap") {
-                    let p0 = dev_pages();
+                    // Binding sweeps unrelated targets idle for two seconds, so a device-wide
+                    // byte count can fall here even when every tile of this cube is shared.
+                    let mappings = super::super::vram::tile_mappings_for(dev.as_raw() as usize, res.as_raw() as usize).expect("cube is mapped");
+                    assert!(!mappings.0.is_empty() || !mappings.1.is_empty(), "cube must have mapped tiles");
                     let res2 = place_tex(base, &d);
-                    assert_eq!(dev_pages(), p0, "cubemap extra_pages must be reused at same va");
+                    assert_eq!(super::super::vram::tile_mappings_for(dev.as_raw() as usize, res2.as_raw() as usize).as_ref(), Some(&mappings),
+                        "the second cube must reuse every title-page and extra-page tile");
+                    assert_eq!(super::super::vram::tile_mappings_for(dev.as_raw() as usize, res.as_raw() as usize).as_ref(), Some(&mappings),
+                        "the original cube must keep the same tile mappings");
+                    println!("{label}: reused {} title-page tiles and {} extra-page tiles", mappings.0.len(), mappings.1.len());
                     drop(res2);
                 }
                 drop(res);

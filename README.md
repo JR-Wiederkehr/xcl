@@ -43,13 +43,15 @@ XCL is a research project and this is a snapshot of it. Please read this before 
 
 - **What upstream reports as working** (see the table further down): a few retail titles are
   listed as playable. Those claims are upstream's; they were not re-tested with this build.
-- **Large, new games: do not expect them to be playable.** With build 14 the game this build
-  was tested against runs its menus and intro, loads its world and **draws it with geometry and
-  textures**; one run of 9 minutes (7.5 in the world) ended without a hang, a crash or a driver
-  error on an RTX 5090. It is **not playable**: about **3 frames a second** in the world, and
-  **the colours are wrong** (flattened into hard bands with a tint). It needed 31 GB of video
-  memory, and on NVIDIA a driver profile setting that raises the reserve for pipeline code. The
-  settings of that run are in [`installer/CHANGES.txt`](installer/CHANGES.txt).
+- **Large, new games: do not expect them to be playable.** With build 15 the game this build
+  was tested against runs its menus and intro, reaches play (the game's own control prompts
+  are up) and **draws its world with the right colours and lighting**: static scenery is close
+  to correct. It is **not playable**: about **3 to 4 frames a second** in the world, **animated
+  models are broken up** (blocks missing, surfaces pulled into wedges), and in about one run in
+  four the graphics driver stops answering half a minute into the world. It needed 27 GB of
+  video memory, and on NVIDIA a driver profile setting that raises the reserve for pipeline
+  code. The settings of those runs, and the diagnostic switches this build adds, are in
+  [`installer/CHANGES.txt`](installer/CHANGES.txt).
 
 - **Network:** XCL has no networking code of its own and does not phone home. The *game* does
   try to use the network – name lookups, and its crash reporter uploads a memory dump when it
@@ -357,7 +359,10 @@ next to `xcl.exe`, directly next to `xcl.exe`, in `%LOCALAPPDATA%\XCL\D3D12\`, o
   folder has DXC 1.7.2308 or 1.8.2502, depending on the SDK's revision). DXC 1.7's DXIL was 2–2.7 times the
   size of 1.9's for translated compute programs and took an NVIDIA driver 1.4–2.2 times as long to build
   pipelines from ([#156](https://github.com/ivall/xcl/issues/156)). `xcl run` prints the DXC it loaded, and
-  `report.json` has it under `dxc`.
+  `report.json` has it under `dxc`. A compute program with many memory-window accesses is compiled
+  as two libraries, the program and its accessors, and linked, which is much faster for DXC
+  (`XCL_LINK_MEM=0` turns it off); the linker needs DXC 1.8 or newer. With an older one the first
+  attempt fails, `xcl.log` says so, and every program is compiled whole after that.
 - **GPU:** developed on AMD RDNA4. The console's geometry and NGG programs run as a compute pass plus a
   mesh pass, so a GPU without mesh shaders draws none of them. On GPUs with 32-lane waves only
   (NVIDIA) console wave64 compute, geometry and mesh programs run as two 32-lane halves that exchange
@@ -392,6 +397,19 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
 <details>
 <summary><b>Switches, caches, logs and the files XCL writes</b></summary>
 
+- When a game folder contains a `shaders.rpf` shader pack or loose `.dxbc` files under
+  `shaders/`, XCL shows shader preparation in the game window before executing title code.
+  The same window then presents the game. The percentage counts
+  processed records. The timer counts seconds since one finished (or preparation started);
+  five seconds without progress counts as a stall, and the window shows when the last one ended.
+  XCL prepares supported shader stages and compute pipelines, including
+  split pieces and their whole fallback. Graphics pipelines that need state supplied by the
+  title are created during play. Later launches reuse matching cache entries.
+  Closing the window cancels the launch. A compiler or driver failure stops it and reports
+  the cause. Null-renderer runs skip shader preparation. With presentation disabled, the gate runs without a window.
+- For compute shaders that XCL can split, the runtime first tries the saved driver blob for
+  the whole shader. A usable blob lets the GPU run it in one dispatch. If the blob is missing
+  or the driver rejects it, XCL builds the split pieces.
 - **`--pipelines` size cap**: a compute program whose DXIL is over 8 MiB and that has no saved
   blob is left to the runtime instead of being compiled in the pass — those compiles take tens
   of minutes and gigabytes and stopped the pass on the biggest programs. `XCL_PIPELINE_MAX_KB`
@@ -402,6 +420,22 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
 - XCL works on **unpacked** game files you own; it contains nothing for decrypting or
   circumventing DRM.
 - **The game folder is never modified** – writes go to the overlay.
+- **Switches for how a title runs** (set them in the environment of `xcl run`):
+  - `XCL_SKIP_BINK`: skips the Bink 2 movies of a title that ships a `bink2*.dll` (its logos and
+    intros), by taking them straight to their last frame without decoding. Off when unset or `0`,
+    `off`, `false` or `no`; `all` also skips looping movies; any other value (`1`, `intro` …)
+    skips the ones that do not loop.
+  - `XCL_MUTE_TTS`: the title gets no Windows speech synthesis: its XAccessibility requests are
+    answered by XCL's own object, which has closed captions and high contrast only. Off by
+    default; any value except empty, `0`, `off` or `false` (in any case) turns it on.
+  - `XCL_FRAME_INTERVAL_US`: changes the console frame clock. Unset, the title's own frame
+    interval (`SetFrameIntervalX`) is kept. `0`, `off` or `uncapped` removes the cap, so
+    `WaitFrameEventX` returns at once with a fresh token. A number of microseconds is an upper
+    bound on the interval, never below 1000: `8333` for 120 Hz, `4167` for 240 Hz.
+  - `XCL_WAIT_TIMEOUT_MS` and `XCL_GPU_WAIT_TIMEOUT_MS`, for diagnostics: the longest XCL waits
+    for a `Wait32BitValueX` / `Wait64BitValueX` that nothing satisfies (2000 ms) and the
+    watchdog for a GPU queue wait (5000 ms). A value that is not a number above 0 keeps the
+    default.
 - Translated shaders are reused across XCL rebuilds when the translator sources and DXC
   toolchain are unchanged; `XCL_TRANSLATED_CACHE=0` disables that disk cache.
 - Direct compute dispatches can split large programs into pipelines built in parallel.
@@ -455,6 +489,31 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
   each render target and the depth buffer drawn into (draws ran / stand-in / PC / skipped) and dumps
   the eight drawn into most (`target<k>_<n>.bmp`); `XCL_DUMP_AFTER_S=<s>` waits `s` seconds first.
   A coarse sample can miss detail; a non-dark sample does not establish correct rendering or gameplay.
+- **Diagnostics for a bug report** (all off by default; set them in the environment of `xcl run`):
+  - `XCL_RUN_SECONDS=n`: the title ends itself after `n` seconds, with the GPU drained and
+    `xcl.log` and `report.json` written, so a run of a fixed length can be attached. A value that
+    is not a whole number is ignored.
+  - `XCL_ACTIVITY=1` (any value turns it on): every 2 seconds `xcl.log` gets an `activity (2 s)`
+    line with what the title did in that time (presents, submits, draws, dispatches, frame-event
+    waits, DirectStorage requests), and a `memory:` line with the process's commit and the video
+    memory in use. Where the lines stop changing is where the title stopped.
+  - `XCL_THREAD_DUMP_AT=s1,s2,…`: at each of those seconds after the start, the state of every
+    thread of the title goes into `xcl.log`, for a title that stalls.
+  - `XCL_TRACE_FAULTS=1` (any value): the first 32 access violations are logged as they are raised
+    (read, write or execute, the address, some registers and the callers on the stack), before the
+    title's own handlers see them – for a title whose crash filter ends the process without a trace.
+  - `XCL_TRACE_MEM=1` (any value turns it on): the title's memory allocations of 64 KiB or more
+    are logged, the first 60 (`XCL_TRACE_MEM=n` with `n > 1`: the first `n`). The same variable
+    also logs XCL's own allocations of 1 MB or more in the title's committed memory window, and
+    the ones that fail.
+  - `XCL_TRACE_IMPORTS`: logs the arguments and the result of every call of the imports it names.
+    A comma-separated list: `1` or `hle` for every function XCL implements (also what a list with
+    no word to add means), `all` for the system's functions too (short runs only), any other word
+    is the start of a `dll!Function` name to add, and `-word` one to leave out; the name is the
+    DLL's file name with its extension and case does not matter, so for example
+    `hle,-kernelx.dll!GetTickCount,gameinput`.
+  - `XCL_D3D12_TRACE=1` (any value): every call console code makes to a public D3D12.X method is
+    logged with the interface and method name. Very verbose: use it for a short run.
 - Title data: `%LOCALAPPDATA%\XCL\<title>\` (`%XCL_DATA_ROOT%`): `xcl.toml`, `overlay\`, `saves\`,
   `pls\` (the title's `S:\`), `temp\` (`T:\`), `cache\`, `logs\xcl.log`, `logs\report.json` (the
   previous run's: `xcl.prev.log`, `report.prev.json`).

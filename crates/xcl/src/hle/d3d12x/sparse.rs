@@ -398,6 +398,14 @@ enum Drain {
     TitleDone,
 }
 
+struct RetiredTiles {
+    tiles: Vec<(u32, u32)>,
+    /// Fence marks on `self.queue` and every known title queue (`None` = signal failed, keep held).
+    marks: Option<Vec<(ID3D12Fence, u64)>>,
+    /// when they were unmapped: they cool (`State::cooling`) from then on once the marks are reached
+    at: std::time::Instant,
+}
+
 struct State {
     dev: ID3D12Device,
     queue: ID3D12CommandQueue,
@@ -432,10 +440,11 @@ struct State {
     pools: Vec<Option<ID3D12Heap>>,
     /// pool tiles to use: those of a pool that were never used, and cooled ones (`cooling`)
     free: Vec<(u32, u32)>,
-    /// pool tiles freed (`flush_parked`, `release_if_unused`), oldest first, with when: used
-    /// again `COOL` after that at the earliest (`take_tile`). Before, a tile unmapped went to
-    /// `free` and was the next one taken, mapped, cleared and filled for another address on the
-    /// sparse queue while title work submitted before the unmap could still read it.
+    /// pool tiles freed (`flush_parked`, once `quarantined` lets them go, and `release_if_unused`),
+    /// oldest first, with when: used again `COOL` after that at the earliest (`take_tile`).
+    /// Before, a tile unmapped went to `free` and was the next one taken, mapped, cleared and
+    /// filled for another address on the sparse queue while title work submitted before the
+    /// unmap could still read it.
     cooling: VecDeque<((u32, u32), std::time::Instant)>,
     /// pools all of whose tiles came free: released once the GPU is past `value` and a moment
     /// went by (titles' queues may still read what was mapped there)
@@ -466,6 +475,11 @@ struct State {
     pending: Vec<usize>,
     /// placed buffers → the tiles they use (address, pool tile)
     buffers: FxHashMap<usize, Vec<(usize, (u32, u32))>>,
+    /// unmapped parked pool tiles awaiting `self.queue` and in-flight title queues before they
+    /// cool (`cooling`)
+    quarantined: VecDeque<RetiredTiles>,
+    /// per-title-queue fences used to mark in-flight GPU work (`note_queue`)
+    queue_fences: FxHashMap<usize, (ID3D12CommandQueue, ID3D12Fence, u64)>,
     /// reused tiles / decommitted partial pages to clear: (address, bytes)
     to_zero: BTreeSet<(usize, usize)>,
     /// ring-buffered upload staging heap (`STAGING` bytes, persistently mapped)
@@ -533,6 +547,20 @@ struct State {
     /// wait
     no_memory: Option<std::time::Instant>,
     counts: MirrorCounts,
+    diag: ViewDiag,
+    /// `XCL_VIEW_POISON`: the tile the windows' tiles without video memory show (`poison_windows`)
+    poison: Option<Poison>,
+}
+
+/// The one 64 KiB of video memory the tiles of the windows without video memory of their own are
+/// mapped to (`D3D12_TILE_RANGE_FLAG_REUSE_SINGLE_TILE`), a buffer placed over it, and the
+/// pattern's upload copy it is filled from again (`refresh_poison`: what a shader wrote there
+/// lands in the one tile).
+struct Poison {
+    heap: ID3D12Heap,
+    buf: ID3D12Resource,
+    src: ID3D12Resource,
+    at: std::time::Instant,
 }
 
 /// What the tiles over CPU views did, for the timing line
@@ -550,6 +578,79 @@ struct MirrorCounts {
     /// pages that were not committed in a CPU view, written since and asked about again
     rechecks: u64,
 }
+
+/// Diagnostics of the GPU-view tiles, all off unless set: `XCL_VIEW_KEEP=1` (a tile over a CPU
+/// view keeps its video memory once filled, within `mirror_cap`), `XCL_VIEW_POISON=1` (or a
+/// 32-bit pattern, `0x…`: what a tile of the windows without video memory reads instead of zeros,
+/// `State::poison_windows`) and `XCL_VIEW_STATS=1`. Any of them logs `view_stats_line` every 2 s.
+struct ViewSwitches {
+    keep: bool,
+    poison: Option<u32>,
+    stats: bool,
+}
+
+fn view_switches() -> &'static ViewSwitches {
+    static ON: std::sync::OnceLock<ViewSwitches> = std::sync::OnceLock::new();
+    ON.get_or_init(|| {
+        let var = |k: &str| std::env::var(k).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty() && v != "0");
+        let (keep, poison) = (var("XCL_VIEW_KEEP").is_some(), poison_pattern(var("XCL_VIEW_POISON").as_deref()));
+        ViewSwitches { keep, poison, stats: keep || poison.is_some() || var("XCL_VIEW_STATS").is_some() }
+    })
+}
+
+/// The poison pattern of `XCL_VIEW_POISON` (set, not "0"): a NaN as a float, a wild index or count
+/// as an integer, or the pattern given in hex.
+fn poison_pattern(v: Option<&str>) -> Option<u32> {
+    let v = v?;
+    match v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
+        Some(hex) => u32::from_str_radix(hex, 16).ok().filter(|&p| p != 0),
+        None => Some(0x7FC0_DEAD),
+    }
+}
+
+/// Whether a tile over a CPU view whose video memory would go back keeps it mapped where it is
+/// (`XCL_VIEW_KEEP`): while the tiles with video memory and kept, this one among them, are within
+/// the cap.
+fn keep_view_tile(keep: bool, held: usize, cap: usize) -> bool {
+    keep && held <= cap
+}
+
+/// The bucket of a tile that got video memory again `submits` after it went: 0-1, 2-8, 9-64, more.
+fn back_bucket(submits: u64) -> usize {
+    match submits {
+        0..=1 => 0,
+        2..=8 => 1,
+        9..=64 => 2,
+        _ => 3,
+    }
+}
+
+/// What the GPU-view diagnostics count (`ViewSwitches`; nothing while they are off but submits).
+#[derive(Default, Debug)]
+struct ViewDiag {
+    keep: bool,
+    stats: bool,
+    /// submits so far (`before_execute_on`)
+    submits: u64,
+    /// tiles kept mapped that would have gone back (`XCL_VIEW_KEEP`)
+    kept: u64,
+    /// tile given back or kept → the submit then, until it gets video memory again
+    left_at: FxHashMap<usize, u64>,
+    /// tiles that got video memory again, by submits since they went (`back_bucket`), and the
+    /// bytes of their committed pages filled again
+    back: [u64; 4],
+    back_bytes: u64,
+    /// submits that left tiles asked for waiting (`later`, `asks`) for a later one
+    deferred: u64,
+}
+
+/// Tiles of GPU views asked for (`map_mirror` queued them), while `ViewSwitches::stats`.
+static VIEW_ASKED: AtomicU64 = AtomicU64::new(0);
+
+/// `view_stats`: [asked, filled, given back, kept, back 0-1, 2-8, 9-64, more, bytes back, submits,
+/// deferred] so far, then [with video memory, kept mapped, waiting, refused] now.
+const VS: usize = 15;
+const VS_NOW: usize = 11;
 
 /// tiles over CPU views asked for taken in at a time, and refused ones tried again at a submit at
 /// most (`State::map_mirrors`); the rest wait for the next one
@@ -767,7 +868,8 @@ pub fn pool_bytes() -> (usize, usize) {
     let g = lock_state();
     let Some(s) = g.as_ref() else { return (0, 0) };
     let pools = s.pools.iter().filter(|p| p.is_some()).count() * POOL_TILES as usize * TILE;
-    (pools, pools.saturating_sub((s.free.len() + s.cooling.len()) * TILE))
+    let quarantined: usize = s.quarantined.iter().map(|b| b.tiles.len()).sum();
+    (pools, pools.saturating_sub((s.free.len() + s.cooling.len() + quarantined) * TILE))
 }
 /// commits before the device existed: the pages committed, as disjoint page ranges (start →
 /// end) merged with their neighbours, so a commit or decommit costs O(log n) and not a scan of
@@ -899,6 +1001,8 @@ unsafe fn new_state(dev: &ID3D12Device, windows: Vec<(usize, ID3D12Resource)>) -
         kept: FxHashMap::default(),
         pending: Vec::new(),
         buffers: FxHashMap::default(),
+        quarantined: VecDeque::new(),
+        queue_fences: FxHashMap::default(),
         to_zero: BTreeSet::new(),
         staging: None,
         ring_write: 0,
@@ -930,6 +1034,8 @@ unsafe fn new_state(dev: &ID3D12Device, windows: Vec<(usize, ID3D12Resource)>) -
         refused: FxHashSet::default(),
         no_memory: None,
         counts: MirrorCounts::default(),
+        diag: ViewDiag { keep: view_switches().keep, stats: view_switches().stats, ..Default::default() },
+        poison: None,
     })
 }
 
@@ -993,9 +1099,25 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
     }
     let made = new_state(dev, windows);
     match made {
-        Ok(s) => {
+        Ok(mut s) => {
             let views = out.iter().filter(|w| u.is_view_window(w.0)).count();
             crate::xlog_info!("D3D12.X: {} sparse window(s) for the title's own memory and {views} for GPU views of it (tiled buffers on video memory)", out.len() - views);
+            let sw = view_switches();
+            if let Some(pattern) = sw.poison {
+                s.poison_windows(pattern);
+            }
+            if sw.stats {
+                crate::xlog_info!(
+                    "D3D12.X: GPU-view diagnostics: keep {}, poison {}, a line every 2 s",
+                    if sw.keep { format!("on ({} tiles at most, XCL_MIRROR_MB)", s.mirror_cap) } else { "off".into() },
+                    match (sw.poison, s.poison.is_some()) {
+                        (Some(p), true) => format!("{p:#010x}"),
+                        (Some(_), false) => "failed (zeros)".into(),
+                        (None, _) => "off".into(),
+                    }
+                );
+                start_view_stats();
+            }
             // a state this replaces (the windows set up again) goes after the lock: the release of
             // its last buffers reaches `forget_buffer`, which takes the lock (#344)
             // (the queue first: `queue()` never answers with one older than the state's)
@@ -1021,10 +1143,11 @@ impl State {
         self.windows.iter().position(|(b, _)| a >= *b && a < *b + crate::gpu::uma::WINDOW)
     }
 
-    /// A pool tile (true: used before, to be cleared). One freed less than `COOL` ago is not
-    /// taken: a retired pool is taken back or a heap made instead. (Parked tiles are not flushed
-    /// for it: freed now, they would cool all the same.)
+    /// A pool tile (true: used before, to be cleared). One freed less than `COOL` ago, or one
+    /// still `quarantined`, is not taken: a retired pool is taken back or a heap made instead.
+    /// (Parked tiles are not flushed for it: freed now, they would wait and cool all the same.)
     unsafe fn take_tile(&mut self) -> Option<((u32, u32), bool)> {
+        self.drain_quarantined();
         if let Some(t) = reuse_tile(&mut self.free, &mut self.cooling, std::time::Instant::now()) {
             return Some((t, true));
         }
@@ -1156,6 +1279,8 @@ impl State {
         let mut regions: Vec<D3D12_TILE_REGION_SIZE> = Vec::with_capacity(xs.len());
         let mut flags: Vec<D3D12_TILE_RANGE_FLAGS> = Vec::with_capacity(xs.len());
         let mut counts: Vec<u32> = Vec::with_capacity(xs.len());
+        // (`XCL_VIEW_POISON`: onto the poison tile, every tile of a run on its one tile)
+        let poison = self.poison.as_ref().map(|p| &p.heap);
         let mut i = 0;
         while i < xs.len() {
             let x0 = xs[i];
@@ -1165,23 +1290,99 @@ impl State {
             }
             coords.push(D3D12_TILED_RESOURCE_COORDINATE { X: x0, ..Default::default() });
             regions.push(D3D12_TILE_REGION_SIZE { NumTiles: run, UseBox: false.into(), ..Default::default() });
-            flags.push(D3D12_TILE_RANGE_FLAG_NULL);
+            flags.push(if poison.is_some() { D3D12_TILE_RANGE_FLAG_REUSE_SINGLE_TILE } else { D3D12_TILE_RANGE_FLAG_NULL });
             counts.push(run);
             i += run as usize;
         }
+        let offsets = vec![0u32; if poison.is_some() { counts.len() } else { 0 }];
         count_tile_calls(res_base, true, 1, tiles.len());
         self.queue.UpdateTileMappings(
             res,
             coords.len() as u32,
             Some(coords.as_ptr()),
             Some(regions.as_ptr()),
-            None,
+            poison,
             flags.len() as u32,
             Some(flags.as_ptr()),
-            None,
+            poison.map(|_| offsets.as_ptr()),
             Some(counts.as_ptr()),
             D3D12_TILE_MAPPING_FLAG_NONE,
         );
+    }
+
+    /// `XCL_VIEW_POISON`: every tile of `res` (`tiles` of them) onto the poison tile, before the
+    /// tiles with video memory are mapped over it.
+    unsafe fn poison_all(&self, res: &ID3D12Resource, tiles: u32) {
+        let Some(p) = &self.poison else { return };
+        if tiles == 0 {
+            return;
+        }
+        let coord = D3D12_TILED_RESOURCE_COORDINATE::default();
+        let region = D3D12_TILE_REGION_SIZE { NumTiles: tiles, UseBox: false.into(), ..Default::default() };
+        let (flag, off) = (D3D12_TILE_RANGE_FLAG_REUSE_SINGLE_TILE, 0u32);
+        self.queue.UpdateTileMappings(res, 1, Some(&coord), Some(&region), &p.heap, 1, Some(&flag), Some(&off), Some(&tiles), D3D12_TILE_MAPPING_FLAG_NONE);
+    }
+
+    /// `XCL_VIEW_POISON`: a tile of video memory filled with `pattern`, and every tile of the
+    /// windows mapped onto it (one call each, before any has video memory of its own); unmapped
+    /// tiles go back to it from here on (`unmap_tiles`), and a buffer placed in a window starts
+    /// on it (`place_buffer`). Many tiles of reserved buffers on one tile of a heap is what
+    /// `REUSE_SINGLE_TILE` is for. Logged and left off when the tile cannot be made.
+    unsafe fn poison_windows(&mut self, pattern: u32) {
+        let made = (|| -> windows::core::Result<Poison> {
+            let desc = D3D12_HEAP_DESC {
+                SizeInBytes: TILE as u64,
+                Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                Alignment: 0,
+                Flags: D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES | D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES,
+            };
+            let mut heap: Option<ID3D12Heap> = None;
+            self.dev.CreateHeap(&desc, &mut heap)?;
+            let heap = heap.ok_or_else(|| windows::core::Error::from(windows::Win32::Foundation::E_FAIL))?;
+            let _ = heap.SetName(windows::core::w!("xcl poison tile"));
+            let mut d = buffer_desc(TILE as u64);
+            d.Flags = D3D12_RESOURCE_FLAG_NONE;
+            let mut buf: Option<ID3D12Resource> = None;
+            self.dev.CreatePlacedResource(&heap, 0, &d, D3D12_RESOURCE_STATE_COMMON, None, &mut buf)?;
+            let mut src: Option<ID3D12Resource> = None;
+            self.dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_GENERIC_READ, None, &mut src)?;
+            let (Some(buf), Some(src)) = (buf, src) else { return Err(windows::Win32::Foundation::E_FAIL.into()) };
+            let mut p = std::ptr::null_mut();
+            src.Map(0, None, Some(&mut p))?;
+            std::slice::from_raw_parts_mut(p as *mut u32, TILE / 4).fill(pattern);
+            src.Unmap(0, None);
+            Ok(Poison { heap, buf, src, at: std::time::Instant::now() })
+        })();
+        match made {
+            Ok(p) => self.poison = Some(p),
+            Err(e) => {
+                crate::xlog_warn!("XCL_VIEW_POISON: no poison tile ({e}) – tiles without video memory read zeros");
+                return;
+            }
+        }
+        let windows: Vec<ID3D12Resource> = self.windows.iter().map(|w| w.1.clone()).collect();
+        let mut tiles = 0u64;
+        for r in &windows {
+            let n = (r.GetDesc().Width as usize).div_ceil(TILE) as u32;
+            self.poison_all(r, n);
+            tiles += n as u64;
+        }
+        self.refresh_poison();
+        crate::xlog_info!("XCL_VIEW_POISON: {tiles} tiles of {} window(s) show {pattern:#010x} where they have no video memory", windows.len());
+    }
+
+    /// The poison tile filled with its pattern again (at most once every 16 ms: at a submit),
+    /// on the sparse queue the title's queues wait for.
+    unsafe fn refresh_poison(&mut self) {
+        let Some((buf, src)) = self.poison.as_mut().map(|p| {
+            p.at = std::time::Instant::now();
+            (p.buf.clone(), p.src.clone())
+        }) else {
+            return;
+        };
+        let idx = self.begin_slot();
+        self.slots[idx].list.CopyBufferRegion(&buf, 0, &src, 0, TILE as u64);
+        self.submit_slot(idx);
     }
 
     /// tiles of `[a, a + n)` get video memory (mapped in their window); `initial_holes` supplies
@@ -2057,6 +2258,7 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
     }
     let mut g = lock_state();
     let Some(s) = g.as_mut() else { return };
+    s.note_queue(queue);
     s.after_execute(queue, ranges, imms);
 }
 
@@ -2478,12 +2680,14 @@ impl State {
         }
         MAPPED_GEN.fetch_add(1, Ordering::Release);
         if self.parked.len() >= PARKED_MAX && self.flush_parked() {
+            self.drain_quarantined();
             self.retire_free_pools();
         }
     }
 
     /// A pool tile a buffer used at `t` is freed (`cooling`), unless its window maps it, it
-    /// is parked there, or another buffer uses it. Kept mapped for the buffer: parked from here on.
+    /// is parked there, it waits in `quarantined`, or another buffer uses it. Kept mapped for
+    /// the buffer: parked from here on.
     fn release_if_unused(&mut self, t: usize, tile: (u32, u32)) {
         if self.pinned.contains_key(&tile) {
             return;
@@ -2493,20 +2697,100 @@ impl State {
             self.parked.insert(t, tile);
             return;
         }
-        if self.mapped.get(&t).is_none_or(|e| e.pool != tile) && self.parked.get(&t) != Some(&tile) {
+        if self.mapped.get(&t).is_none_or(|e| e.pool != tile)
+            && self.parked.get(&t) != Some(&tile)
+            && !self.quarantined.iter().any(|b| b.tiles.contains(&tile))
+        {
             self.cooling.push_back((tile, std::time::Instant::now()));
         }
     }
 
+    unsafe fn note_queue(&mut self, q: &ID3D12CommandQueue) -> bool {
+        let key = q.as_raw() as usize;
+        if self.queue_fences.contains_key(&key) {
+            return true;
+        }
+        // Ignore queues belonging to a different device (e.g. isolated unit tests).
+        let mut qdev: Option<ID3D12Device> = None;
+        if q.GetDevice(&mut qdev).is_err() || qdev.as_ref().is_none_or(|d| d.as_raw() != self.dev.as_raw()) {
+            return true;
+        }
+        match self.dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) {
+            Ok(fence) => {
+                self.queue_fences.insert(key, (q.clone(), fence, 0));
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    unsafe fn sync_known_queues(&mut self) -> bool {
+        let mut ok = true;
+        for raw in super::present::known_queues() {
+            if !self.queue_fences.contains_key(&raw) {
+                let ptr = raw as *mut c_void;
+                if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&ptr) {
+                    ok &= self.note_queue(q);
+                }
+            }
+        }
+        ok
+    }
+
+    unsafe fn quarantine_tiles(&mut self, tiles: Vec<(u32, u32)>) {
+        if tiles.is_empty() {
+            return;
+        }
+        let mut ok = self.sync_known_queues();
+        let mut marks = Vec::with_capacity(1 + self.queue_fences.len());
+        marks.push((self.fence.clone(), self.value));
+        if ok {
+            for (q, fence, val) in self.queue_fences.values_mut() {
+                let next = *val + 1;
+                if q.Signal(&*fence, next).is_ok() {
+                    *val = next;
+                    marks.push((fence.clone(), next));
+                } else {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        self.quarantined.push_back(RetiredTiles { tiles, marks: ok.then_some(marks), at: std::time::Instant::now() });
+    }
+
+    /// The `quarantined` tiles the GPU is past go to `cooling` (from when they were unmapped).
+    /// (XCL's own query of the fences: the title's `GetCompletedValue` hook takes the state's
+    /// lock, which the caller holds.)
+    unsafe fn drain_quarantined(&mut self) -> bool {
+        let mut freed = false;
+        while let Some(front) = self.quarantined.front() {
+            let ready = front.marks.as_ref().is_some_and(|marks| marks.iter().all(|(f, v)| super::real::fence_completed(f) >= *v));
+            if !ready {
+                break;
+            }
+            let batch = self.quarantined.pop_front().unwrap();
+            let at = batch.at;
+            for tile in batch.tiles {
+                if !self.pinned.contains_key(&tile) {
+                    self.cooling.push_back((tile, at));
+                    freed = true;
+                }
+            }
+        }
+        freed
+    }
+
     /// The parked tiles unmapped from their windows (one call per window) and their pool tiles
-    /// freed to `cooling` (but those of placed buffers). Pools left all free are not retired
-    /// here: callers do that (`retire_free_pools`).
+    /// (but those of placed buffers) quarantined behind `self.queue` and every known title
+    /// queue's completion fence, then freed to `cooling` (`drain_quarantined`). Pools left all
+    /// free are not retired here: callers do that (`retire_free_pools`).
     unsafe fn flush_parked(&mut self) -> bool {
         if self.parked.is_empty() {
             return false;
         }
-        let now = std::time::Instant::now();
         let mut by_window: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
+        let mut tiles: Vec<(u32, u32)> = Vec::new();
         for (t, tile) in std::mem::take(&mut self.parked) {
             // (a placed buffer uses it)
             if self.pinned.contains_key(&tile) {
@@ -2516,9 +2800,11 @@ impl State {
             if let Some(wi) = self.window_index(t) {
                 by_window.entry(wi).or_default().push(t);
             }
-            self.cooling.push_back((tile, now));
+            tiles.push(tile);
         }
         if by_window.is_empty() {
+            // (nothing to unmap)
+            self.quarantine_tiles(tiles);
             return false;
         }
         for (wi, ts) in by_window {
@@ -2527,6 +2813,7 @@ impl State {
             self.unmap_tiles(&r, b, &ts);
         }
         self.signal();
+        self.quarantine_tiles(tiles);
         true
     }
 }
@@ -2736,6 +3023,9 @@ pub fn map_mirror(va: usize, len: usize) -> usize {
         return 0;
     }
     let queued = new.len();
+    if view_switches().stats {
+        VIEW_ASKED.fetch_add(queued as u64, Ordering::Relaxed);
+    }
     MIRROR_ASKS.lock().unwrap().extend(new);
     MIRROR_ASKING.store(true, Ordering::Release);
     queued
@@ -2905,9 +3195,31 @@ impl State {
             while let Some(&piece) = self.to_zero.range((w, 0)..(w + TILE, 0)).next() {
                 self.to_zero.remove(&piece);
             }
-            self.parked.insert(w, e.pool);
             self.mirrored -= 1;
+            self.give_back(w, e.pool);
+        }
+    }
+
+    /// The video memory `pool` of window tile `w` over a CPU view goes back (no longer counted in
+    /// `mirrored`): parked – or kept mapped there (`XCL_VIEW_KEEP`, `keep_view_tile`), to be taken
+    /// back as a parked tile is (`new_mirror`).
+    fn give_back(&mut self, w: usize, pool: (u32, u32)) {
+        if keep_view_tile(self.diag.keep, self.mirrored + 1 + self.kept.len(), self.mirror_cap) {
+            if self.diag.kept == 0 {
+                crate::xlog_info!("XCL_VIEW_KEEP: tiles over CPU views keep their video memory once filled ({} tiles at most)", self.mirror_cap);
+            }
+            self.kept.insert(w, pool);
+            self.diag.kept += 1;
+        } else {
+            self.parked.insert(w, pool);
             self.counts.given_back += 1;
+        }
+        if self.diag.stats {
+            // (a tile that never comes back is not kept for ever)
+            if self.diag.left_at.len() >= 1 << 20 {
+                self.diag.left_at.clear();
+            }
+            self.diag.left_at.insert(w, self.diag.submits);
         }
     }
 
@@ -2924,9 +3236,16 @@ impl State {
             self.mapped.insert(w, TileEntry { src, gen: next_gen(), ..TileEntry::with_holes(tile, holes) });
             self.to_zero.insert((w, TILE));
         } else {
-            let at_cap = !force && self.mirrored >= self.mirror_cap;
+            // (`XCL_VIEW_KEEP`: the tiles kept hold video memory too)
+            let held = self.mirrored + if self.diag.keep { self.kept.len() } else { 0 };
+            let at_cap = !force && held >= self.mirror_cap;
+            if at_cap && self.diag.keep && !self.kept.is_empty() {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| crate::xlog_warn!("XCL_VIEW_KEEP: {} tiles kept and {} with video memory reach the cap of {} (XCL_MIRROR_MB) – tiles are refused from here on, and read zeros", self.kept.len(), self.mirrored, self.mirror_cap));
+            }
             // (a moment after a heap could not be made, only tiles at hand: parked ones and those
-            // still cooling are not)
+            // still quarantined or cooling are not)
+            self.drain_quarantined();
             let at_hand = !self.free.is_empty() || cooled(&self.cooling, std::time::Instant::now()) || !self.retired.is_empty();
             let wait = at_cap || (!force && self.short_of_memory() && !at_hand);
             let got = if wait { None } else { self.take_tile() };
@@ -2953,6 +3272,12 @@ impl State {
         self.fill.push(w);
         self.mirrored += 1;
         self.counts.peak = self.counts.peak.max(self.mirrored);
+        if self.diag.stats {
+            if let Some(at) = self.diag.left_at.remove(&w) {
+                self.diag.back[back_bucket(self.diag.submits - at)] += 1;
+                self.diag.back_bytes += ((PAGES_PER_TILE - holes.count_ones() as usize) * PAGE) as u64;
+            }
+        }
         true
     }
 
@@ -3295,9 +3620,8 @@ impl State {
             for w in over {
                 let Some(pool) = self.mapped.get(&w).filter(|e| e.src == t).map(|e| e.pool) else { continue };
                 if !decommit_tiles(&mut self.mapped, &self.pinned, &mut Vec::new(), &mut self.to_zero, w + (lo - t), hi - lo).is_empty() {
-                    self.parked.insert(w, pool);
                     self.mirrored -= 1;
-                    self.counts.given_back += 1;
+                    self.give_back(w, pool);
                 }
             }
         }
@@ -3594,6 +3918,53 @@ pub fn tile_calls_line(now: &[u64; 8], before: &[u64; 8]) -> Option<String> {
     ))
 }
 
+/// The GPU-view diagnostics' counts (`VS`), all zero but the asks before there is a state.
+fn view_stats() -> [u64; VS] {
+    let mut x = [0u64; VS];
+    x[0] = VIEW_ASKED.load(Ordering::Relaxed);
+    let g = lock_state();
+    let Some(s) = g.as_ref() else { return x };
+    let d = &s.diag;
+    let rest = [s.counts.fills, s.counts.given_back, d.kept, d.back[0], d.back[1], d.back[2], d.back[3], d.back_bytes, d.submits, d.deferred];
+    x[1..VS_NOW].copy_from_slice(&rest);
+    let now = [s.mirrored, s.kept.len(), s.later.len() + s.asks.len(), s.refused.len()];
+    for (k, n) in now.into_iter().enumerate() {
+        x[VS_NOW + k] = n as u64;
+    }
+    x
+}
+
+/// The GPU-view diagnostics' line between two `view_stats`, None when nothing was counted.
+fn view_stats_line(now: &[u64; VS], before: &[u64; VS]) -> Option<String> {
+    let d: [u64; VS_NOW] = std::array::from_fn(|k| now[k].saturating_sub(before[k]));
+    if d.iter().all(|&n| n == 0) {
+        return None;
+    }
+    Some(format!(
+        "GPU-view tiles (2 s): {} asked for, {} filled, {} given back, {} kept; back after 0-1 / 2-8 / 9-64 / more submits: {} / {} / {} / {} ({:.1} MB filled again); {} of {} submits left asked tiles waiting; now {} with video memory, {} kept, {} waiting, {} refused",
+        d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8] as f64 / (1 << 20) as f64, d[10], d[9],
+        now[VS_NOW], now[VS_NOW + 1], now[VS_NOW + 2], now[VS_NOW + 3]
+    ))
+}
+
+/// `view_stats_line` every 2 s on a thread of its own (`ViewSwitches::stats`; once).
+fn start_view_stats() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let _ = std::thread::Builder::new().name("xcl-view-stats".into()).spawn(|| {
+            let mut before = view_stats();
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                let now = view_stats();
+                if let Some(line) = view_stats_line(&now, &before) {
+                    crate::xlog_info!("D3D12.X: {line}");
+                }
+                before = now;
+            }
+        });
+    });
+}
+
 /// The sparse lock split line of `x` (`LOCK_SPLIT`'s sums), as averages a submit.
 fn lock_split_line(x: &[u64; 11]) -> String {
     let n = x[LS_SUBMITS].max(1) as f64;
@@ -3644,6 +4015,10 @@ impl State {
         // back from `parked` needs none)
         s.remap_mirrors();
         s.map_mirrors();
+        s.diag.submits += 1;
+        if s.diag.stats && !(s.later.is_empty() && s.asks.is_empty()) {
+            s.diag.deferred += 1;
+        }
         s.mirror_writes(dirty, page);
         let t_views = stamp();
         // the title's work sees what was committed mapped …
@@ -3651,8 +4026,13 @@ impl State {
         PENDING.store(false, Ordering::Release);
         let t_map = stamp();
         // the title's work sees what was decommitted unmapped, as it was (pools whose last tiles
-        // cooled since go with no tile freed now too: those a flush frees still cool there)
-        if s.flush_parked() || retire_due(&s.cooling, !s.retired.is_empty(), s.retire_tried, std::time::Instant::now()) {
+        // cooled since go with no tile freed now too: those a flush frees wait for the GPU in
+        // `quarantined`, then still cool there: `retire_due` sees them). This queue's work so far
+        // is waited for too.
+        s.note_queue(queue);
+        let flushed = s.flush_parked();
+        s.drain_quarantined();
+        if flushed || retire_due(&s.cooling, !s.retired.is_empty(), s.retire_tried, std::time::Instant::now()) {
             s.retire_free_pools();
         }
         let t_locked = std::time::Instant::now();
@@ -3763,6 +4143,9 @@ impl State {
         if !dirty_runs.is_empty() {
             s.upload_dirty(&dirty_runs);
         }
+        if s.poison.as_ref().is_some_and(|p| p.at.elapsed() >= std::time::Duration::from_millis(16)) {
+            s.refresh_poison();
+        }
         PHASES[2].fetch_add(t_scanned.elapsed().as_micros() as u64, Ordering::Relaxed);
         {
             static CALLS: AtomicU64 = AtomicU64::new(0);
@@ -3844,6 +4227,8 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
     let tiles = s.buffer_tiles(start, delta + bytes);
     let raw = *ppv;
     let res = ID3D12Resource::from_raw_borrowed(&raw)?.clone();
+    // (`XCL_VIEW_POISON`: its tiles without video memory show the poison tile as the window's do)
+    s.poison_all(&res, (delta + bytes).div_ceil(TILE) as u32);
     s.map_tiles(&res, start, &tiles);
     for &(_, tile) in &tiles {
         *s.pinned.entry(tile).or_default() += 1;
@@ -4168,6 +4553,8 @@ mod tests {
                 parked: FxHashMap::default(),
                 kept: FxHashMap::default(),
                 pending: Vec::new(),
+                quarantined: VecDeque::new(),
+                queue_fences: FxHashMap::default(),
                 buffers: FxHashMap::default(),
                 to_zero: BTreeSet::new(),
                 staging: None,
@@ -4200,6 +4587,8 @@ mod tests {
                 refused: FxHashSet::default(),
                 no_memory: None,
                 counts: MirrorCounts::default(),
+                diag: ViewDiag::default(),
+                poison: None,
             };
             s.commit_range(base, TILE);
             assert!(s.mapped.contains_key(&base));
@@ -4455,6 +4844,8 @@ mod tests {
                 pending: Vec::new(),
                 mapped: FxHashMap::default(),
                 pinned: FxHashMap::default(),
+                quarantined: VecDeque::new(),
+                queue_fences: FxHashMap::default(),
                 buffers: FxHashMap::default(),
                 to_zero: BTreeSet::new(),
                 staging: None,
@@ -4487,6 +4878,8 @@ mod tests {
                 refused: FxHashSet::default(),
                 no_memory: None,
                 counts: MirrorCounts::default(),
+                diag: ViewDiag::default(),
+                poison: None,
             };
 
             let (first, reused) = s.take_tile().expect("a tile from a new pool");
@@ -4687,6 +5080,8 @@ mod tests {
                 parked: FxHashMap::default(),
                 kept: FxHashMap::default(),
                 pending: Vec::new(),
+                quarantined: VecDeque::new(),
+                queue_fences: FxHashMap::default(),
                 buffers: FxHashMap::default(),
                 to_zero: BTreeSet::new(),
                 staging: None,
@@ -4719,6 +5114,8 @@ mod tests {
                 refused: FxHashSet::default(),
                 no_memory: None,
                 counts: MirrorCounts::default(),
+                diag: ViewDiag::default(),
+                poison: None,
             };
 
             // Mirrors `place_buffer`: map both tiles probing real OS page commitment.
@@ -4808,6 +5205,8 @@ mod tests {
                 parked: FxHashMap::default(),
                 kept: FxHashMap::default(),
                 pending: Vec::new(),
+                quarantined: VecDeque::new(),
+                queue_fences: FxHashMap::default(),
                 buffers: FxHashMap::default(),
                 to_zero: BTreeSet::new(),
                 staging: None,
@@ -4840,6 +5239,8 @@ mod tests {
                 refused: FxHashSet::default(),
                 no_memory: None,
                 counts: MirrorCounts::default(),
+                diag: ViewDiag::default(),
+                poison: None,
             };
 
             s.commit_range(base, TILE);
@@ -4873,13 +5274,18 @@ mod tests {
             assert_eq!(s.value, v, "no tile mapping changed");
             assert!(mapped_gen() > gen, "readers of `mapped` see it changed");
 
-            // decommitted and flushed (as before a submit): unmapped and cooling, not free yet
+            // decommitted and flushed (as before a submit): unmapped and quarantined until the
+            // unmap fence completes, then cooling, not free yet
             s.decommit_range(base, TILE);
             assert!(s.flush_parked());
             assert!(s.parked.is_empty());
-            assert!(s.cooling.iter().any(|c| c.0 == tile) && !s.free.contains(&tile));
+            assert!(s.quarantined.iter().any(|b| b.tiles.contains(&tile)));
+            assert!(!s.cooling.iter().any(|c| c.0 == tile) && !s.free.contains(&tile));
             assert!(s.value > v, "the unmapping is sent");
             assert!(!s.flush_parked(), "nothing left to flush");
+            s.wait_for(s.value);
+            assert!(s.drain_quarantined());
+            assert!(s.cooling.iter().any(|c| c.0 == tile) && !s.free.contains(&tile));
 
             // no free tile left: neither the parked tile (mapped at its address until the next
             // flush) nor the one cooling is taken for the next commit, but a new pool's. Before,
@@ -4895,6 +5301,9 @@ mod tests {
             assert_ne!(tile.0, parked.0, "a tile of a new pool");
             assert!(!s.mapped.contains_key(&base));
             assert!(s.flush_parked());
+            assert!(!s.cooling.iter().any(|c| c.0 == parked), "unmapped at the flush, quarantined");
+            s.wait_for(s.value);
+            assert!(s.drain_quarantined());
             assert_eq!(s.cooling.back().map(|c| c.0), Some(parked), "unmapped at the flush, then cooling");
 
             // a placed buffer uses the tile: the window keeps it when it is decommitted and
@@ -4930,6 +5339,8 @@ mod tests {
             s.release_if_unused(at, tile);
             assert!(s.kept.is_empty() && !s.cooling.iter().any(|c| c.0 == tile));
             assert!(s.flush_parked());
+            s.wait_for(s.value);
+            assert!(s.drain_quarantined());
             assert!(s.cooling.iter().any(|c| c.0 == tile) && !s.free.contains(&tile));
 
             assert_eq!(s.runs, runs_of(&s));
@@ -4958,6 +5369,131 @@ mod tests {
             assert_eq!(s.runs, runs_of(&s), "a tile with pages left stays");
             s.flush_pending();
 
+            s.wait_for(s.value);
+            drop(s);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    struct SignalOnDrop(ID3D12Fence, u64);
+
+    impl Drop for SignalOnDrop {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = self.0.Signal(self.1);
+            }
+        }
+    }
+
+    unsafe fn test_state_with_reserved(tiles: usize) -> (usize, State) {
+        use windows_sys::Win32::System::Memory::MEM_RESERVE;
+
+        let dev = test_device();
+        let base = VirtualAlloc(std::ptr::null(), tiles * TILE, MEM_RESERVE, PAGE_NOACCESS) as usize;
+        assert!(base != 0 && base % TILE == 0);
+        let mut reserved: Option<ID3D12Resource> = None;
+        dev.CreateReservedResource(&buffer_desc((tiles * TILE) as u64), D3D12_RESOURCE_STATE_COMMON, None, &mut reserved)
+            .expect("CreateReservedResource");
+        let reserved = reserved.expect("reserved buffer");
+        let s = new_state(&dev, vec![(base, reserved)]).expect("state");
+        (base, s)
+    }
+
+    /// The tiles `flush_parked` quarantined, once the sparse queue and the title queues are past
+    /// them (`drain_quarantined`), waited for up to 5 s.
+    unsafe fn settle_quarantined(s: &mut State) {
+        s.wait_for(s.value);
+        let start = std::time::Instant::now();
+        while !s.quarantined.is_empty() && start.elapsed() < std::time::Duration::from_secs(5) {
+            if !s.drain_quarantined() {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    }
+
+    /// `flush_parked` must keep unmapped pool tiles out of `free` (and `take_tile` must not reuse
+    /// them) while the sparse queue's unmap fence is still in flight on the GPU.
+    #[test]
+    fn flush_parked_does_not_free_or_reuse_tiles_while_unmap_is_in_flight() {
+        use windows_sys::Win32::System::Memory::MEM_RELEASE;
+
+        unsafe {
+            let (base, mut s) = test_state_with_reserved(2);
+            s.commit_range(base, TILE);
+            let tile = s.mapped[&base].pool;
+            s.wait_for(s.value);
+
+            let gate: ID3D12Fence = s.dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("gate fence");
+            let _unblock = SignalOnDrop(gate.clone(), 1);
+            s.queue.Wait(&gate, 1).expect("gate sparse queue");
+
+            s.decommit_range(base, TILE);
+            s.free.clear();
+            assert!(s.flush_parked());
+            assert!(
+                !s.free.contains(&tile) && !s.cooling.iter().any(|c| c.0 == tile),
+                "unmapped tile must remain quarantined until unmap fence completes"
+            );
+
+            // While the unmap is still blocked on `gate`, committing another tile must not steal `tile`.
+            s.commit_range(base + TILE, TILE);
+            assert_ne!(s.mapped[&(base + TILE)].pool, tile, "in-flight unmapped tile must not be reused before GPU completion");
+
+            gate.Signal(1).expect("release sparse queue");
+            s.wait_for(s.value);
+            assert!(s.drain_quarantined(), "completed unmap batch should drain after fence completion");
+            assert!(
+                s.cooling.iter().any(|c| c.0 == tile) && !s.free.contains(&tile),
+                "unmapped tile must go on to cool (`cooling`) once unmap fence completes"
+            );
+            drop(_unblock);
+            s.wait_for(s.value);
+            drop(s);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    /// `flush_parked` must keep unmapped pool tiles quarantined until every active title queue has
+    /// finished its prior work, even after `s.queue` itself finishes unmapping.
+    #[test]
+    fn flush_parked_quarantines_tiles_until_title_queues_finish() {
+        use windows_sys::Win32::System::Memory::MEM_RELEASE;
+
+        unsafe {
+            let (base, mut s) = test_state_with_reserved(2);
+            let title_q: ID3D12CommandQueue = s.dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("title queue");
+            assert!(s.note_queue(&title_q));
+
+            s.commit_range(base, TILE);
+            let tile = s.mapped[&base].pool;
+            s.wait_for(s.value);
+
+            let title_gate: ID3D12Fence = s.dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("title gate fence");
+            let _unblock = SignalOnDrop(title_gate.clone(), 1);
+            title_q.Wait(&title_gate, 1).expect("gate title queue");
+
+            s.decommit_range(base, TILE);
+            s.free.clear();
+            assert!(s.flush_parked());
+
+            // Even after `s.queue` finishes `unmap_tiles`, `title_q` is still gated behind `title_gate`.
+            s.wait_for(s.value);
+            assert!(!s.drain_quarantined(), "tile must remain quarantined while title queue has work in flight");
+            assert!(!s.free.contains(&tile) && !s.cooling.iter().any(|c| c.0 == tile));
+
+            s.commit_range(base + TILE, TILE);
+            assert_ne!(s.mapped[&(base + TILE)].pool, tile, "must not reuse tile still in use by title queue");
+
+            title_gate.Signal(1).expect("release title queue");
+            let start = std::time::Instant::now();
+            while !s.drain_quarantined() && start.elapsed() < std::time::Duration::from_secs(5) {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            assert!(
+                s.cooling.iter().any(|c| c.0 == tile) && !s.free.contains(&tile),
+                "tile must go on to cool (`cooling`) after title queue completes"
+            );
+            drop(_unblock);
             s.wait_for(s.value);
             drop(s);
             assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
@@ -6240,6 +6776,91 @@ mod tests {
         );
     }
 
+    /// The GPU-view diagnostics: the poison pattern a switch names, the keep decision within the
+    /// cap, the buckets of the submits a tile was away, and the line of the counts since the last.
+    #[test]
+    fn view_diag_switches_buckets_and_line() {
+        assert_eq!(poison_pattern(None), None);
+        assert_eq!(poison_pattern(Some("1")), Some(0x7FC0_DEAD));
+        assert_eq!(poison_pattern(Some("0x0000BEEF")), Some(0xBEEF));
+        assert_eq!(poison_pattern(Some("0x0")), None, "a zero pattern is no poison");
+        assert_eq!(poison_pattern(Some("0xnope")), None);
+        assert!(!keep_view_tile(false, 1, 10), "off: given back");
+        assert!(keep_view_tile(true, 10, 10), "at the cap with this tile: kept");
+        assert!(!keep_view_tile(true, 11, 10), "past it (a placed buffer's tiles): given back");
+        let buckets: Vec<usize> = [0, 1, 2, 8, 9, 64, 65, u64::MAX].into_iter().map(back_bucket).collect();
+        assert_eq!(buckets, vec![0, 0, 1, 1, 2, 2, 3, 3]);
+        let mut before = [0u64; VS];
+        before[VS_NOW] = 5;
+        assert_eq!(view_stats_line(&before, &before), None, "nothing counted: no line");
+        let mut now = [7, 3, 2, 1, 4, 0, 1, 0, 3 << 19, 20, 6, 9, 1, 12, 0];
+        for (n, b) in now.iter_mut().zip(before.iter_mut()).take(VS_NOW) {
+            *b = 1;
+            *n += 1;
+        }
+        assert_eq!(
+            view_stats_line(&now, &before).as_deref(),
+            Some("GPU-view tiles (2 s): 7 asked for, 3 filled, 2 given back, 1 kept; back after 0-1 / 2-8 / 9-64 / more submits: 4 / 0 / 1 / 0 (1.5 MB filled again); 6 of 20 submits left asked tiles waiting; now 9 with video memory, 1 kept, 12 waiting, 0 refused")
+        );
+    }
+
+    /// `XCL_VIEW_KEEP`: a tile whose CPU view is decommitted stays mapped where it is (kept, not
+    /// parked, so no submit unmaps it), and is taken back from there once its CPU tile is written
+    /// again, counted in the bucket of the submits it was away.
+    #[test]
+    fn a_kept_tile_stays_mapped_and_comes_back() {
+        unsafe {
+            let Some(mut v) = Views::new(191) else { return crate::gpu::recomp::runner::skip_test("no reserved buffers") };
+            let (w, c) = (v.w, v.c);
+            (v.s.diag.keep, v.s.diag.stats) = (true, true);
+            v.commit(0, 1);
+            v.write(0, 1, 9);
+            v.s.asks.push(w);
+            v.s.map_mirrors();
+            v.submit(&[]);
+            let pool = v.s.mapped[&w].pool;
+            v.s.source_decommitted_in(c, TILE);
+            assert_ne!(VirtualFree(c as *mut c_void, TILE, MEM_DECOMMIT), 0);
+            assert_eq!((v.s.kept.get(&w), v.s.parked.get(&w)), (Some(&pool), None));
+            assert_eq!((v.s.mirrored, v.s.counts.given_back, v.s.diag.kept), (0, 0, 1));
+            v.submit(&[]);
+            assert_eq!(v.s.kept.get(&w), Some(&pool), "no submit unmaps it");
+            v.commit(0, 1);
+            *((c + 5 * PAGE) as *mut u8) = 1;
+            v.s.mirror_writes(&[c + 5 * PAGE], PAGE);
+            assert_eq!((v.s.mapped[&w].pool, v.s.kept.get(&w)), (pool, None), "back from kept");
+            assert_eq!((v.s.diag.back, v.s.diag.back_bytes), ([1, 0, 0, 0], TILE as u64), "away one submit");
+            v.submit(&[c + 5 * PAGE]);
+        }
+    }
+
+    /// `XCL_VIEW_POISON`: a tile of the window without video memory reads the pattern, one with
+    /// it what was filled there, and one given back the pattern again once a submit unmaps it.
+    #[test]
+    fn a_tile_without_video_memory_reads_the_poison() {
+        unsafe {
+            let Some(mut v) = Views::new(193) else { return crate::gpu::recomp::runner::skip_test("no reserved buffers") };
+            let (w, c) = (v.w, v.c);
+            v.s.poison_windows(0x7FC0_DEAD);
+            assert!(v.s.poison.is_some(), "a poison tile");
+            let buf = v.buf.clone();
+            let poison: Vec<u8> = std::iter::repeat_n(0x7FC0_DEADu32.to_le_bytes(), 8).flatten().collect();
+            assert_eq!(v.gpu_bytes(&buf, 0, 32), poison);
+            assert_eq!(v.gpu_bytes(&buf, 192 * TILE + 0x40, 32), poison, "every tile");
+            v.commit(0, 1);
+            v.write(0, 1, 11);
+            v.s.asks.push(w);
+            v.s.map_mirrors();
+            v.submit(&[]);
+            assert_eq!(v.gpu_bytes(&buf, 0, 32), v.cpu_tile(0)[..32].to_vec(), "filled");
+            assert_eq!(v.gpu_bytes(&buf, TILE, 32), poison, "the next tile still has none");
+            v.s.source_decommitted_in(c, TILE);
+            assert_ne!(VirtualFree(c as *mut c_void, TILE, MEM_DECOMMIT), 0);
+            v.submit(&[]);
+            assert_eq!(v.gpu_bytes(&buf, 0, 32), poison, "given back");
+        }
+    }
+
     /// A pool goes when all its tiles are free or cooled: one with a tile still cooling stays.
     #[test]
     fn a_pool_with_a_tile_still_cooling_is_not_retired() {
@@ -6272,6 +6893,8 @@ mod tests {
             v.s.forget_mirrors_in(c, c + TILE);
             assert_eq!(v.s.parked.get(&w), Some(&pool));
             v.submit(&[]);
+            // (unmapped at the submit, and quarantined until the GPU is past it)
+            settle_quarantined(&mut v.s);
             assert_eq!(v.s.cooling.iter().map(|t| t.0).collect::<Vec<_>>(), vec![pool], "unmapped, cooling");
             v.s.asks.push(w + TILE);
             v.submit(&[]);
@@ -6318,6 +6941,8 @@ mod tests {
             let pool = v.s.mapped[&w].pool;
             v.s.forget_mirrors_in(c, c + TILE);
             v.submit(&[]);
+            // (unmapped at the submit, and quarantined until the GPU is past it)
+            settle_quarantined(&mut v.s);
             assert_eq!(v.s.cooling.iter().map(|t| t.0).collect::<Vec<_>>(), vec![pool], "unmapped, cooling");
             assert!(v.s.pools[pool.0 as usize].is_some(), "its last tile is cooling");
             v.submit(&[]);

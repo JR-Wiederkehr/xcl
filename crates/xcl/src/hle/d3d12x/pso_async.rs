@@ -5,7 +5,8 @@
 //! (`SetPipelineState`, console list replay, the two-pass lookups) uses the real one as soon
 //! as it is there. A lazy pipeline (`lazy`) is built at its first use or ahead of it
 //! (`Backlog`: every one, at the lowest priority). A draw or dispatch with a pipeline
-//! still being built waits for it (`resolve_wait`): a dispatch until it is built (a skipped one
+//! still being built waits for it (`resolve_wait`) where it is used, a `Dispatch` at its submit
+//! (`waits_for`, `need_by_submit`): a dispatch until it is built (a skipped one
 //! corrupts what it computes) unless `XCL_CS_PSO_WAIT_MS` limits that, a draw only while its
 //! thread has waited less than `XCL_GFX_PSO_WAIT_MS` in the last second when that is set
 //! (`gfx_wait_left`) – then it and
@@ -59,6 +60,10 @@ struct Demand {
     /// binds waiting for it: a wait that ran out of its budget leaves (`Pending::unwant`), one
     /// that saw the build end stays counted
     waiters: u32,
+    /// a call put off to the submit needs it (`need_by_submit`)
+    by_submit: bool,
+    /// a submit counts among `waiters` before it gets to it (`want`; left with the wait for it)
+    ahead: bool,
     /// thread id of the preload worker (lowest priority) building it, 0 = none
     preload_thread: u32,
 }
@@ -169,10 +174,13 @@ impl Pending {
     /// One of the title's threads is about to wait for it: the worker building it goes on now,
     /// at a normal priority.
     fn want(&self) {
-        let mut d = self.demand.lock().unwrap();
+        Self::add_waiter(&mut self.demand.lock().unwrap());
+    }
+
+    fn add_waiter(d: &mut Demand) {
         d.waiters += 1;
         if d.waiters == 1 {
-            Self::set_priority(&d, windows_sys::Win32::System::Threading::THREAD_PRIORITY_NORMAL);
+            Self::set_priority(d, windows_sys::Win32::System::Threading::THREAD_PRIORITY_NORMAL);
         }
     }
 
@@ -186,6 +194,15 @@ impl Pending {
         d.waiters = d.waiters.saturating_sub(1);
         if d.waiters == 0 {
             Self::set_priority(&d, windows_sys::Win32::System::Threading::THREAD_PRIORITY_LOWEST);
+        }
+    }
+
+    /// The wait that ran out of its budget was the one a submit had counted ahead (`want`): that
+    /// one leaves too.
+    fn unwant_ahead(&self) {
+        let ahead = std::mem::take(&mut self.demand.lock().unwrap().ahead);
+        if ahead {
+            self.unwant();
         }
     }
 
@@ -320,6 +337,7 @@ fn start_stats() {
     STARTED.call_once(|| {
         let _ = std::thread::Builder::new().name("xcl-pso-stats".into()).spawn(|| {
             let mut last = Stats::default();
+            let mut last_put_off = PutOffStats::default();
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(2));
                 let now = stats();
@@ -327,9 +345,137 @@ fn start_stats() {
                     crate::xlog_info!("{line}");
                 }
                 last = now;
+                let now = put_off_stats();
+                if let Some(line) = put_off_line(&now, &last_put_off) {
+                    crate::xlog_info!("{line}");
+                }
+                last_put_off = now;
             }
         });
     });
+}
+
+/// What became of a call put off to the submit (`list_x::defer`), for the line of them
+/// (`put_off_line`).
+#[derive(Clone, Copy)]
+pub(super) enum PutOff {
+    /// put off: its list split around it
+    Deferred,
+    /// its pipeline would have been waited for, but the list could not be split (no room for
+    /// more segments, a predicated or bundle list, one that is no title list, `XCL_ALLOC_SWAP=0`):
+    /// waited in the call
+    Refused,
+    /// recorded at a submit with its pipeline built
+    Recorded,
+    /// recorded at a submit, but its pipeline's build failed or ran out of its budget: skipped
+    Skipped,
+    /// not recorded at the submit (no allocator of the list's own, its Reset failed)
+    Dropped,
+}
+
+static PUT_OFF: [AtomicUsize; 5] = [const { AtomicUsize::new(0) }; 5];
+/// pipelines a put-off call needed (`need_by_submit`); of them built by a worker before its queue
+static NEEDED_MADE: AtomicUsize = AtomicUsize::new(0);
+static NEEDED_FIRST: AtomicUsize = AtomicUsize::new(0);
+/// builds a thread that waits for the pipeline ran itself (`resolve_wait_for`); of them at a submit
+static BUILT_HERE: AtomicUsize = AtomicUsize::new(0);
+static BUILT_AT_SUBMIT: AtomicUsize = AtomicUsize::new(0);
+/// waits at a submit for the pipelines of its put-off calls: count, µs
+static SUBMIT_WAITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SUBMIT_WAIT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(super) fn note_put_off(what: PutOff) {
+    PUT_OFF[what as usize].fetch_add(1, Ordering::Relaxed);
+    start_stats();
+}
+
+thread_local! {
+    /// this thread records the put-off calls of a submit (`at_submit`)
+    static AT_SUBMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// While it lives this thread records a submit's put-off calls: its waits for their pipelines,
+/// and the builds it runs itself, are the submit's (`put_off_line`).
+pub(super) struct AtSubmit(bool);
+
+pub(super) fn at_submit() -> AtSubmit {
+    AtSubmit(AT_SUBMIT.with(|a| a.replace(true)))
+}
+
+impl Drop for AtSubmit {
+    fn drop(&mut self) {
+        AT_SUBMIT.with(|a| a.set(self.0));
+    }
+}
+
+pub(super) fn is_at_submit() -> bool {
+    AT_SUBMIT.with(|a| a.get())
+}
+
+/// How many put-off calls came to `what` so far.
+#[cfg(test)]
+pub(super) fn put_off_count(what: PutOff) -> usize {
+    PUT_OFF[what as usize].load(Ordering::Relaxed)
+}
+
+/// What the line of put-off calls (`put_off_line`) shows.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+struct PutOffStats {
+    /// by `PutOff`
+    calls: [usize; 5],
+    needed: usize,
+    needed_first: usize,
+    built_here: usize,
+    built_at_submit: usize,
+    /// every background build that ended (built or failed)
+    builds: usize,
+    /// waits at submits: (count, µs)
+    waits: (u64, u64),
+    /// the most segments a title list's recording had (`title_list::segments_peak`)
+    segments: usize,
+}
+
+fn put_off_stats() -> PutOffStats {
+    let l = |a: &AtomicUsize| a.load(Ordering::Relaxed);
+    PutOffStats {
+        calls: std::array::from_fn(|k| l(&PUT_OFF[k])),
+        needed: l(&NEEDED_MADE),
+        needed_first: l(&NEEDED_FIRST),
+        built_here: l(&BUILT_HERE),
+        built_at_submit: l(&BUILT_AT_SUBMIT),
+        builds: l(&BUILT) + l(&FAILED),
+        waits: (SUBMIT_WAITS.load(Ordering::Relaxed), SUBMIT_WAIT_US.load(Ordering::Relaxed)),
+        segments: super::title_list::segments_peak(),
+    }
+}
+
+/// The line of calls put off to the submit for `now` when it changed since `last` (written 2 s
+/// before) and some call was put off or would have been: how many, what became of them at the
+/// submits, the pipelines they needed and where those were built, and how long submits stood
+/// in their waits for them.
+fn put_off_line(now: &PutOffStats, last: &PutOffStats) -> Option<String> {
+    let c = |k: PutOff| now.calls[k as usize];
+    if now == last || c(PutOff::Deferred) + c(PutOff::Refused) == 0 {
+        return None;
+    }
+    Some(format!(
+        "D3D12.X: put-off dispatches: {} put off to the submit ({} in 2 s), {} waited in the call (no split); at submits {} recorded, {} skipped (build failed or late), {} dropped; {} pipelines needed by a submit ({} built by a worker before its queue); submits waited {} ms for them in 2 s ({} waits; {} ms so far); {} builds of {} on threads that waited for them ({} at a submit); at most {} segments in a recording",
+        c(PutOff::Deferred),
+        c(PutOff::Deferred) - last.calls[PutOff::Deferred as usize],
+        c(PutOff::Refused),
+        c(PutOff::Recorded),
+        c(PutOff::Skipped),
+        c(PutOff::Dropped),
+        now.needed,
+        now.needed_first,
+        (now.waits.1 - last.waits.1) / 1000,
+        now.waits.0 - last.waits.0,
+        now.waits.1 / 1000,
+        now.built_here,
+        now.builds,
+        now.built_at_submit,
+        now.segments,
+    ))
 }
 /// binds waiting right now for a pipeline still being built (`title_held`)
 static HELD: AtomicUsize = AtomicUsize::new(0);
@@ -339,43 +485,55 @@ static HELD: AtomicUsize = AtomicUsize::new(0);
 struct PcCalls {
     /// (id, when it began)
     now: Vec<(u64, std::time::Instant)>,
-    /// the frames shown when `spent` began to count
-    frame: u64,
+    /// the frames shown when `spent` began to count (`None` before the first observation)
+    frame: Option<u64>,
+    /// when the latest frame advance was first observed; calls that started earlier are clamped here
+    frame_since: Option<std::time::Instant>,
     /// the time of the PC calls that ended since then
     spent: std::time::Duration,
 }
 
 impl PcCalls {
     const fn new() -> Self {
-        Self { now: Vec::new(), frame: 0, spent: std::time::Duration::ZERO }
+        Self { now: Vec::new(), frame: None, frame_since: None, spent: std::time::Duration::ZERO }
     }
 
     /// `frame` frames have been shown: the calls before the last of them are not this wait's.
-    fn at(&mut self, frame: u64) {
-        if frame != self.frame {
-            self.frame = frame;
-            self.spent = std::time::Duration::ZERO;
+    fn at(&mut self, frame: u64, now: std::time::Instant) {
+        match self.frame {
+            None => self.frame = Some(frame),
+            Some(prev) if frame > prev => {
+                self.frame = Some(frame);
+                self.frame_since = Some(now);
+                self.spent = std::time::Duration::ZERO;
+            }
+            Some(_) => {}
         }
     }
 
-    fn begin(&mut self, id: u64, now: std::time::Instant) {
+    fn clamp(&self, since: std::time::Instant) -> std::time::Instant {
+        self.frame_since.map_or(since, |f| since.max(f))
+    }
+
+    fn begin(&mut self, id: u64, frame: u64, now: std::time::Instant) {
+        self.at(frame, now);
         self.now.push((id, now));
     }
 
     fn end(&mut self, id: u64, frame: u64, now: std::time::Instant) {
-        self.at(frame);
+        self.at(frame, now);
         if let Some(i) = self.now.iter().position(|c| c.0 == id) {
             let (_, since) = self.now.swap_remove(i);
-            self.spent += now.saturating_duration_since(since);
+            self.spent += now.saturating_duration_since(self.clamp(since));
         }
     }
 
     /// Whether a call going on holds the title: the PC calls since the last frame, it included,
     /// have taken `PC_CALL_HOLDS_AFTER`.
     fn holds(&mut self, frame: u64, now: std::time::Instant) -> bool {
-        self.at(frame);
+        self.at(frame, now);
         let spent = self.spent;
-        self.now.iter().any(|(_, since)| spent + now.saturating_duration_since(*since) >= PC_CALL_HOLDS_AFTER)
+        self.now.iter().any(|(_, since)| spent + now.saturating_duration_since(self.clamp(*since)) >= PC_CALL_HOLDS_AFTER)
     }
 }
 
@@ -407,7 +565,7 @@ pub struct PcCall(u64);
 pub fn pc_call() -> PcCall {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
-    PC_CALLS.lock().unwrap().begin(id, std::time::Instant::now());
+    PC_CALLS.lock().unwrap().begin(id, super::present::presents(), std::time::Instant::now());
     PcCall(id)
 }
 
@@ -445,6 +603,29 @@ pub fn enabled() -> bool {
 /// Builds the real pipeline: its raw pointer, 0 = failed.
 pub type Job = Box<dyn FnOnce() -> usize + Send>;
 
+/// pipelines a submit will wait for: the workers take these before their queue (`need_by_submit`)
+static NEEDED: Mutex<std::collections::VecDeque<Arc<Pending>>> = Mutex::new(std::collections::VecDeque::new());
+
+fn next_needed() -> Option<Arc<Pending>> {
+    NEEDED.lock().unwrap().pop_front()
+}
+
+/// Drop an unstarted orphaned job outside all locks and wake any concurrent waiter.
+fn drop_unstarted_job(p: &Pending) {
+    let job = p.job.lock().unwrap().take();
+    if let Some(job) = job {
+        {
+            let mut done = p.done.lock().unwrap();
+            *done = true;
+            p.cv.notify_all();
+        }
+        drop(job);
+        // (its translation ahead is of no use either, as in `complete`: the backlog may hold
+        // the entry a while yet)
+        drop(p.warm.lock().unwrap().take());
+    }
+}
+
 type Work = Box<dyn FnOnce() + Send>;
 
 fn queue() -> &'static Mutex<mpsc::Sender<Work>> {
@@ -459,6 +640,11 @@ fn queue() -> &'static Mutex<mpsc::Sender<Work>> {
             let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || loop {
                 let next = rx.lock().unwrap().recv();
                 let Ok(work) = next else { return };
+                while let Some(p) = next_needed() {
+                    if build_queued(&p) {
+                        NEEDED_FIRST.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
                 work();
             });
         }
@@ -468,17 +654,22 @@ fn queue() -> &'static Mutex<mpsc::Sender<Work>> {
 
 fn enqueue(p: Arc<Pending>) {
     let _ = queue().lock().unwrap().send(Box::new(move || {
-        // (released by the title meanwhile)
-        if p.orphan.load(Ordering::Acquire) {
-            let _ = p.job.lock().unwrap().take();
-            return;
-        }
-        // (None: a bind took it and builds it itself)
-        let job = p.job.lock().unwrap().take();
-        if let Some(job) = job {
-            build(&p, job, false);
-        }
+        build_queued(&p);
     }));
+}
+
+/// Whether this worker built `p` (not: released, or another thread took the build).
+fn build_queued(p: &Arc<Pending>) -> bool {
+    // (released by the title meanwhile)
+    if p.orphan.load(Ordering::Acquire) {
+        drop_unstarted_job(p);
+        return false;
+    }
+    // (None: a bind took it and builds it itself)
+    let job = p.job.lock().unwrap().take();
+    let Some(job) = job else { return false };
+    build(p, job, false);
+    true
 }
 
 /// This thread is a backlog worker whose build nobody waits for (yet).
@@ -633,6 +824,18 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64, warm
     }
 }
 
+/// The shaders of a pipeline's set, told when the set's key is made (`real::OwnedDesc`).
+pub(crate) fn shaders_of(key: u64, shaders: Vec<u64>) {
+    used::parts(key, shaders);
+}
+
+/// The shaders of the pipelines earlier runs used, each by its own key (`used-shaders.txt`
+/// beside the DXIL cache): what a title's shader preparation translates. Empty before a run
+/// with this list has used a pipeline.
+pub fn earlier_used_shaders() -> std::collections::HashSet<u64> {
+    used::parse(&std::fs::read_to_string(crate::gpu::recomp::dxc::cache_dir().join("used-shaders.txt")).unwrap_or_default())
+}
+
 /// The keys of the pipelines earlier runs used (`used-pipelines.txt` beside the DXIL cache):
 /// what `xcl shaders --precompile --used-only` builds.
 pub fn earlier_used_keys() -> std::collections::HashSet<u64> {
@@ -656,6 +859,10 @@ mod used {
     struct Used {
         earlier: RwLock<HashSet<u64>>,
         now: Mutex<(HashSet<u64>, Option<std::fs::File>)>,
+        /// the shaders of each set made in this run, by the set's key; the shaders of the sets
+        /// used so far and `used-shaders.txt`, where they are kept for the next run
+        parts: Mutex<std::collections::HashMap<u64, Vec<u64>>>,
+        shaders: Mutex<(HashSet<u64>, Option<std::fs::File>)>,
     }
 
     /// The keys in a `used-pipelines.txt` (lines that are not a hexadecimal key are passed over).
@@ -668,7 +875,7 @@ mod used {
         U.get_or_init(|| {
             // (a test neither reads nor writes the user's file)
             if cfg!(test) {
-                return Used { earlier: RwLock::new(HashSet::new()), now: Mutex::new((HashSet::new(), None)) };
+                return Used { earlier: RwLock::new(HashSet::new()), now: Mutex::new((HashSet::new(), None)), parts: Default::default(), shaders: Mutex::new((HashSet::new(), None)) };
             }
             let path = crate::gpu::recomp::dxc::cache_dir().join("used-pipelines.txt");
             let earlier = parse(&std::fs::read_to_string(&path).unwrap_or_default());
@@ -679,7 +886,10 @@ mod used {
                 let _ = std::fs::create_dir_all(dir);
             }
             let file = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok();
-            Used { now: Mutex::new((earlier.clone(), file)), earlier: RwLock::new(earlier) }
+            let shaders_path = path.with_file_name("used-shaders.txt");
+            let shaders = parse(&std::fs::read_to_string(&shaders_path).unwrap_or_default());
+            let shaders_file = std::fs::OpenOptions::new().create(true).append(true).open(&shaders_path).ok();
+            Used { now: Mutex::new((earlier.clone(), file)), earlier: RwLock::new(earlier), parts: Default::default(), shaders: Mutex::new((shaders, shaders_file)) }
         })
     }
 
@@ -693,12 +903,38 @@ mod used {
         if key == 0 {
             return;
         }
-        let mut g = get().now.lock().unwrap();
-        if g.0.insert(key) {
-            if let Some(f) = g.1.as_mut() {
-                let _ = writeln!(f, "{key:016x}");
+        {
+            let mut g = get().now.lock().unwrap();
+            if g.0.insert(key) {
+                if let Some(f) = g.1.as_mut() {
+                    let _ = writeln!(f, "{key:016x}");
+                }
             }
         }
+        // its shaders, each once (also those of a set an earlier run used: the list of
+        // shaders is younger than the list of sets)
+        let parts = get().parts.lock().unwrap().get(&key).cloned().unwrap_or_default();
+        let mut g = get().shaders.lock().unwrap();
+        for part in parts {
+            if g.0.insert(part) {
+                if let Some(f) = g.1.as_mut() {
+                    let _ = writeln!(f, "{part:016x}");
+                }
+            }
+        }
+    }
+
+    /// The shaders of the set `key`, each by its own key (`real::shader_key`).
+    pub fn parts(key: u64, shaders: Vec<u64>) {
+        if key != 0 {
+            get().parts.lock().unwrap().entry(key).or_insert(shaders);
+        }
+    }
+
+    /// (tests) This run used the shader `key`.
+    #[cfg(test)]
+    pub fn shader_noted(key: u64) -> bool {
+        get().shaders.lock().unwrap().0.contains(&key)
     }
 
     /// (tests) This run used a pipeline of these shaders.
@@ -953,14 +1189,28 @@ fn spawn_preload_worker(q: &'static Preload) {
 mod used_tests {
     use super::*;
 
+    /// The shaders of a set are kept when a pipeline of the set is used, each once, and not
+    /// before: a set that is only made keeps nothing.
+    #[test]
+    fn the_shaders_of_a_used_set_are_kept_for_the_next_run() {
+        let (set, other) = (0x5e70_0000_0000_0001u64, 0x5e70_0000_0000_0003u64);
+        let (vs, ps, cs) = (0x5e70_0000_0000_0011u64, 0x5e70_0000_0000_0013u64, 0x5e70_0000_0000_0015u64);
+        shaders_of(set, vec![vs, ps]);
+        shaders_of(other, vec![cs]);
+        assert!(!used::shader_noted(vs) && !used::shader_noted(ps), "made, not used yet");
+        used::note(set);
+        assert!(used::shader_noted(vs) && used::shader_noted(ps), "the shaders of the used set");
+        assert!(!used::shader_noted(cs), "the other set was not used");
+    }
+
     /// A PC call that has kept one of the title's threads for long holds the title, a short one
     /// does not, and the hold ends with the call.
     #[test]
     fn a_long_pc_call_holds_the_title() {
         let mut calls = PcCalls::new();
         let began = std::time::Instant::now();
-        calls.begin(1, began);
-        calls.begin(2, began + 2 * PC_CALL_HOLDS_AFTER);
+        calls.begin(1, 0, began);
+        calls.begin(2, 0, began + 2 * PC_CALL_HOLDS_AFTER);
         assert!(!calls.holds(0, began), "a call that has just begun holds the title");
         let later = began + 2 * PC_CALL_HOLDS_AFTER;
         assert!(calls.holds(0, later), "a PC call has lasted {:?}, but the title is not held", 2 * PC_CALL_HOLDS_AFTER);
@@ -978,13 +1228,13 @@ mod used_tests {
         let step = PC_CALL_HOLDS_AFTER / 10;
         let mut now = std::time::Instant::now();
         for id in 0..20 {
-            calls.begin(id, now);
+            calls.begin(id, 7, now);
             assert!(id >= 9 || !calls.holds(7, now + step), "{id} short calls hold the title already");
             now += step;
             calls.end(id, 7, now);
         }
         assert!(!calls.holds(7, now), "no PC call is going on, the title is held");
-        calls.begin(20, now);
+        calls.begin(20, 7, now);
         assert!(calls.holds(7, now), "twenty short PC calls since the last frame and one going on, but the title is not held");
         assert!(!calls.holds(8, now), "a frame was shown, the calls before it still hold the title");
         calls.end(20, 8, now);
@@ -1076,6 +1326,105 @@ mod used_tests {
         assert_eq!(resolve_wait_for(waited, None), 0x5B5B);
         let _ = released(spared);
         let _ = released(waited);
+    }
+
+    #[test]
+    fn a_pipeline_a_submit_needs_is_built_before_the_queue() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let backlog = 8 * crate::gpu::recomp::dxc::compile_threads();
+        let standins: Vec<usize> = (0..=backlog).map(|i| 0x7E57_E000usize + i).collect();
+        for &standin in &standins {
+            let order = order.clone();
+            submit(standin, true, Box::new(move || {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                order.lock().unwrap().push(standin);
+                0x6161
+            }));
+        }
+        let last = *standins.last().unwrap();
+        need_by_submit(last);
+        let start = std::time::Instant::now();
+        while standins.iter().any(|&s| is_pending(s)) && start.elapsed() < std::time::Duration::from_secs(30) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let order = order.lock().unwrap();
+        assert_eq!(order.len(), standins.len());
+        let at = order.iter().position(|&s| s == last).unwrap();
+        assert!(at < order.len() / 2, "made last and needed by a submit, it was built {at} of {}", order.len());
+        for &standin in &standins {
+            let _ = released(standin);
+        }
+    }
+
+    /// A dispatch is put off to the submit only where it would wait now: not with a pipeline that
+    /// writes only images (its dispatches are left out while it is built) nor with one a bind
+    /// already waited for past its budget. A submit that says it will wait for a pipeline counts
+    /// once among its waiters however often it says so, and leaves when that wait runs out; a
+    /// late or spared pipeline it does not count at all.
+    #[test]
+    fn a_dispatch_is_put_off_only_where_it_would_wait() {
+        let (plain, spared) = (0x7E57_F001usize, 0x7E57_F002usize);
+        let (go, finish) = mpsc::channel::<()>();
+        let finish = Arc::new(Mutex::new(finish));
+        for standin in [plain, spared] {
+            let finish = finish.clone();
+            submit_lazy(standin, true, Box::new(move || {
+                let _ = finish.lock().unwrap().recv_timeout(std::time::Duration::from_secs(10));
+                0x7171
+            }), 0);
+        }
+        image_only(spared);
+        assert!(waits_for(plain));
+        assert!(!waits_for(spared), "its dispatches are left out while it is built");
+        let p = entry(plain).unwrap();
+        want(plain);
+        want(plain);
+        assert_eq!(p.demand.lock().unwrap().waiters, 1, "a submit counts once");
+        assert_eq!(resolve_within(&p, plain, std::time::Duration::from_millis(50)), plain);
+        assert_eq!(p.demand.lock().unwrap().waiters, 0, "the submit's count leaves with the wait that ran out");
+        assert!(!waits_for(plain), "late: binds go on without it");
+        // a later submit that puts it off does not wait for it: it does not count
+        want(plain);
+        assert_eq!(p.demand.lock().unwrap().waiters, 0, "a late build stays unwanted");
+        assert_eq!(resolve_within(&p, plain, std::time::Duration::from_millis(50)), plain);
+        assert_eq!(p.demand.lock().unwrap().waiters, 0);
+        // a submit counted before another thread's wait made it late leaves at its own
+        {
+            let mut d = p.demand.lock().unwrap();
+            d.ahead = true;
+            Pending::add_waiter(&mut d);
+        }
+        assert_eq!(resolve_within(&p, plain, std::time::Duration::from_millis(50)), plain);
+        assert_eq!(p.demand.lock().unwrap().waiters, 0, "the submit's count leaves with its wait for a late build");
+        want(spared);
+        assert_eq!(entry(spared).unwrap().demand.lock().unwrap().waiters, 0, "nobody waits for a spared build");
+        drop(go);
+        let start = std::time::Instant::now();
+        while (is_pending(plain) || is_pending(spared)) && start.elapsed() < std::time::Duration::from_secs(20) {
+            let _ = resolve(spared);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!waits_for(plain) && !waits_for(spared), "built");
+        let _ = released(plain);
+        let _ = released(spared);
+    }
+
+    #[test]
+    fn the_put_off_line_says_what_became_of_the_put_off_dispatches() {
+        let last = PutOffStats::default();
+        assert_eq!(put_off_line(&last, &last), None);
+        let idle = PutOffStats { builds: 5, ..last };
+        assert_eq!(put_off_line(&idle, &last), None, "nothing put off: no line");
+        let now = PutOffStats { calls: [12, 1, 9, 2, 1], needed: 7, needed_first: 5, built_here: 3, built_at_submit: 2, builds: 40, waits: (6, 2_500_000), segments: 24 };
+        let before = PutOffStats { calls: [4, 0, 4, 0, 0], waits: (2, 500_000), ..Default::default() };
+        let line = put_off_line(&now, &before).unwrap();
+        assert!(line.contains("12 put off to the submit (8 in 2 s), 1 waited in the call"), "{line}");
+        assert!(line.contains("at submits 9 recorded, 2 skipped (build failed or late), 1 dropped"), "{line}");
+        assert!(line.contains("7 pipelines needed by a submit (5 built by a worker before its queue)"), "{line}");
+        assert!(line.contains("submits waited 2000 ms for them in 2 s (4 waits; 2500 ms so far)"), "{line}");
+        assert!(line.contains("3 builds of 40 on threads that waited for them (2 at a submit)"), "{line}");
+        assert!(line.contains("at most 24 segments in a recording"), "{line}");
+        assert_eq!(put_off_line(&now, &now), None, "nothing changed: no line");
     }
 
     /// A bind waits for a pipeline still being built no longer than its budget and goes on with
@@ -1763,10 +2112,13 @@ mod used_tests {
         released(unknown);
     }
 
+    static WORKER_SATURATION_LOCK: Mutex<()> = Mutex::new(());
+
     /// A queued normal worker job whose stand-in was released before a worker starts it is
     /// skipped as orphaned instead of entering the compiler.
     #[test]
     fn a_released_queued_pipeline_is_not_built_by_normal_workers() {
+        let _sat = WORKER_SATURATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use std::sync::atomic::AtomicBool;
         use std::time::{Duration, Instant};
 
@@ -1829,6 +2181,149 @@ mod used_tests {
             let _ = released(standin);
         }
     }
+
+    #[test]
+    fn pc_call_crossing_frame_boundary_does_not_charge_prior_frame_time() {
+        let mut calls = PcCalls::new();
+        let t0 = std::time::Instant::now();
+        let ms = std::time::Duration::from_millis;
+        calls.begin(1, 7, t0);
+        // Frame 8 shown after 290 ms; call 1 ends 10 ms later -> only 10 ms counts on frame 8.
+        let t_frame8 = t0 + PC_CALL_HOLDS_AFTER + ms(40);
+        assert!(!calls.holds(8, t_frame8), "call from frame 7 must not immediately hold frame 8");
+        calls.end(1, 8, t_frame8 + ms(10));
+        let t_next = t_frame8 + ms(11);
+        calls.begin(2, 8, t_next);
+        assert!(!calls.holds(8, t_next), "pre-frame duration leaked into frame 8's budget");
+        // A call genuinely stuck >= PC_CALL_HOLDS_AFTER after frame 8 still holds the title.
+        assert!(!calls.holds(8, t_next + PC_CALL_HOLDS_AFTER - ms(20)));
+        assert!(calls.holds(8, t_next + PC_CALL_HOLDS_AFTER));
+        calls.end(2, 8, t_next + PC_CALL_HOLDS_AFTER);
+
+        // Also when frame 9 is first noticed inside end() itself, pre-frame time is clamped to 0.
+        let t_f9 = t_next + PC_CALL_HOLDS_AFTER + ms(10);
+        calls.begin(3, 8, t_f9);
+        let t_f9_end = t_f9 + PC_CALL_HOLDS_AFTER + ms(50);
+        calls.end(3, 9, t_f9_end);
+        calls.begin(4, 9, t_f9_end + ms(1));
+        assert!(!calls.holds(9, t_f9_end + ms(1)), "end() on new frame must not charge prior-frame duration");
+        calls.end(4, 9, t_f9_end + ms(1) + PC_CALL_HOLDS_AFTER);
+
+        // A stale lower frame number must never rewind self.frame or wipe frame 9's spent budget.
+        let t_stale = t_f9_end + PC_CALL_HOLDS_AFTER + ms(10);
+        calls.begin(5, 8, t_stale);
+        assert!(calls.holds(9, t_stale), "stale lower frame rewound frame 9 or cleared its spent budget");
+        calls.end(5, 9, t_stale);
+    }
+
+    #[test]
+    fn released_queued_pipeline_drops_job_immediately_before_workers_drain() {
+        let _sat = WORKER_SATURATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Duration, Instant};
+
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        struct OpenGate(Arc<(Mutex<bool>, Condvar)>);
+        impl Drop for OpenGate {
+            fn drop(&mut self) {
+                *self.0 .0.lock().unwrap() = true;
+                self.0 .1.notify_all();
+            }
+        }
+
+        // Saturate normal workers and verify released() drops the queued job immediately.
+        let n = crate::gpu::recomp::dxc::compile_threads();
+        let (started_tx, started_rx) = mpsc::channel();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let open_normal = OpenGate(gate.clone());
+        let mut blockers = Vec::with_capacity(n);
+        for k in 0..n {
+            let standin = 0x7E57_A100usize + k;
+            let (tx, g) = (started_tx.clone(), gate.clone());
+            submit(standin, false, Box::new(move || {
+                let _ = tx.send(());
+                let mut open = g.0.lock().unwrap();
+                while !*open {
+                    open = g.1.wait(open).unwrap();
+                }
+                0xA100 + k
+            }));
+            blockers.push(standin);
+        }
+        for _ in 0..n {
+            started_rx.recv_timeout(Duration::from_secs(10)).expect("normal workers saturated");
+        }
+        let target_n = 0x7E57_A1FFusize;
+        let (ran_n, dropped_n) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let (ran_job, flag_n) = (ran_n.clone(), DropFlag(dropped_n.clone()));
+        submit(target_n, false, Box::new(move || {
+            let _keep = &flag_n;
+            ran_job.store(true, Ordering::Release);
+            0xA1FF
+        }));
+        assert_eq!(released(target_n), 0);
+        assert!(dropped_n.load(Ordering::Acquire), "normal queued job was not dropped immediately on released()");
+        drop(open_normal);
+        assert!(!ran_n.load(Ordering::Acquire));
+        for standin in blockers {
+            let start = Instant::now();
+            while is_pending(standin) && start.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let _ = released(standin);
+        }
+
+        // Saturate preload workers and verify released() drops the preloaded job immediately.
+        let m = (crate::gpu::recomp::dxc::compile_threads() / 4).clamp(2, 4);
+        let (p_tx, p_rx) = mpsc::channel();
+        let p_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let open_pre = OpenGate(p_gate.clone());
+        let mut p_blockers = Vec::with_capacity(m);
+        for k in 0..m {
+            let standin = 0x7E57_A200usize + k;
+            let key = 0x5EED_A200u64 + k as u64;
+            used::earlier_run_used(key);
+            let (tx, g) = (p_tx.clone(), p_gate.clone());
+            submit_lazy(standin, false, Box::new(move || {
+                let _ = tx.send(());
+                let mut open = g.0.lock().unwrap();
+                while !*open {
+                    open = g.1.wait(open).unwrap();
+                }
+                0xA200 + k
+            }), key);
+            p_blockers.push(standin);
+        }
+        for _ in 0..m {
+            p_rx.recv_timeout(Duration::from_secs(10)).expect("preload workers saturated");
+        }
+        let target_p = 0x7E57_A2FFusize;
+        let key_p = 0x5EED_A2FFu64;
+        used::earlier_run_used(key_p);
+        let (ran_p, dropped_p) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let (ran_job, flag_p) = (ran_p.clone(), DropFlag(dropped_p.clone()));
+        submit_lazy(target_p, false, Box::new(move || {
+            let _keep = &flag_p;
+            ran_job.store(true, Ordering::Release);
+            0xA2FF
+        }), key_p);
+        assert_eq!(released(target_p), 0);
+        assert!(dropped_p.load(Ordering::Acquire), "preload queued job was not dropped immediately on released()");
+        drop(open_pre);
+        assert!(!ran_p.load(Ordering::Acquire));
+        for standin in p_blockers {
+            let start = Instant::now();
+            while is_pending(standin) && start.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let _ = released(standin);
+        }
+    }
 }
 
 fn entry(pso: usize) -> Option<Arc<Pending>> {
@@ -1860,10 +2355,16 @@ pub fn resolve(pso: usize) -> usize {
     p.note_use();
     match p.real.load(Ordering::Acquire) {
         0 => {
-            // a lazy one is wanted now: to the workers
+            // a lazy one is wanted now: to the workers (one binds do not wait for to the
+            // backlog's lane, as `resolve_spared` sends it: a bind no longer waits for a compute
+            // pipeline, its dispatch does)
             let stand = p.stand(pso);
             if !p.sent.swap(true, Ordering::AcqRel) {
-                enqueue(p);
+                if p.spared.load(Ordering::Acquire) {
+                    send_spared(p, preload());
+                } else {
+                    enqueue(p);
+                }
             }
             stand
         }
@@ -1960,6 +2461,10 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     let mut wait = Wait::new(&p);
     let job = p.job.lock().unwrap().take();
     if let Some(job) = job {
+        BUILT_HERE.fetch_add(1, Ordering::Relaxed);
+        if is_at_submit() {
+            BUILT_AT_SUBMIT.fetch_add(1, Ordering::Relaxed);
+        }
         complete(&p, run_job(&p, job));
     }
     p.want();
@@ -2038,6 +2543,10 @@ impl<'a> Wait<'a> {
 impl Drop for Wait<'_> {
     fn drop(&mut self) {
         let waited = self.start.elapsed();
+        if is_at_submit() {
+            SUBMIT_WAITS.fetch_add(1, Ordering::Relaxed);
+            SUBMIT_WAIT_US.fetch_add(waited.as_micros() as u64, Ordering::Relaxed);
+        }
         // (a bind that built the pipeline itself did not wait on `until_done`)
         if self.logged || (waited >= LONG_WAIT && !self.p.warned.swap(true, Ordering::Relaxed)) {
             crate::xlog_warn!(
@@ -2105,6 +2614,9 @@ fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> 
         enqueue(p.clone());
     }
     if p.late.load(Ordering::Acquire) {
+        // (a submit that counted itself ahead, `want`, before another wait made it late: it
+        // waits no more either)
+        p.unwant_ahead();
         return p.stand(pso);
     }
     // (the title's thread is held from here until the pipeline is built or the budget is over)
@@ -2116,6 +2628,7 @@ fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> 
     drop(wait);
     p.late.store(true, Ordering::Release);
     p.unwant();
+    p.unwant_ahead();
     if p.compute && p.record != 0 && cs_wait_budget().is_some() {
         if first_late(p.record) {
             crate::xlog_warn!("D3D12.X: compute pipeline of record {:016x} not built after {} ms: its dispatches are skipped until it is", p.record, budget.as_millis());
@@ -2222,14 +2735,22 @@ pub fn resolve_for_bind(pso: usize) -> usize {
 /// the worker's result is then released when it arrives).
 pub fn released(pso: usize) -> usize {
     let Some(p) = PENDING.remove(pso) else { return 0 };
-    let done = p.done.lock().unwrap();
-    if *done {
-        p.real.swap(0, Ordering::AcqRel)
-    } else {
+    {
+        let done = p.done.lock().unwrap();
+        if *done {
+            return p.real.swap(0, Ordering::AcqRel);
+        }
         // the worker stores its result into a Pending nobody will read: mark it orphaned
         p.orphan.store(true, Ordering::Release);
-        0
     }
+    drop_unstarted_job(&p);
+    0
+}
+
+/// Whether a draw or dispatch with `pso` now has the pipeline it stands for: not a stand-in, or
+/// one whose build succeeded (`put_off_line`'s skipped ones are those that had not).
+pub(super) fn has_real(pso: usize) -> bool {
+    entry(pso).is_none_or(|p| p.real.load(Ordering::Acquire) != 0)
 }
 
 /// `pso` is a stand-in whose real pipeline is still being built.
@@ -2243,6 +2764,42 @@ pub fn is_pending(pso: usize) -> bool {
 /// failed build's stand-in is what draws for good).
 pub fn gave_standin(pso: usize, resolved: usize) -> bool {
     entry(pso).is_some_and(|p| resolved == p.stand(pso) && (!*p.done.lock().unwrap() || p.real.load(Ordering::Acquire) != 0))
+}
+
+/// Whether a dispatch with `pso` would wait for its build now (`resolve_wait`): a pipeline still
+/// being built that binds do not go on without – not one whose dispatches are left out while it
+/// is built (`image_only`) or that a bind already waited for past its budget (`late`). Those go
+/// on as they did, in the call, and their builds keep their place (not before the workers'
+/// queue: `need_by_submit`).
+pub fn waits_for(pso: usize) -> bool {
+    entry(pso).is_some_and(|p| !p.spared.load(Ordering::Acquire) && !p.late.load(Ordering::Acquire) && !*p.done.lock().unwrap())
+}
+
+/// A submit is about to wait for `pso` (one of its next put-off calls): it counts among the
+/// build's waiters (`Pending::want`) once, however often the submit says so, and leaves with
+/// the wait for it when that runs out of its budget (`resolve_within`). Not for a pipeline the
+/// submit will not wait for (late, or spared): nothing would take that count back, and its build
+/// would stay wanted – ahead of the commit gate – until it is built.
+pub fn want(pso: usize) {
+    let Some(p) = entry(pso) else { return };
+    // (under the lock: a wait that makes it late takes `ahead` back after it, `resolve_within`)
+    let mut d = p.demand.lock().unwrap();
+    if p.late.load(Ordering::Acquire) || p.spared.load(Ordering::Acquire) || std::mem::replace(&mut d.ahead, true) {
+        return;
+    }
+    Pending::add_waiter(&mut d);
+}
+
+/// A call with `pso` was put off to the submit: its build goes before the workers' queue.
+pub fn need_by_submit(pso: usize) {
+    let Some(p) = entry(pso) else { return };
+    // (a lazy one is sent here: `resolve` does not send it again)
+    p.sent.store(true, Ordering::Release);
+    if !std::mem::replace(&mut p.demand.lock().unwrap().by_submit, true) {
+        NEEDED_MADE.fetch_add(1, Ordering::Relaxed);
+        NEEDED.lock().unwrap().push_back(p);
+        let _ = queue().lock().unwrap().send(Box::new(|| ()));
+    }
 }
 
 /// (built in the background, failed, still building)

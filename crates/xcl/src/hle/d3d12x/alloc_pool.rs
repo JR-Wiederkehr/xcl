@@ -316,6 +316,37 @@ pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
     }
 }
 
+/// The lists recording on the PC allocators of `alloc` hold them no more: the allocator a title
+/// list keeps for its put-off dispatches goes with the list, before the list's segments that
+/// recorded on it are released (`list_x::on_release`), and `forget` gives back only what nothing
+/// holds.
+pub(super) fn unpin_users(alloc: usize) {
+    let mut g = STATE.lock().unwrap();
+    if let Some(s) = g.as_mut() {
+        unpin_users_in(s, alloc);
+    }
+}
+
+fn unpin_users_in(s: &mut State, alloc: usize) {
+    let mine: Vec<usize> = s.cur.get(&alloc).copied().into_iter().chain(s.aside.get(&alloc).into_iter().flatten().copied()).chain([alloc]).collect();
+    for b in mine {
+        if let Some(b) = s.backings.get_mut(&b) {
+            for l in std::mem::take(&mut b.users) {
+                s.of_list.remove(&l);
+            }
+        }
+    }
+}
+
+/// Whether the GPU may still run a recording made on the title's allocator `alloc`.
+pub(super) unsafe fn allocator_in_flight(alloc: usize) -> bool {
+    let g = STATE.lock().unwrap();
+    let Some(s) = g.as_ref() else { return false };
+    let mine = s.cur.get(&alloc).into_iter().chain(s.aside.get(&alloc).into_iter().flatten()).chain([&alloc]);
+    let busy = mine.filter_map(|b| s.backings.get(b)).any(|b| !b.idle());
+    busy
+}
+
 /// The title's allocator `alloc` is gone (its last Release): nothing of it stays here – a later
 /// allocator may get its address, and must not go on with this one's PC allocators. The ones
 /// made here go with it (those lists still record on are left alone: not freed, not tracked).
@@ -457,6 +488,27 @@ unsafe fn title_reset_in(s: &mut State, alloc: *mut c_void, mut reset: impl FnMu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// When a title list goes, the segments that recorded its put-off dispatches on its own
+    /// allocator hold neither the PC allocator it stands for now nor the ones put aside: `forget`
+    /// then releases those the GPU is done with (they were left behind, with what was held on them).
+    #[test]
+    fn the_own_allocator_of_a_list_that_goes_is_held_by_none_of_its_segments() {
+        let (own, now, aside, other) = (0x1000usize, 0x2000usize, 0x3000usize, 0x4000usize);
+        let (seg, old_seg, elsewhere) = (0x5000usize, 0x6000usize, 0x7000usize);
+        let mut s = State::default();
+        s.cur.insert(own, now);
+        s.aside.insert(own, vec![aside]);
+        move_list(&mut s, seg, now);
+        move_list(&mut s, old_seg, aside);
+        move_list(&mut s, elsewhere, other);
+        assert!(!unsafe { s.backings[&now].free() });
+        unpin_users_in(&mut s, own);
+        assert!(unsafe { s.backings[&now].free() && s.backings[&aside].free() }, "nothing holds them");
+        assert!(!s.of_list.contains_key(&seg) && !s.of_list.contains_key(&old_seg));
+        assert_eq!(s.of_list.get(&elsewhere), Some(&other), "a list on another allocator keeps its hold");
+        assert!(s.backings[&other].users.contains(&elsewhere));
+    }
 
     #[test]
     fn a_spare_whose_reset_fails_stays_available_for_retry() {

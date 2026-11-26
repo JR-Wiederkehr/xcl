@@ -535,7 +535,7 @@ pub fn global_heap() -> Option<ID3D12DescriptorHeap> {
 
 /// Whether `obj` (a title's view heap) has its descriptors in the shared heap.
 pub fn in_global(obj: usize) -> bool {
-    HEAPS.lock().unwrap().iter().any(|h| h.obj == obj && !h.pages.is_empty())
+    HEAPS.lock().unwrap().iter().any(|h| h.obj == obj && !h.sampler && !h.pages.is_empty())
 }
 
 /// Memory for a heap of `bytes` from the title's allocation hook – where the title expects the
@@ -797,12 +797,12 @@ pub unsafe fn publish_range(first: &Slot, n: u32, names: &[(usize, usize)]) {
     }
 }
 
-/// view slot address → the resource its view names (`XCL_TRACE_FRAME` diagnostics)
+/// view slot address → the resource its view names (`XCL_TRACE_FRAME`, `XCL_DUMP_TARGETS`)
 static RES: Mutex<Option<std::collections::HashMap<usize, usize>>> = Mutex::new(None);
 
 /// The view in slot `s` names `res` (0: none).
 pub fn note_resource(s: &Slot, res: usize) {
-    if s.sampler || !super::present::trace_frame() {
+    if s.sampler || !(super::present::trace_frame() || super::targets::enabled()) {
         return;
     }
     let mut g = RES.lock().unwrap();
@@ -862,7 +862,7 @@ pub fn census() {
             let w = unsafe { std::slice::from_raw_parts((h.shadow + (k * SAMPLER_SLOT) as usize) as *const u32, 4) };
             if w.iter().all(|&x| x == 0) {
                 empty += 1;
-            } else if w[3] & 0xFFF == k {
+            } else if w[3] & 0xFFF == sampler_own_index(&h.pages, k) {
                 own += 1;
             } else {
                 other += 1;
@@ -941,6 +941,14 @@ fn sampler_unmapped_index(hosted: bool, k: u32) -> u32 {
     if hosted { 0 } else { k }
 }
 
+/// Expected PC sampler index for slot `k` of a sampler heap with shared-page table `pages`.
+fn sampler_own_index(pages: &[u32], k: u32) -> u32 {
+    match pages.get((k / SAMPLER_PAGE_SLOTS) as usize) {
+        Some(&f) if f != UNMAPPED => f + (k % SAMPLER_PAGE_SLOTS),
+        _ => sampler_unmapped_index(!pages.is_empty(), k),
+    }
+}
+
 struct GlobalSampler {
     dev: ID3D12Device,
     heap: ID3D12DescriptorHeap,
@@ -987,18 +995,7 @@ pub unsafe fn shared_sampler_heap(dev: &ID3D12Device) -> bool {
         };
         let cpu = heap.GetCPUDescriptorHandleForHeapStart().ptr as u64;
         let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
-        let zero = D3D12_SAMPLER_DESC {
-            Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
-            AddressU: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
-            AddressV: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
-            AddressW: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
-            MipLODBias: 0.0,
-            MaxAnisotropy: 1,
-            ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
-            BorderColor: [0.0; 4],
-            MinLOD: 0.0,
-            MaxLOD: 0.0,
-        };
+        let zero = zero_sampler();
         for k in 0..GLOBAL_SAMPLER_MAX as u64 {
             dev.CreateSampler(&zero, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: (cpu + k * inc as u64) as usize });
         }
@@ -1043,8 +1040,11 @@ fn sampler_page_of(h: &mut Heap, k: u32) -> Option<(u32, u32)> {
 }
 
 fn release_global_sampler(first: u32, count: u32) {
+    if count == 0 {
+        return;
+    }
     if let Some(s) = GLOBAL_SAMPLER.lock().unwrap().as_mut() {
-        s.free.push((first, count));
+        merge_release(&mut s.free, first, count);
     }
 }
 
@@ -1056,6 +1056,34 @@ pub fn global_sampler_heap() -> Option<ID3D12DescriptorHeap> {
 /// Whether `obj` (a title's sampler heap) has its descriptors in the shared sampler heap.
 pub fn in_global_sampler(obj: usize) -> bool {
     HEAPS.lock().unwrap().iter().any(|h| h.obj == obj && h.sampler && !h.pages.is_empty())
+}
+
+/// The zero sampler: what an S# of zeros is on the console (point filtering, wrap, mip 0 only),
+/// and what a shader gets whose S# XCL takes for a heap entry it is not (entry 0).
+/// `XCL_ZERO_SAMPLER_LINEAR=1` (a diagnostic): linear filtering, clamp, every mip instead; a
+/// picture that changes with it samples through the zero sampler.
+pub(super) fn zero_sampler() -> D3D12_SAMPLER_DESC {
+    static LINEAR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let linear = *LINEAR.get_or_init(|| {
+        let on = std::env::var("XCL_ZERO_SAMPLER_LINEAR").is_ok_and(|v| v.trim() == "1");
+        if on {
+            crate::xlog_info!("D3D12.X: XCL_ZERO_SAMPLER_LINEAR=1 - the zero sampler is linear, clamp, all mips (a diagnostic)");
+        }
+        on
+    });
+    let address = if linear { D3D12_TEXTURE_ADDRESS_MODE_CLAMP } else { D3D12_TEXTURE_ADDRESS_MODE_WRAP };
+    D3D12_SAMPLER_DESC {
+        Filter: if linear { D3D12_FILTER_MIN_MAG_MIP_LINEAR } else { D3D12_FILTER_MIN_MAG_MIP_POINT },
+        AddressU: address,
+        AddressV: address,
+        AddressW: address,
+        MipLODBias: 0.0,
+        MaxAnisotropy: 1,
+        ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
+        BorderColor: [0.0; 4],
+        MinLOD: 0.0,
+        MaxLOD: if linear { 1000.0 } else { 0.0 },
+    }
 }
 
 #[cfg(test)]
@@ -1515,5 +1543,145 @@ mod tests {
         // Exhaustion fallback: hosted sampler heaps map overflowed slots to reserved slot 0; unhosted keep local k.
         assert_eq!(sampler_unmapped_index(true, 42), 0);
         assert_eq!(sampler_unmapped_index(false, 42), 42);
+    }
+
+    #[test]
+    fn release_global_sampler_merges_adjacent_ranges_and_ignores_zero_count() {
+        const CHILD: &str = "XCL_TEST_RELEASE_GLOBAL_SAMPLER_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "hle::d3d12x::console_heap::tests::release_global_sampler_merges_adjacent_ranges_and_ignores_zero_count", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        use std::ffi::c_void;
+        #[repr(C)]
+        struct Object { vt: *const usize }
+        unsafe extern "system" fn retain(_this: *mut c_void) -> u32 { 1 }
+        let mut vt = [0usize; 4];
+        vt[1] = retain as usize;
+        vt[2] = retain as usize;
+        let mut device = Object { vt: vt.as_ptr() };
+        let mut heap = Object { vt: vt.as_ptr() };
+        unsafe {
+            *GLOBAL_SAMPLER.lock().unwrap() = Some(GlobalSampler {
+                dev: ID3D12Device::from_raw(&mut device as *mut _ as *mut c_void),
+                heap: ID3D12DescriptorHeap::from_raw(&mut heap as *mut _ as *mut c_void),
+                cpu: 0x1000, inc: 32, cap: 17, next: 1, free: Vec::new(),
+            });
+            assert_eq!(reserve_global_sampler(4), Some(1));
+            assert_eq!(reserve_global_sampler(4), Some(5));
+            assert_eq!(reserve_global_sampler(4), Some(9));
+            assert_eq!(reserve_global_sampler(4), Some(13));
+            assert_eq!(reserve_global_sampler(1), None);
+            // Adjacent out-of-order releases coalesce and zero-count releases are ignored.
+            release_global_sampler(5, 4);
+            release_global_sampler(1, 4);
+            release_global_sampler(1, 0);
+            assert_eq!(GLOBAL_SAMPLER.lock().unwrap().as_ref().unwrap().free, vec![(1, 8)]);
+            assert_eq!(reserve_global_sampler(8), Some(1));
+            // Coalesced range ending at cursor straddles cleanly into the never-used tail.
+            {
+                let mut g = GLOBAL_SAMPLER.lock().unwrap();
+                let s = g.as_mut().unwrap();
+                s.next = 13;
+                s.free.clear();
+            }
+            release_global_sampler(9, 2);
+            release_global_sampler(11, 2);
+            assert_eq!(reserve_global_sampler(8), Some(9));
+            let g = GLOBAL_SAMPLER.lock().unwrap();
+            let s = g.as_ref().unwrap();
+            assert_eq!(s.next, 17);
+            assert!(s.free.is_empty());
+            drop(g);
+            *GLOBAL_SAMPLER.lock().unwrap() = None;
+        }
+    }
+
+    #[test]
+    fn in_global_excludes_shared_sampler_heaps() {
+        const CHILD: &str = "XCL_TEST_IN_GLOBAL_SAMPLER_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "hle::d3d12x::console_heap::tests::in_global_excludes_shared_sampler_heaps", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        use std::ffi::c_void;
+        #[repr(C)]
+        struct Object { vt: *const usize }
+        unsafe extern "system" fn retain(_this: *mut c_void) -> u32 { 1 }
+        let mut vt = [0usize; 4];
+        vt[1] = retain as usize;
+        vt[2] = retain as usize;
+        let mut device = Object { vt: vt.as_ptr() };
+        let mut view_heap = Object { vt: vt.as_ptr() };
+        let mut sampler_heap = Object { vt: vt.as_ptr() };
+        unsafe {
+            let dev = ID3D12Device::from_raw(&mut device as *mut _ as *mut c_void);
+            *GLOBAL.lock().unwrap() = Some(Global {
+                dev: dev.clone(),
+                heap: ID3D12DescriptorHeap::from_raw(&mut view_heap as *mut _ as *mut c_void),
+                cpu: 0x1000, gpu: 0x2000, inc: 32, cap: 1024, next: 64, free: Vec::new(), nulls: None,
+            });
+            *GLOBAL_SAMPLER.lock().unwrap() = Some(GlobalSampler {
+                dev,
+                heap: ID3D12DescriptorHeap::from_raw(&mut sampler_heap as *mut _ as *mut c_void),
+                cpu: 0x4000, inc: 32, cap: 17, next: 1, free: Vec::new(),
+            });
+            if crate::gpu::uma::get().is_some() {
+                assert!(register(0xC100, 16, 0x9000, 0, 16, true, true, true));
+                assert!(register(0xC101, 16, 0x1000, 0, 32, false, true, true));
+                assert!(register(0xC102, 4, 0xA000, 0, 16, true, false, true));
+                assert!(!in_global(0xC100) && in_global_sampler(0xC100));
+                assert!(in_global(0xC101) && !in_global_sampler(0xC101));
+                assert!(!in_global(0xC102) && !in_global_sampler(0xC102));
+                unregister(0xC100);
+                unregister(0xC101);
+                unregister(0xC102);
+                // Adjacent 4-slot sampler heaps coalesce in GLOBAL_SAMPLER on unregister.
+                assert!(register(0xC110, 4, 0x9000, 0, 16, true, true, true));
+                assert!(register(0xC111, 4, 0x9100, 0, 16, true, true, true));
+                assert_eq!(slot(start(0xC110).unwrap()).unwrap().index, 1);
+                assert_eq!(slot(start(0xC111).unwrap()).unwrap().index, 5);
+                unregister(0xC110);
+                unregister(0xC111);
+                assert_eq!(GLOBAL_SAMPLER.lock().unwrap().as_ref().unwrap().free, vec![(1, 8)]);
+            } else {
+                let mut heaps = HEAPS.lock().unwrap();
+                heaps.push(Heap { obj: 0xC100, shadow: 0, n: 16, pc_cpu: 0, pc_gpu: 0, inc: 16, sampler: true, pages: vec![UNMAPPED; 2], visible: true, memory: Memory::Uma });
+                heaps.push(Heap { obj: 0xC101, shadow: 0, n: 16, pc_cpu: 0, pc_gpu: 0, inc: 32, sampler: false, pages: vec![UNMAPPED], visible: true, memory: Memory::Uma });
+                drop(heaps);
+                assert!(!in_global(0xC100) && in_global_sampler(0xC100));
+                assert!(in_global(0xC101) && !in_global_sampler(0xC101));
+                HEAPS.lock().unwrap().clear();
+            }
+            *GLOBAL_SAMPLER.lock().unwrap() = None;
+            *GLOBAL.lock().unwrap() = None;
+        }
+    }
+
+    #[test]
+    fn sampler_own_index_tracks_mapped_pages_and_fallbacks() {
+        // Hosted shared sampler heap with two mapped pages at GLOBAL_SAMPLER indices 1 and 17.
+        let pages = [1u32, 17u32];
+        assert_eq!(sampler_own_index(&pages, 0), 1);
+        assert_eq!(sampler_own_index(&pages, SAMPLER_PAGE_SLOTS - 1), SAMPLER_PAGE_SLOTS);
+        assert_eq!(sampler_own_index(&pages, SAMPLER_PAGE_SLOTS), 17);
+        assert_eq!(sampler_own_index(&pages, SAMPLER_PAGE_SLOTS + 5), 22);
+        // Unmapped or out-of-range page in a hosted shared sampler heap maps to reserved slot 0.
+        assert_eq!(sampler_own_index(&[UNMAPPED], 0), 0);
+        assert_eq!(sampler_own_index(&[1, UNMAPPED], SAMPLER_PAGE_SLOTS + 1), 0);
+        assert_eq!(sampler_own_index(&[1], SAMPLER_PAGE_SLOTS * 2), 0);
+        // Unhosted sampler heap (empty pages) keeps local slot index k.
+        assert_eq!(sampler_own_index(&[], 0), 0);
+        assert_eq!(sampler_own_index(&[], 42), 42);
     }
 }

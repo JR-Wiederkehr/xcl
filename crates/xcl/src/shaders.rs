@@ -795,29 +795,131 @@ fn coverage(agg: &Agg, order: &[String], ks: &[usize]) -> Vec<(usize, usize)> {
     ks.iter().map(|&k| (k, max_rank.iter().filter(|&&r| r <= k).count())).collect()
 }
 
-pub fn run(path: &Path, args: &[String]) -> i32 {
-    let opt = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<usize>().ok());
-    // a flag that needs a value: missing, or another flag in its place, is an error
-    let required = |name: &str| -> Result<Option<&String>, String> {
-        match args.iter().position(|a| a == name) {
-            None => Ok(None),
-            Some(i) => match args.get(i + 1) {
-                Some(v) if !v.starts_with("--") => Ok(Some(v)),
-                _ => Err(format!("xcl shaders: {name} needs a value")),
-            },
-        }
+struct ShadersOptions {
+    top: usize,
+    json: bool,
+    compile: usize,
+    recomp: bool,
+    iface: bool,
+    example: Option<String>,
+    /// `--windows`; None: the runtime's count for `--precompile` / `--export-hlsl` /
+    /// `--measure-pso` (`configured_runtime_windows`), 4 for `--direct`
+    windows: Option<u32>,
+    split: Option<bool>,
+    export_hlsl: Option<PathBuf>,
+    min_kb: usize,
+    count: usize,
+    record_hash: Option<u64>,
+    measure_pso: Option<u64>,
+    repeat: usize,
+    precompile: bool,
+    limit: usize,
+    only: Option<String>,
+    pipelines: bool,
+    used_only: bool,
+    direct: bool,
+    sample: usize,
+    seed: u64,
+    validate: bool,
+    compare: bool,
+    threads: Option<usize>,
+    trace: bool,
+    max_bytes: usize,
+    timeout: u64,
+    lanes: bool,
+    hash: Option<u64>,
+    dump: Option<PathBuf>,
+}
+
+fn parse_args(args: &[String]) -> Result<ShadersOptions, String> {
+    let mut opts = ShadersOptions {
+        top: 60,
+        json: false,
+        compile: 0,
+        recomp: false,
+        iface: false,
+        example: None,
+        windows: None,
+        split: None,
+        export_hlsl: None,
+        min_kb: 1024,
+        count: 2,
+        record_hash: None,
+        measure_pso: None,
+        repeat: 1,
+        precompile: false,
+        limit: usize::MAX,
+        only: None,
+        pipelines: false,
+        used_only: false,
+        direct: false,
+        sample: 200,
+        seed: 1,
+        validate: false,
+        compare: false,
+        threads: None,
+        trace: false,
+        max_bytes: 16384,
+        timeout: 10,
+        lanes: false,
+        hash: None,
+        dump: None,
     };
-    let (export_dir, record_hash, measure) = match (required("--export-hlsl"), required("--record-hash"), required("--measure-pso")) {
-        (Ok(a), Ok(b), Ok(c)) => (a, b, c),
-        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
-            eprintln!("{e}");
+    let mut p = crate::cli::Parser::new(args);
+    while let Some(arg) = p.next_arg() {
+        match arg {
+            "--top" => opts.top = p.parse_usize("--top")?,
+            "--json" => opts.json = true,
+            "--compile" => opts.compile = p.parse_usize("--compile")?,
+            "--recomp" => opts.recomp = true,
+            "--iface" => opts.iface = true,
+            "--example" => opts.example = Some(p.value("--example")?.to_string()),
+            "--windows" => {
+                let w = p.parse_usize("--windows")?;
+                opts.windows = Some(u32::try_from(w).map_err(|_| format!("invalid value for --windows: {w}"))?);
+            }
+            "--split" => opts.split = Some(p.parse_bool_01("--split")?),
+            "--export-hlsl" => opts.export_hlsl = Some(PathBuf::from(p.value("--export-hlsl")?)),
+            "--min-kb" => opts.min_kb = p.parse_usize("--min-kb")?,
+            "--count" => opts.count = p.parse_usize("--count")?,
+            "--record-hash" => opts.record_hash = Some(p.parse_hex_u64("--record-hash")?),
+            "--measure-pso" => opts.measure_pso = Some(p.parse_hex_u64("--measure-pso")?),
+            "--repeat" => opts.repeat = p.parse_usize("--repeat")?,
+            "--precompile" => opts.precompile = true,
+            "--limit" => opts.limit = p.parse_usize("--limit")?,
+            "--only" => opts.only = Some(p.value("--only")?.to_ascii_lowercase()),
+            "--pipelines" => opts.pipelines = true,
+            "--used-only" => opts.used_only = true,
+            "--direct" => opts.direct = true,
+            "--sample" => opts.sample = p.parse_usize("--sample")?,
+            "--seed" => opts.seed = p.parse_u64("--seed")?,
+            "--validate" => opts.validate = true,
+            "--compare" => opts.compare = true,
+            "--threads" => opts.threads = Some(p.parse_usize("--threads")?),
+            "--trace" => opts.trace = true,
+            "--max-bytes" => opts.max_bytes = p.parse_usize("--max-bytes")?,
+            "--timeout" => opts.timeout = p.parse_u64("--timeout")?,
+            "--lanes" => opts.lanes = true,
+            "--hash" => opts.hash = Some(p.parse_hex_u64("--hash")?),
+            "--dump" => opts.dump = Some(PathBuf::from(p.value("--dump")?)),
+            other => return Err(crate::cli::Parser::unexpected(other)),
+        }
+    }
+    Ok(opts)
+}
+
+pub fn run(path: &Path, args: &[String]) -> i32 {
+    let opts = match parse_args(args) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("xcl shaders: {e}");
             return 2;
         }
     };
     // the runtime's memory windows: as many as a run has (`XCL_UMA_WINDOWS`), from the
     // descriptor heap with `XCL_HEAP_WINDOWS=1` (`pso::mem_windows`), as `--precompile`
     let runtime_windows = {
-        let windows = opt("--windows").unwrap_or_else(crate::gpu::uma::configured_runtime_windows);
+        let windows = opts.windows.map_or_else(crate::gpu::uma::configured_runtime_windows, |w| w as usize);
         let heap = windows > 1 && recomp::pso::heap_windows();
         if !recomp::valid_window_count(windows, heap) {
             eprintln!("xcl shaders: --windows {windows}: 1 to 4, or 8 or 16 with XCL_HEAP_WINDOWS=1");
@@ -826,12 +928,12 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
         let windows = windows as u32;
         move || if heap { windows | recomp::HEAP_WINDOWS } else { windows }
     };
-    let top = opt("--top").unwrap_or(60);
-    let json = args.iter().any(|a| a == "--json");
-    let compile = opt("--compile").unwrap_or(0);
-    let recomp_on = compile > 0 || args.iter().any(|a| a == "--recomp");
-    let iface_on = args.iter().any(|a| a == "--iface");
-    if let Some(m) = args.iter().position(|a| a == "--example").and_then(|i| args.get(i + 1)) {
+    let top = opts.top;
+    let json = opts.json;
+    let compile = opts.compile;
+    let recomp_on = compile > 0 || opts.recomp;
+    let iface_on = opts.iface;
+    if let Some(m) = &opts.example {
         let _ = EXAMPLE_FOR.set(m.clone());
     }
     let t0 = std::time::Instant::now();
@@ -853,7 +955,7 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             let records = pack::scan(&data, 0x40);
             let what = format!("RPF9 package {:.1} MB, {} shader records", data.len() as f64 / 1048576.0, records.len());
             (Input::Pack { data, records }, what)
-        } else if export_dir.is_some() || measure.is_some() {
+        } else if opts.export_hlsl.is_some() || opts.measure_pso.is_some() {
             // one shader file: the record to export or measure
             (Input::Files(vec![path.to_path_buf()]), "single file".to_string())
         } else {
@@ -862,64 +964,47 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             return print(path, "single file", a, top, json, t0, compile);
         }
     };
-    if let Some(dir) = export_dir {
-        let record_hash = match record_hash.map(|v| parse_record_hash(v)) {
-            Some(Ok(h)) => Some(h),
-            Some(Err(e)) => {
-                eprintln!("xcl shaders: --record-hash: {e}");
-                return 2;
-            }
-            None => None,
-        };
+    if let Some(dir) = &opts.export_hlsl {
         return export_hlsl(
             &input,
-            Path::new(dir),
-            opt("--min-kb").unwrap_or(1024),
-            opt("--count").unwrap_or(2),
+            dir,
+            opts.min_kb,
+            opts.count,
             runtime_windows(),
-            opt("--split").map(|v| v != 0),
-            record_hash,
+            opts.split,
+            opts.record_hash,
         );
     }
-    if let Some(hash) = measure {
-        let hash = match parse_record_hash(hash) {
-            Ok(h) => h,
-            Err(e) => {
-                eprintln!("xcl shaders: --measure-pso: {e}");
-                return 2;
-            }
-        };
+    if let Some(hash) = opts.measure_pso {
         return measure_pso(
             &input,
             hash,
-            opt("--repeat").unwrap_or(1).max(1),
+            opts.repeat.max(1),
             runtime_windows(),
-            opt("--split").map(|v| v != 0),
+            opts.split,
         );
     }
-    if args.iter().any(|a| a == "--precompile") {
-        let only = args.iter().position(|a| a == "--only").and_then(|i| args.get(i + 1)).map(|s| s.to_ascii_lowercase());
-        let pipelines = args.iter().any(|a| a == "--pipelines");
+    if opts.precompile {
         // `--used-only`: only the compute programs whose pipelines an earlier run of a title used
-        let used = args.iter().any(|a| a == "--used-only").then(crate::hle::d3d12x::pso_async::earlier_used_keys);
+        let used = opts.used_only.then(crate::hle::d3d12x::pso_async::earlier_used_keys);
         // the runtime's key: heap windows with `XCL_HEAP_WINDOWS=1` (`pso::mem_windows`)
         let windows = runtime_windows();
-        return precompile(&input, opt("--limit").unwrap_or(usize::MAX), windows, opt("--split").map(|v| v != 0), only.as_deref(), pipelines, used.as_ref(), t0);
+        return match precompile(&input, opts.limit, windows, opts.split, opts.only.as_deref(), opts.pipelines, used.as_ref(), t0, None) {
+            Ok(()) => 0,
+            Err(e) => { eprintln!("xcl shaders: {e}"); 2 }
+        };
     }
-    if args.iter().any(|a| a == "--direct") {
-        return direct_sweep(&input, args, top, json, t0);
+    if opts.direct {
+        return direct_sweep(&input, &opts, t0);
     }
     let agg = analyze(&input, recomp_on, compile, iface_on);
     drop(input);
     print(path, &what, agg, top, json, t0, compile)
 }
 
+#[cfg(test)]
 fn parse_record_hash(s: &str) -> Result<u64, String> {
-    let hex = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
-    if hex.is_empty() || hex.len() > 16 || !hex.bytes().all(|c| c.is_ascii_hexdigit()) {
-        return Err(format!("{s:?} is not a 1–16 digit hexadecimal hash"));
-    }
-    u64::from_str_radix(hex, 16).map_err(|e| e.to_string())
+    crate::cli::parse_hex_u64_str(s)
 }
 
 fn is_compute_container(blob: &[u8]) -> bool {
@@ -1130,10 +1215,14 @@ fn measure_pso_result(input: &Input, hash: u64, repeat: usize, windows: u32, spl
 /// (the > 8 MB HLSL programs DXC compiles at `-O0`, #1269).
 struct Pipelines {
     dev: windows::Win32::Graphics::Direct3D12::ID3D12Device,
-    signatures: Mutex<std::collections::HashMap<Vec<u32>, windows::Win32::Graphics::Direct3D12::ID3D12RootSignature>>,
+    signatures: Mutex<std::collections::HashMap<(bool, Vec<u32>), windows::Win32::Graphics::Direct3D12::ID3D12RootSignature>>,
     made: AtomicUsize,
     refused: AtomicUsize,
     reused: AtomicUsize,
+    /// pipelines another process of the same preparation was building (`Claim`): left to it
+    elsewhere: AtomicUsize,
+    split_programs: AtomicUsize,
+    split_pieces: AtomicUsize,
     /// programs over `max_dxil` with no blob yet, and their DXIL bytes
     capped: AtomicUsize,
     capped_bytes: AtomicUsize,
@@ -1143,6 +1232,8 @@ struct Pipelines {
     most: usize,
     /// DXIL bytes a pipeline is still handed to the driver (`XCL_PIPELINE_MAX_KB`, 8 MiB; 0: off)
     max_dxil: usize,
+    #[cfg(test)]
+    cache_dir: Option<PathBuf>,
 }
 
 /// `XCL_PIPELINE_MAX_KB`: the KiB of DXIL `--pipelines` still compiles (default 8 MiB; 0: no
@@ -1206,65 +1297,253 @@ mod pipeline_cap_tests {
         assert_eq!((capped, made, refused), (1, 0, 0));
         assert!(!path.exists(), "rejected blob should not be retried next run");
     }
+
+    #[test]
+    fn split_compute_program_prebuilds_and_caches_chain_pieces() {
+        use super::{Pipelines, recomp, Ordering};
+        use crate::hle::d3d12x::real::driver_cache;
+        use std::sync::Arc;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use windows::Win32::Graphics::Direct3D12::*;
+
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+        if let Err(reason) = recomp::dxc::location() {
+            recomp::runner::skip_test(&format!("no DXC: {reason}"));
+            return;
+        }
+        let mut pipelines = match Pipelines::new() {
+            Ok(pipelines) => pipelines,
+            Err(reason) => {
+                recomp::runner::skip_test(&format!("no D3D12 device: {reason}"));
+                return;
+            }
+        };
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let scratch = Scratch(std::env::temp_dir().join(format!("xcl-split-pso-{}-{nonce}", std::process::id())));
+        std::fs::create_dir(&scratch.0).expect("scratch cache directory");
+        pipelines.cache_dir = Some(scratch.0.clone());
+
+        // Each piece binds the dispatch-chain UAV/CBV (space2), which only `dispatch_chain_root_signature`
+        // declares: building them with the regular ABI root signature would be refused by D3D12.
+        let piece0 = recomp::dxc::compile(
+            "RWByteAddressBuffer mem : register(u2); RWByteAddressBuffer sc : register(u0, space2); \
+             cbuffer ch : register(b0, space2) { uint4 meta; }; \
+             [numthreads(1,1,1)] void main() { sc.Store(0, meta.w + 1); mem.Store(0, meta.x); }",
+            "main",
+            "cs_6_6",
+            &[],
+        )
+        .expect("piece0 DXC compile");
+        let piece1 = recomp::dxc::compile(
+            "RWByteAddressBuffer mem : register(u2); RWByteAddressBuffer sc : register(u0, space2); \
+             cbuffer ch : register(b0, space2) { uint4 meta; }; \
+             [numthreads(1,1,1)] void main() { uint v = sc.Load(0); mem.Store(4, v + meta.w + 2); }",
+            "main",
+            "cs_6_6",
+            &[],
+        )
+        .expect("piece1 DXC compile");
+        // Larger than both pieces so a cap between piece size and whole size proves each piece
+        // is capped individually rather than against the unsplit whole container.
+        let whole = recomp::dxc::compile(
+            "RWByteAddressBuffer mem : register(u2); \
+             [numthreads(1,1,1)] void main() { \
+             uint x = mem.Load(0); uint y = mem.Load(4); uint z = mem.Load(8); uint w = mem.Load(12); \
+             mem.Store(0, x ^ y ^ z ^ w ^ 0x12345678u); mem.Store(4, (x + y) * (z + w) + 7u); \
+             mem.Store(8, (x * 3u) ^ (y * 5u) ^ (z * 7u)); mem.Store(12, x + y + z + w); }",
+            "main",
+            "cs_6_6",
+            &[],
+        )
+        .expect("whole DXC compile");
+        let max_piece = piece0.len().max(piece1.len());
+        let compiled = recomp::pso::Compiled {
+            dispatch_chain: Some(Arc::new(crate::gpu::dxil::kernel::DispatchChain {
+                pieces: vec![piece0.clone(), piece1.clone()],
+                dwords_per_group: 4,
+            })),
+            dxil: whole.clone(),
+            samplers: vec![],
+        };
+
+        pipelines.max_dxil = max_piece;
+        pipelines.make(&compiled);
+        let p0_path = scratch.0.join(driver_cache::name_for(&piece0, 0, true));
+        let p1_path = scratch.0.join(driver_cache::name_for(&piece1, 0, true));
+        let whole_path = scratch.0.join(driver_cache::name_for(&whole, 0, false));
+        assert_eq!(pipelines.split_programs.load(Ordering::Relaxed), 1);
+        assert_eq!(pipelines.split_pieces.load(Ordering::Relaxed), 2);
+        assert_eq!(pipelines.made.load(Ordering::Relaxed), 2);
+        assert_eq!(pipelines.refused.load(Ordering::Relaxed), 0);
+        assert_eq!(pipelines.reused.load(Ordering::Relaxed), 0);
+        assert_eq!(pipelines.capped.load(Ordering::Relaxed), 0);
+        assert!(p0_path.is_file() && p0_path.metadata().unwrap().len() > 0, "piece 0 .chain.pso missing");
+        assert!(p1_path.is_file() && p1_path.metadata().unwrap().len() > 0, "piece 1 .chain.pso missing");
+        assert!(!whole_path.exists(), "unsplit whole .pso should not be written for a split compute program");
+
+        // Second pass reuses both cached piece blobs.
+        pipelines.make(&compiled);
+        assert_eq!(pipelines.reused.load(Ordering::Relaxed), 2);
+        assert_eq!(pipelines.made.load(Ordering::Relaxed), 4);
+        assert_eq!(pipelines.refused.load(Ordering::Relaxed), 0);
+
+        // Runtime-side check: the dispatch-chain root signature accepts each cached .chain.pso blob.
+        let chain_rs = recomp::pso::dispatch_chain_root_signature(&pipelines.dev, &[]).expect("dispatch chain RS");
+        for (dxil, path) in [(&piece0, &p0_path), (&piece1, &p1_path)] {
+            let blob = std::fs::read(path).expect("read cached .chain.pso");
+            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::ManuallyDrop::new(Some(chain_rs.clone())),
+                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr().cast(), BytecodeLength: dxil.len() },
+                CachedPSO: D3D12_CACHED_PIPELINE_STATE { pCachedBlob: blob.as_ptr().cast(), CachedBlobSizeInBytes: blob.len() },
+                ..Default::default()
+            };
+            let pso = unsafe { pipelines.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) }
+                .expect("runtime dispatch_chain RS accepts offline .chain.pso");
+            drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
+            let got = unsafe { pso.GetCachedBlob() }.expect("cached blob");
+            assert_eq!(unsafe { got.GetBufferSize() }, blob.len());
+        }
+
+        // A corrupt .chain.pso over the per-piece cap is removed and capped without rebuilding.
+        std::fs::write(&p1_path, b"corrupt chain blob").expect("corrupt piece1 blob");
+        pipelines.max_dxil = piece1.len() - 1;
+        let reused_before = pipelines.reused.load(Ordering::Relaxed);
+        pipelines.make(&compiled);
+        assert!(!p1_path.exists(), "rejected over-cap .chain.pso should be removed");
+        assert_eq!(pipelines.capped.load(Ordering::Relaxed), 1);
+        if piece0.len() <= pipelines.max_dxil {
+            assert_eq!(pipelines.reused.load(Ordering::Relaxed), reused_before + 1);
+        }
+    }
 }
 
 // D3D12 devices and root signatures are free-threaded
 unsafe impl Sync for Pipelines {}
 
 impl Pipelines {
-    fn new() -> Result<Pipelines, String> {
+    fn new() -> Result<Pipelines, String> { Self::for_adapter("auto") }
+
+    fn for_adapter(adapter: &str) -> Result<Pipelines, String> {
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
         use windows::Win32::Graphics::Dxgi::*;
         unsafe {
             let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| e.to_string())?;
-            let sel = crate::gpu::adapter::Selector::from_env_or("auto");
-            let (adapter, _) = crate::gpu::adapter::candidates(&factory, &sel).into_iter().next().ok_or_else(|| crate::gpu::adapter::no_match(&factory, &sel))?;
-            let dev = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0).map_err(|e| e.to_string())?;
+            let sel = crate::gpu::adapter::Selector::from_env_or(adapter);
+            let dev = if sel == crate::gpu::adapter::Selector::Warp {
+                let warp: IDXGIAdapter = factory.EnumWarpAdapter().map_err(|e| e.to_string())?;
+                crate::gpu::agility::create_device(&warp, D3D_FEATURE_LEVEL_12_0).map_err(|e| e.to_string())?
+            } else {
+                let (adapter, _) = crate::gpu::adapter::candidates(&factory, &sel).into_iter().next().ok_or_else(|| crate::gpu::adapter::no_match(&factory, &sel))?;
+                crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0).map_err(|e| e.to_string())?
+            };
             let most = std::env::var("XCL_PIPELINE_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4usize).max(1);
             let max_dxil = pipeline_cap_kb(std::env::var("XCL_PIPELINE_MAX_KB").ok().as_deref()).saturating_mul(1024);
-            Ok(Pipelines { dev, signatures: Mutex::new(Default::default()), made: AtomicUsize::new(0), refused: AtomicUsize::new(0), reused: AtomicUsize::new(0), capped: AtomicUsize::new(0), capped_bytes: AtomicUsize::new(0), running: (Mutex::new(0), std::sync::Condvar::new()), most, max_dxil })
+            Ok(Pipelines {
+                dev,
+                signatures: Mutex::new(Default::default()),
+                made: AtomicUsize::new(0),
+                refused: AtomicUsize::new(0),
+                reused: AtomicUsize::new(0),
+                elsewhere: AtomicUsize::new(0),
+                split_programs: AtomicUsize::new(0),
+                split_pieces: AtomicUsize::new(0),
+                capped: AtomicUsize::new(0),
+                capped_bytes: AtomicUsize::new(0),
+                running: (Mutex::new(0), std::sync::Condvar::new()),
+                most,
+                max_dxil,
+                #[cfg(test)]
+                cache_dir: None,
+            })
         }
     }
 
-    /// The compute pipeline of `c` (made and released).
+    /// The compute pipeline of `c` (made and released). When direct translation split the program
+    /// into a dispatch chain of at least two pieces, each piece is built and cached under the
+    /// dispatch-chain root signature (`.chain.pso`) as the runtime does (`dispatch_chain::build`),
+    /// instead of the unsplit whole container.
     fn make(&self, c: &recomp::pso::Compiled) {
         self.make_with_cache_path(c, None);
     }
 
     fn make_with_cache_path(&self, c: &recomp::pso::Compiled, path_override: Option<PathBuf>) {
+        if path_override.is_none() {
+            if let Some(chain) = c.dispatch_chain.as_deref().filter(|chain| chain.pieces.len() >= 2) {
+                self.split_programs.fetch_add(1, Ordering::Relaxed);
+                self.split_pieces.fetch_add(chain.pieces.len(), Ordering::Relaxed);
+                let workers = chain.pieces.len().min(self.most);
+                if workers <= 1 {
+                    for piece in &chain.pieces {
+                        self.make_one(piece, &c.samplers, true, None);
+                    }
+                } else {
+                    let next = AtomicUsize::new(0);
+                    std::thread::scope(|s| {
+                        for _ in 0..workers {
+                            s.spawn(|| loop {
+                                let i = next.fetch_add(1, Ordering::Relaxed);
+                                let Some(piece) = chain.pieces.get(i) else { break };
+                                self.make_one(piece, &c.samplers, true, None);
+                            });
+                        }
+                    });
+                }
+                return;
+            }
+        }
+        self.make_one(&c.dxil, &c.samplers, false, path_override);
+    }
+
+    fn make_one(&self, dxil: &[u8], samplers: &[recomp::pso::StaticSampler], chained: bool, path_override: Option<PathBuf>) {
         use windows::Win32::Graphics::Direct3D12::*;
-        let key: Vec<u32> = c.samplers.iter().flat_map(|(w, cmp)| w.iter().copied().chain([*cmp as u32])).collect();
+        let key: (bool, Vec<u32>) = (chained, samplers.iter().flat_map(|(w, cmp)| w.iter().copied().chain([*cmp as u32])).collect());
         let rs = {
             let mut g = self.signatures.lock().unwrap();
             match g.get(&key) {
                 Some(rs) => rs.clone(),
-                None => match recomp::pso::abi_root_signature_with(&self.dev, true, &c.samplers) {
-                    Ok(rs) => {
-                        g.insert(key, rs.clone());
-                        rs
+                None => {
+                    let created = if chained {
+                        recomp::pso::dispatch_chain_root_signature(&self.dev, samplers)
+                    } else {
+                        recomp::pso::abi_root_signature_with(&self.dev, true, samplers)
+                    };
+                    match created {
+                        Ok(rs) => {
+                            g.insert(key, rs.clone());
+                            rs
+                        }
+                        Err(_) => {
+                            self.refused.fetch_add(1, Ordering::Relaxed);
+                            return;
+                        }
                     }
-                    Err(_) => {
-                        self.refused.fetch_add(1, Ordering::Relaxed);
-                        return;
-                    }
-                },
+                }
             }
         };
         let mut desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::ManuallyDrop::new(Some(rs)),
-            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: c.dxil.as_ptr() as *const _, BytecodeLength: c.dxil.len() },
+            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as *const _, BytecodeLength: dxil.len() },
             ..Default::default()
         };
         use crate::hle::d3d12x::real::driver_cache;
-        let path = path_override.or_else(|| driver_cache::path(&c.dxil, desc.Flags.0));
-        let cached = path.as_deref().and_then(driver_cache::load);
-        let over_cap = self.max_dxil != 0 && c.dxil.len() > self.max_dxil;
+        let path = path_override.or_else(|| {
+            #[cfg(test)]
+            if let Some(dir) = self.cache_dir.as_deref() {
+                return Some(dir.join(driver_cache::name_for(dxil, desc.Flags.0, chained)));
+            }
+            driver_cache::path_for(dxil, desc.Flags.0, chained)
+        });
+        let mut cached = path.as_deref().and_then(driver_cache::load);
+        let over_cap = self.max_dxil != 0 && dxil.len() > self.max_dxil;
         // over the cap and no blob from an earlier run: the driver's compile of this one takes
         // tens of minutes and gigabytes; the pass finishes without it, and the runtime builds it
         // when a title needs the pipeline. `XCL_PIPELINE_MAX_KB` 0 turns the cap off.
         if cached.is_none() && over_cap {
             self.capped.fetch_add(1, Ordering::Relaxed);
-            self.capped_bytes.fetch_add(c.dxil.len(), Ordering::Relaxed);
+            self.capped_bytes.fetch_add(dxil.len(), Ordering::Relaxed);
             drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
             return;
         }
@@ -1275,6 +1554,26 @@ impl Pipelines {
             }
             *n += 1;
         }
+        // (another process may have written the blob while this one waited for its turn)
+        if cached.is_none() {
+            cached = path.as_deref().and_then(driver_cache::load);
+        }
+        // not in the cache: the one process that claims the pipeline builds it. Records with the
+        // same program are in several workers' slices, and the driver's compile of one took
+        // twice as long in each of four workers that built it at once.
+        let claim = match (&cached, path.as_deref()) {
+            (None, Some(path)) => match Claim::take(path) {
+                Some(c) => Some(c),
+                None => {
+                    *self.running.0.lock().unwrap() -= 1;
+                    self.running.1.notify_one();
+                    self.elsewhere.fetch_add(1, Ordering::Relaxed);
+                    drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
+                    return;
+                }
+            },
+            _ => None,
+        };
         let from_cache = cached.as_ref().and_then(|bytes| {
             desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: bytes.as_ptr().cast(), CachedBlobSizeInBytes: bytes.len() };
             // a driver that cannot use the blob may compile from the DXIL itself and still
@@ -1292,7 +1591,7 @@ impl Pipelines {
             *self.running.0.lock().unwrap() -= 1;
             self.running.1.notify_one();
             self.capped.fetch_add(1, Ordering::Relaxed);
-            self.capped_bytes.fetch_add(c.dxil.len(), Ordering::Relaxed);
+            self.capped_bytes.fetch_add(dxil.len(), Ordering::Relaxed);
             drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
             return;
         }
@@ -1313,6 +1612,7 @@ impl Pipelines {
             }
             pso
         };
+        drop(claim);
         *self.running.0.lock().unwrap() -= 1;
         self.running.1.notify_one();
         drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
@@ -1332,15 +1632,264 @@ fn used_compute(blob: &[u8], used: &std::collections::HashSet<u64>) -> bool {
     used.contains(&crate::hle::d3d12x::real::shaders_key(&[blob.to_vec()]))
 }
 
-fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, used: Option<&std::collections::HashSet<u64>>, t0: std::time::Instant) -> i32 {
-    let pipelines = if pipelines {
-        match Pipelines::new() {
-            Ok(p) => Some(p),
-            Err(e) => {
-                eprintln!("xcl shaders --pipelines: no GPU device: {e}");
-                return 2;
-            }
+#[derive(Default)]
+pub(crate) struct LaunchPreparation {
+    pub adapter: String,
+    pub done: AtomicUsize,
+    pub total: AtomicUsize,
+    pub cancel: std::sync::atomic::AtomicBool,
+    /// The worker processes building compute pipelines (0: none; `done` and `total` then count
+    /// the records translated here, with them the records the workers have passed).
+    pub workers: AtomicUsize,
+    /// The shaders earlier runs used (`pso_async::earlier_used_shaders`), when there are any:
+    /// only their records are translated before the title starts, and it translates another
+    /// when it first uses it. `XCL_PREPARE_ALL=1`: every record, as without the list.
+    pub only: Option<HashSet<u64>>,
+}
+
+/// Unpacked shader containers in the title's shaders directory. Do not follow directory
+/// junctions into another tree or back into the shader directory.
+fn loose_inputs(dir: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    use std::os::windows::fs::MetadataExt;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        if metadata.file_attributes() & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT != 0 { continue; }
+        let path = entry.path();
+        if metadata.is_dir() {
+            loose_inputs(&path, files)?;
+        } else if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("dxbc")) {
+            files.push(path);
         }
+    }
+    Ok(())
+}
+
+pub(crate) fn prepare_for_launch(root: &Path, progress: &LaunchPreparation) -> Result<(), String> {
+    let mut inputs = Vec::new();
+    let pack = root.join("shaders.rpf");
+    if pack.try_exists().map_err(|e| e.to_string())? {
+        let data = std::fs::read(&pack).map_err(|e| format!("Reading {}: {e}", pack.display()))?;
+        if !data.starts_with(pack::RPF9_MAGIC) { return Err(format!("Unrecognized shader pack: {}", pack.display())); }
+        let records = pack::scan(&data, 0x40);
+        if records.is_empty() { return Err(format!("No readable shader records in {}", pack.display())); }
+        inputs.push(Input::Pack { data, records });
+    }
+    let loose = root.join("shaders");
+    if loose.is_dir() {
+        let mut files = Vec::new();
+        loose_inputs(&loose, &mut files).map_err(|e| format!("Reading {}: {e}", loose.display()))?;
+        if !files.is_empty() { inputs.push(Input::Files(files)); }
+    }
+    progress.total.store(inputs.iter().map(Input::len).sum(), Ordering::Relaxed);
+    let mut windows = crate::gpu::uma::configured_runtime_windows() as u32;
+    if windows > 1 && recomp::pso::heap_windows() { windows |= recomp::HEAP_WINDOWS; }
+    let workers = prepare_workers();
+    for input in inputs {
+        if progress.cancel.load(Ordering::Relaxed) { return Err("Shader preparation cancelled".into()); }
+        // a pack: its stages here, its compute pipelines in worker processes (the driver builds
+        // about two pipelines at a time for one process, whatever the processors)
+        if workers > 1 && matches!(input, Input::Pack { .. }) {
+            let n = input.len();
+            precompile(&input, usize::MAX, windows, None, None, false, None, std::time::Instant::now(), Some(progress))?;
+            if progress.cancel.load(Ordering::Relaxed) { return Err("Shader preparation cancelled".into()); }
+            pipelines_in_workers(&pack, windows, workers, n, progress)?;
+            continue;
+        }
+        precompile(&input, usize::MAX, windows, None, None, true, None, std::time::Instant::now(), Some(progress))?;
+    }
+    Ok(())
+}
+
+/// `XCL_PREPARE_WORKERS`: the processes that build a pack's compute pipelines before a title
+/// starts (1: in this process, as before). Unset: the logical processors less four, and no
+/// more than 3 GB of the commit the system has left for each.
+fn prepare_workers() -> usize {
+    if let Some(n) = std::env::var("XCL_PREPARE_WORKERS").ok().and_then(|v| v.parse::<usize>().ok()) {
+        return n.clamp(1, 32);
+    }
+    let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let (used, limit) = crate::host::system_commit();
+    workers_for(cores, limit.saturating_sub(used))
+}
+
+/// The workers for `cores` logical processors (threads, not cores) and `free_mb` of commit left.
+fn workers_for(cores: usize, free_mb: u64) -> usize {
+    cores.saturating_sub(4).min(32).min((free_mb / 3072) as usize).max(1)
+}
+
+/// The record count of a builder's progress line (`  400/26503 (12 s)`).
+fn progress_count(line: &str) -> Option<usize> {
+    let (d, rest) = line.trim().split_once('/')?;
+    let (n, rest) = rest.split_once(' ')?;
+    n.parse::<usize>().ok()?;
+    if !rest.starts_with('(') { return None; }
+    d.parse().ok()
+}
+
+/// A pipeline one process builds: a file beside the driver blob it will write (`<blob>.claim`),
+/// made when the build starts and gone when it ends. A second process that finds it leaves the
+/// pipeline to the first. One left behind by a process that died is taken over after `STALE`.
+struct Claim(PathBuf);
+
+impl Claim {
+    const STALE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+    /// None: another process has it.
+    fn take(blob: &std::path::Path) -> Option<Claim> {
+        let mut name = blob.as_os_str().to_owned();
+        name.push(".claim");
+        let path = PathBuf::from(name);
+        let make = || std::fs::OpenOptions::new().write(true).create_new(true).open(&path);
+        match make() {
+            Ok(_) => Some(Claim(path)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let old = std::fs::metadata(&path).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age > Self::STALE);
+                (old && std::fs::remove_file(&path).is_ok() && make().is_ok()).then(|| Claim(path))
+            }
+            // (the folder cannot be written: nothing is shared through it either)
+            Err(_) => Some(Claim(PathBuf::new())),
+        }
+    }
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        if !self.0.as_os_str().is_empty() {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod claim_tests {
+    use super::Claim;
+
+    /// The first process to ask builds a pipeline, a second one leaves it, and it is free again
+    /// when the first is done.
+    #[test]
+    fn a_pipeline_is_claimed_by_one_builder_at_a_time() {
+        let dir = std::env::temp_dir().join(format!("xcl-claim-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let blob = dir.join("0123.pso");
+        let first = Claim::take(&blob).expect("free");
+        assert!(dir.join("0123.pso.claim").exists());
+        assert!(Claim::take(&blob).is_none(), "claimed");
+        assert!(Claim::take(&dir.join("4567.pso")).is_some(), "another pipeline is free");
+        drop(first);
+        assert!(!dir.join("0123.pso.claim").exists());
+        assert!(Claim::take(&blob).is_some(), "free again");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The compute pipelines of `pack` built by `workers` processes of this program, each on its own
+/// slice of the records (`XCL_PRECOMPILE_SLICE`): only the ones an earlier run of the title used
+/// when that list exists (the title builds another when it first uses it). Their records count
+/// into `progress`. A worker that fails is noted and the title starts all the same: it builds
+/// what is missing itself.
+fn pipelines_in_workers(pack: &Path, windows: u32, workers: usize, records: usize, progress: &LaunchPreparation) -> Result<(), String> {
+    use std::io::BufRead;
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let me = std::env::current_exe().map_err(|e| e.to_string())?;
+    let used_only = !crate::hle::d3d12x::pso_async::earlier_used_keys().is_empty();
+    // the workers' pass has its own count on the screen: the records they have passed
+    let (done_before, total_before) = (progress.done.load(Ordering::Relaxed), progress.total.load(Ordering::Relaxed));
+    progress.done.store(0, Ordering::Relaxed);
+    progress.total.store(records, Ordering::Relaxed);
+    progress.workers.store(workers, Ordering::Relaxed);
+    let counts: Vec<AtomicUsize> = (0..workers).map(|_| AtomicUsize::new(0)).collect();
+    let t0 = std::time::Instant::now();
+    crate::xlog_info!("Shader preparation: compute pipelines in {workers} worker processes{}", if used_only { ", those an earlier run used" } else { "" });
+    let mut children = Vec::new();
+    for i in 0..workers {
+        let mut c = std::process::Command::new(&me);
+        c.arg("shaders").arg(pack).args(["--precompile", "--only", "cs", "--pipelines", "--windows"]).arg((windows & !recomp::HEAP_WINDOWS).to_string());
+        if used_only { c.arg("--used-only"); }
+        // (not a host, not a launcher's child: a builder that ends when this process does)
+        for gone in ["XCL_HOST", "XCL_PREPARATION_PARENT", "XCL_PREPARATION_MENU", "XCL_RUN_SECONDS"] { c.env_remove(gone); }
+        c.env("XCL_PRECOMPILE_SLICE", format!("{i}/{workers}")).env("XCL_PRECOMPILE_PARENT", std::process::id().to_string());
+        if std::env::var_os("XCL_DXC_THREADS").is_none() { c.env("XCL_DXC_THREADS", "2"); }
+        if std::env::var_os("XCL_PIPELINE_THREADS").is_none() { c.env("XCL_PIPELINE_THREADS", "1"); }
+        c.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped()).creation_flags(CREATE_NO_WINDOW);
+        match c.spawn() {
+            Ok(child) => children.push((i, child)),
+            Err(e) => crate::xlog_warn!("Shader preparation: worker {i} did not start: {e}"),
+        }
+    }
+    let cancelled = std::thread::scope(|s| {
+        for (i, child) in children.iter_mut() {
+            let Some(err) = child.stderr.take() else { continue };
+            let count = &counts[*i];
+            s.spawn(move || {
+                // (a builder ends its progress lines with a line feed; others pass by)
+                let mut r = std::io::BufReader::new(err);
+                let mut buf = Vec::new();
+                while r.read_until(b'\n', &mut buf).is_ok_and(|n| n > 0) {
+                    for part in String::from_utf8_lossy(&buf).split(['\r', '\n']) {
+                        if let Some(d) = progress_count(part) { count.store(d, Ordering::Relaxed); }
+                    }
+                    buf.clear();
+                }
+            });
+        }
+        loop {
+            // (a worker counts the records of its own slice)
+            let d: usize = counts.iter().map(|c| c.load(Ordering::Relaxed)).sum();
+            progress.done.store(d.min(records), Ordering::Relaxed);
+            if progress.cancel.load(Ordering::Relaxed) {
+                for (_, child) in children.iter_mut() { let _ = child.kill(); }
+                return true;
+            }
+            if children.iter_mut().all(|(_, child)| !matches!(child.try_wait(), Ok(None))) { return false; }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    });
+    let mut failed = 0;
+    for (i, child) in children.iter_mut() {
+        match child.wait() {
+            Ok(st) if st.success() => {}
+            Ok(st) => { failed += 1; crate::xlog_warn!("Shader preparation: worker {i} ended with {st}"); }
+            Err(e) => { failed += 1; crate::xlog_warn!("Shader preparation: worker {i}: {e}"); }
+        }
+    }
+    progress.workers.store(0, Ordering::Relaxed);
+    progress.total.store(total_before, Ordering::Relaxed);
+    progress.done.store(done_before, Ordering::Relaxed);
+    if cancelled { return Err("Shader preparation cancelled".into()); }
+    crate::xlog_info!("Shader preparation: compute pipelines done in {:.0} s ({failed} of {workers} workers failed)", t0.elapsed().as_secs_f64());
+    Ok(())
+}
+
+/// `XCL_PRECOMPILE_PARENT=pid` (set for a title's preparation workers): this process ends when
+/// that one does, so no builder is left on the GPU behind a title that was ended.
+fn end_with_parent() {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject, INFINITE, PROCESS_SYNCHRONIZE};
+    let Some(pid) = std::env::var("XCL_PRECOMPILE_PARENT").ok().and_then(|v| v.parse::<u32>().ok()) else { return };
+    let h = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+    if h.is_null() {
+        // (gone already)
+        std::process::exit(3);
+    }
+    let h = h as usize;
+    std::thread::spawn(move || unsafe {
+        WaitForSingleObject(h as _, INFINITE);
+        CloseHandle(h as _);
+        std::process::exit(3);
+    });
+}
+
+fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, used: Option<&std::collections::HashSet<u64>>, t0: std::time::Instant, startup: Option<&LaunchPreparation>) -> Result<(), String> {
+    if startup.is_none() { end_with_parent(); }
+    let pipelines = if pipelines {
+        let mut p = Pipelines::for_adapter(startup.map_or("auto", |p| p.adapter.as_str()))
+            .map_err(|e| format!("No pipeline device: {e}"))?;
+        if startup.is_some() && std::env::var_os("XCL_PIPELINE_MAX_KB").is_none() {
+            p.max_dxil = 0;
+        }
+        Some(p)
     } else {
         None
     };
@@ -1352,6 +1901,9 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
         let (i, n) = v.split_once('/')?;
         Some((i.trim().parse().ok()?, n.trim().parse::<usize>().ok().filter(|n| *n > 0)?))
     });
+    // a progress line every 200 records; every record for a title waiting on this builder
+    // (`pipelines_in_workers` shows the count)
+    let every = if std::env::var_os("XCL_PRECOMPILE_PARENT").is_some() { 1 } else { 200 };
     let next = AtomicUsize::new(0);
     let (done, compiled, cached, failed, skipped) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
     let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -1362,11 +1914,12 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     // the compiles run on the DXC pool; these threads translate and keep it fed
     let threads = recomp::dxc::compile_threads() + 2;
     // no title runs: only a little commit is kept free besides the compiles
-    recomp::dxc::set_memory_reserve(2);
+    if startup.is_none() { recomp::dxc::set_memory_reserve(2); }
     // VS / PS: the 32-lane form wherever the GPU can run 32-lane waves (`pso::graphics_wave32`);
     // `--split` sets both
-    let graphics_split = split.unwrap_or_else(recomp::runner::graphics_wave32);
-    let split = split.unwrap_or_else(|| recomp::pso::split_wave64_forced() || recomp::runner::wave64_supported().is_ok_and(|w| !w));
+    let startup_device = pipelines.filter(|_| startup.is_some());
+    let graphics_split = split.unwrap_or_else(|| startup_device.map_or_else(recomp::runner::graphics_wave32, |p| recomp::pso::graphics_wave32_for_device(&p.dev)));
+    let split = split.unwrap_or_else(|| startup_device.map_or_else(|| recomp::pso::split_wave64_forced() || recomp::runner::wave64_supported().is_ok_and(|w| !w), |p| recomp::pso::wave32_only_for_device(&p.dev)));
     println!(
         "precompiling {n} shaders into {} ({} compile threads; {} memory windows{}{})",
         recomp::dxc::cache_dir().display(),
@@ -1378,6 +1931,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     std::thread::scope(|s| {
         for _ in 0..threads {
             s.spawn(|| loop {
+                if startup.is_some_and(|p| p.cancel.load(Ordering::Relaxed)) { break; }
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 if i >= n {
                     break;
@@ -1385,11 +1939,31 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                 if slice.is_some_and(|(k, of)| i % of != k) {
                     continue;
                 }
+                let record_done = || {
+                    let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    if let Some(p) = startup { p.done.fetch_add(1, Ordering::Relaxed); }
+                    if d % every == 0 { eprintln!("  {d}/{n} ({:.0} s)", t0.elapsed().as_secs_f64()); }
+                };
                 let (name, blob) = input.get(i);
-                let Some(blob) = blob else { continue };
-                let Some(sh) = xbox::parse(&blob) else { continue };
+                let Some(blob) = blob else {
+                    if startup.is_some() { failed.fetch_add(1, Ordering::Relaxed); }
+                    record_done();
+                    continue;
+                };
+                let Some(sh) = xbox::parse(&blob) else {
+                    if startup.is_some() && !matches!(shader::classify(&blob).0, shader::Kind::Dxil | shader::Kind::Dxbc) {
+                        failed.fetch_add(1, Ordering::Relaxed);
+                    }
+                    record_done();
+                    continue;
+                };
                 if only.is_some_and(|o| !sh.stage.eq_ignore_ascii_case(o)) {
-                    done.fetch_add(1, Ordering::Relaxed);
+                    record_done();
+                    continue;
+                }
+                if startup.and_then(|p| p.only.as_ref()).is_some_and(|used| !used.contains(&crate::hle::d3d12x::real::shader_key(&blob))) {
+                    unused.fetch_add(1, Ordering::Relaxed);
+                    record_done();
                     continue;
                 }
                 // a compute program as a title's pipeline translates it (`pso::console_to_dxil_in`):
@@ -1397,13 +1971,16 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                 if sh.fssm.iter().any(|f| matches!(recomp::interface(&blob, &sh, f), Some(recomp::Mode::Compute(_)))) {
                     if used.is_some_and(|u| !used_compute(&blob, u)) {
                         unused.fetch_add(1, Ordering::Relaxed);
-                        done.fetch_add(1, Ordering::Relaxed);
+                        record_done();
                         continue;
                     }
                     match recomp::pso::console_to_dxil_in(&blob, recomp::pso::Stage::Compute, 0, split, windows) {
                         Ok(c) => {
                             if let Some(p) = pipelines {
                                 p.make(&c);
+                                if startup.is_some() && c.dispatch_chain.as_ref().is_some_and(|plan| plan.pieces.len() >= 2) {
+                                    p.make_one(&c.dxil, &c.samplers, true, None);
+                                }
                             }
                             compiled.fetch_add(1, Ordering::Relaxed)
                         }
@@ -1415,10 +1992,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                             failed.fetch_add(1, Ordering::Relaxed)
                         }
                     };
-                    let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-                    if d % 200 == 0 {
-                        eprintln!("  {d}/{n} ({:.0} s)", t0.elapsed().as_secs_f64());
-                    }
+                    record_done();
                     continue;
                 }
                 for f in &sh.fssm {
@@ -1438,11 +2012,22 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                         // as `pso` translates: with the title's memory windows (`console_translation`,
                         // `translate_mesh`)
                         let split = if matches!(mode, recomp::Mode::Vertex(_) | recomp::Mode::Pixel(_)) { graphics_split } else { split };
-                        let opt = recomp::Options { mode: mode.clone(), wave64: recomp::detect_wave64(code), split_wave64: split, mem_windows: windows, rodata: f.rodata(p), ..Default::default() };
-                        let Ok(t) = recomp::translate(code, &opt) else { continue };
-                        if !t.complete() {
-                            continue;
-                        }
+                        let opt = recomp::Options { mode: mode.clone(), wave64: recomp::fssm_wave64(f, code), split_wave64: split, mem_windows: windows, rodata: f.rodata(p), ..Default::default() };
+                        let t = match recomp::translate(code, &opt) {
+                            Ok(t) if t.complete() => t,
+                            Ok(_) => {
+                                if startup.is_some() { skipped.fetch_add(1, Ordering::Relaxed); }
+                                continue;
+                            }
+                            Err(e) => {
+                                if startup.is_some() {
+                                    failed.fetch_add(1, Ordering::Relaxed);
+                                    let mut logs = errors.lock().unwrap();
+                                    if logs.len() < 10 { logs.push(format!("{name}: {e}")); }
+                                }
+                                continue;
+                            }
+                        };
                         for (profile, src) in &jobs {
                             match recomp::dxc::compile_cached(src.as_deref().unwrap_or(&t.hlsl), "main", profile) {
                                 Ok((_, true)) => cached.fetch_add(1, Ordering::Relaxed),
@@ -1458,18 +2043,17 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                         }
                     }
                 }
-                let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-                if d % 200 == 0 {
-                    eprintln!("  {d}/{n} ({:.0} s)", t0.elapsed().as_secs_f64());
-                }
+                record_done();
             });
         }
     });
+    let failed = failed.into_inner();
+    let skipped_reason = if startup.is_some() { "runtime pairing or unsupported translation" } else { "GS – paired at pipeline creation" };
     println!(
-        "compiled {}, already cached {}, errors {}, skipped (GS – paired at pipeline creation) {}, time {:.1} s",
+        "compiled {}, already cached {}, errors {}, skipped ({skipped_reason}) {}, time {:.1} s",
         compiled.into_inner(),
         cached.into_inner(),
-        failed.into_inner(),
+        failed,
         skipped.into_inner(),
         t0.elapsed().as_secs_f64()
     );
@@ -1479,15 +2063,31 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     if let Some(p) = pipelines {
         println!("pipelines made on the GPU {}, refused {}", p.made.load(Ordering::Relaxed), p.refused.load(Ordering::Relaxed));
         println!("pipelines loaded from the driver cache {}", p.reused.load(Ordering::Relaxed));
+        println!("pipelines left to another process that was building them {}", p.elsewhere.load(Ordering::Relaxed));
+        let split_programs = p.split_programs.load(Ordering::Relaxed);
+        if split_programs != 0 {
+            println!("split compute programs: {} ({} pieces)", split_programs, p.split_pieces.load(Ordering::Relaxed));
+        }
         let capped = p.capped.load(Ordering::Relaxed);
         if capped != 0 {
             println!("pipelines over the {} MiB DXIL cap, left to the runtime: {} ({} MiB of DXIL; XCL_PIPELINE_MAX_KB)", p.max_dxil >> 20, capped, p.capped_bytes.load(Ordering::Relaxed) >> 20);
         }
     }
-    for e in errors.into_inner().unwrap() {
-        println!("  {e}");
+    let errors = errors.into_inner().unwrap();
+    for e in &errors { println!("  {e}"); }
+    if let Some(progress) = startup {
+        if progress.cancel.load(Ordering::Relaxed) { return Err("Shader preparation cancelled".into()); }
+        // (no pipelines here when worker processes build them: `pipelines_in_workers`)
+        let refused = pipelines.map_or(0, |p| p.refused.load(Ordering::Relaxed));
+        let capped = pipelines.map_or(0, |p| p.capped.load(Ordering::Relaxed));
+        if failed + refused + capped > 0 {
+            let cause = errors.first().map(String::as_str).unwrap_or(
+                if capped > 0 { "Raise XCL_PIPELINE_MAX_KB or set it to 0 to prepare larger pipelines." }
+                else { "Check the shader pack and driver diagnostics." });
+            return Err(format!("Shader preparation stopped: {failed} record failures, {refused} refused pipelines, {capped} over the size cap. {cause}"));
+        }
     }
-    0
+    Ok(())
 }
 
 /// Compile the kept HLSL samples with DXC on all cores: (ok, failures with the first error line).
@@ -1817,6 +2417,28 @@ fn print(path: &Path, what: &str, agg: Agg, top: usize, json: bool, t0: std::tim
 
 #[cfg(test)]
 mod tests {
+    /// The workers of a title's shader preparation: four logical processors are left free,
+    /// 3 GB of commit for each, and one where there is no room.
+    #[test]
+    fn preparation_workers_leave_two_processors_and_follow_the_commit_left() {
+        assert_eq!(workers_for(32, 100_000), 28);
+        assert_eq!(workers_for(8, 100_000), 4);
+        assert_eq!(workers_for(32, 10_000), 3);
+        assert_eq!(workers_for(2, 100_000), 1);
+        assert_eq!(workers_for(64, 1_000_000), 32);
+        assert_eq!(workers_for(32, 0), 1);
+    }
+
+    /// A builder's progress line gives its record count; its other lines give none.
+    #[test]
+    fn a_builders_progress_line_gives_its_count() {
+        assert_eq!(progress_count("  400/26503 (12 s)"), Some(400));
+        assert_eq!(progress_count("26400/26503 (1339 s)"), Some(26400));
+        assert_eq!(progress_count("xcl: [SHADER] direct DXIL fallback stage=CS reason=a/b (c)"), None);
+        assert_eq!(progress_count("  pipelines: 50 made, 0 refused"), None);
+        assert_eq!(progress_count("3/4"), None);
+    }
+
     /// `--used-only` keeps a compute program exactly when the runtime noted its pipeline: the
     /// key of a pipeline of that one shader, as `real::shaders_key` makes it.
     #[test]
@@ -2006,30 +2628,33 @@ fn name_hash(name: &str) -> u64 {
 /// every program of a seeded sample of N records (default 200 programs' worth; `--sample 0` =
 /// all) through the direct DXIL translator; per-stage outcomes, a ranked histogram of what it
 /// cannot translate, translation times and (`--compare`) DXIL size vs HLSL + DXC.
-fn direct_sweep(input: &Input, args: &[String], top: usize, json: bool, t0: std::time::Instant) -> i32 {
+fn direct_sweep(input: &Input, opts: &ShadersOptions, t0: std::time::Instant) -> i32 {
     use crate::gpu::dxil::coverage::{self, Report, Sample};
-    let opt = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<u64>().ok());
-    let want = opt("--sample").map(|v| v as usize).unwrap_or(200);
-    let want = if want == 0 { usize::MAX } else { want };
-    let seed = opt("--seed").unwrap_or(1);
-    let validate = args.iter().any(|a| a == "--validate");
-    let compare = args.iter().any(|a| a == "--compare");
-    let windows = opt("--windows").unwrap_or(4) as u32;
-    let split = opt("--split").map(|v| v != 0).unwrap_or(true);
+    let top = opts.top;
+    let json = opts.json;
+    let want = if opts.sample == 0 { usize::MAX } else { opts.sample };
+    let seed = opts.seed;
+    let validate = opts.validate;
+    let compare = opts.compare;
+    let windows = opts.windows.unwrap_or(4);
+    let split = opts.split.unwrap_or(true);
     // records hold one or more programs: sample records, stop at `want` programs
     let order = coverage::sample_indices(input.len(), want, seed);
     let next = AtomicUsize::new(0);
     let taken = AtomicUsize::new(0);
-    let threads = opt("--threads").map(|v| v.max(1) as usize).unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8));
-    let trace = args.iter().any(|a| a == "--trace");
+    let threads = opts
+        .threads
+        .map(|v| v.max(1))
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8));
+    let trace = opts.trace;
     // big programs translate slowly (SSA over every guarded access): skip above the cap,
     // give up on one after the timeout (its thread is left to finish; the process ends soon)
-    let max_bytes = opt("--max-bytes").map(|v| v as usize).unwrap_or(16384);
-    let timeout = std::time::Duration::from_secs(opt("--timeout").unwrap_or(10));
+    let max_bytes = opts.max_bytes;
+    let timeout = std::time::Duration::from_secs(opts.timeout);
     let skipped = AtomicUsize::new(0);
     // `--lanes`: compute programs through the per-lane form too (`recomp::lower_dxil`); where it
     // translates, its DXIL size against the per-instruction form's, and the refusals ranked
-    let lanes = args.iter().any(|a| a == "--lanes");
+    let lanes = opts.lanes;
     let lanes_tried = AtomicUsize::new(0);
     let lanes_ok = AtomicUsize::new(0);
     let lanes_bytes = AtomicUsize::new(0);
@@ -2038,9 +2663,9 @@ fn direct_sweep(input: &Input, args: &[String], top: usize, json: bool, t0: std:
     // `--hash H`: only the container whose `[SHADER]` hash (FNV-64 of the container) is H, every
     // record searched; `--dump DIR`: write each program's direct DXIL (and with `--compare` the
     // HLSL path's source and DXIL) to DIR, for diffing the two (`dxc -dumpbin`)
-    let only_hash = args.iter().position(|a| a == "--hash").and_then(|i| args.get(i + 1)).and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok());
-    let dump_dir = args.iter().position(|a| a == "--dump").and_then(|i| args.get(i + 1)).map(std::path::PathBuf::from);
-    if let Some(d) = &dump_dir {
+    let only_hash = opts.hash;
+    let dump_dir = opts.dump.as_ref();
+    if let Some(d) = dump_dir {
         let _ = std::fs::create_dir_all(d);
     }
     let (order, want, max_bytes) = if only_hash.is_some() { ((0..input.len()).collect(), usize::MAX, 0) } else { (order, want, max_bytes) };
@@ -2074,7 +2699,7 @@ fn direct_sweep(input: &Input, args: &[String], top: usize, json: bool, t0: std:
                             skipped.fetch_add(1, Ordering::Relaxed);
                             continue;
                         }
-                        let wave64 = recomp::detect_wave64(code);
+                        let wave64 = recomp::fssm_wave64(f, code);
                         let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: wave64 && split, mem_windows: windows, sampler_base: 0 };
                         if trace {
                             eprintln!("direct: {name} FSSM#{fi} ({} B, {})", code.len(), coverage::stage_name(&mode));

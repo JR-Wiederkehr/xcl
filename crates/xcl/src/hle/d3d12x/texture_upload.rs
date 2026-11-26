@@ -481,6 +481,18 @@ unsafe fn plan_item(dev: &ID3D12Device, k: usize, it: &Item, at: &mut u64, out: 
         for (i, l) in c.levels.iter().enumerate() {
             push(0, i, Rect { x0: 0, y0: 0, x1: l.width, y1: l.height }, l.depth);
         }
+        super::lut3d::wrote(it.res.as_raw() as usize, false, || {
+            format!(
+                "uploaded from the title's memory at {:#x}: {} bytes ({} tiled, swizzle mode {}), all {} levels and {} depth slices{}",
+                it.src,
+                s.size(),
+                if c.layout.block_d > 1 { "thick" } else { "thin" },
+                s.mode,
+                mips,
+                s.depth,
+                if it.changed.is_some() { " (pages of it were written)" } else { "" }
+            )
+        });
         return Ok(());
     }
     let whole = [(0, c.slice_bytes * array)];
@@ -921,16 +933,23 @@ mod tests {
         assert_eq!(both(), vec![Change::None, Change::None]);
     }
 
-    unsafe fn test_device() -> ID3D12Device {
+    /// The default adapter's device, else WARP's (`XCL_ADAPTER=warp`: WARP's); None, the test
+    /// skipped, where there is neither (a DXGI that refuses the factory, #2238).
+    unsafe fn test_device() -> Option<ID3D12Device> {
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
         use windows::Win32::Graphics::Dxgi::*;
+        let warp_only = crate::gpu::adapter::Selector::from_env_or("auto") == crate::gpu::adapter::Selector::Warp;
         let mut dev: Option<ID3D12Device> = None;
-        if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
-            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
-            let warp: IDXGIAdapter = factory.EnumWarpAdapter().expect("WARP");
-            D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
+        if warp_only || D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+            dev = None;
+            if let Ok(warp) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)).and_then(|f| f.EnumWarpAdapter::<IDXGIAdapter>()) {
+                let _ = D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev);
+            }
         }
-        dev.expect("D3D12 device")
+        if dev.is_none() {
+            crate::gpu::recomp::runner::skip_test("no D3D12 device");
+        }
+        dev
     }
 
     /// Textures of every kind: (dimension, width, height, slices or depth, levels, format, layout).
@@ -993,7 +1012,7 @@ mod tests {
     #[test]
     fn pieces_hold_the_texels_of_their_levels() {
         unsafe {
-            let dev = test_device();
+            let Some(dev) = test_device() else { return };
             for (n, kind) in KINDS.into_iter().enumerate() {
                 let m = make(&dev, kind);
                 let s = m.tex.texels().unwrap();
@@ -1034,7 +1053,7 @@ mod tests {
     #[test]
     fn gpu_parts_of_a_texture_go_up_and_the_rest_stays() {
         unsafe {
-            let dev = test_device();
+            let Some(dev) = test_device() else { return };
             let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
             let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
             let mut value = 0;
@@ -1132,7 +1151,7 @@ mod tests {
     fn what_is_kept_is_what_went_up() {
         use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
         unsafe {
-            let dev = test_device();
+            let Some(dev) = test_device() else { return };
             // 64 KiB blocks: 256x256 RGBA8 in 64KB_S, 4 of them
             let m = make(&dev, (3, 256, 256, 1, 1, 28, 0x109));
             let size = m.tex.size() as usize;
@@ -1182,7 +1201,7 @@ mod tests {
     #[test]
     fn an_upload_that_may_be_overtaken_goes_up_again() {
         unsafe {
-            let dev = test_device();
+            let Some(dev) = test_device() else { return };
             let (direct, own, other) = (0x1000usize, 0x2000usize, 0x3000usize);
             let fence = || -> ID3D12Fence { dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap() };
             let (fd, fo, fx) = (fence(), fence(), fence());

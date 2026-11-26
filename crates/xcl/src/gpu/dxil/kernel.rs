@@ -38,7 +38,7 @@ pub struct KernelOptions {
 /// identity (`recomp::pso`): bump it when `pso::direct_compute` / `direct_graphics` change the
 /// containers. An edit of `gpu/dxil` needs no bump, `XCL_DIRECT_DXIL_SOURCE_ID` is its hash
 /// (the `gpu/dxil` sources are not in build.rs's translator source hash).
-pub const TRANSLATOR_VERSION: u32 = 11;
+pub const TRANSLATOR_VERSION: u32 = 12;
 
 /// `XCL_DIRECT_DXIL=1`: console compute shaders (and the kernel tests) go through this
 /// translator, with the HLSL path as the fallback for what it cannot translate yet.
@@ -74,7 +74,7 @@ pub fn dispatch_piece_limit() -> usize {
     std::env::var("XCL_DIRECT_SPLIT_INSTRUCTIONS").ok().and_then(|s| s.parse().ok()).unwrap_or(12_500)
 }
 
-/// `XCL_DIRECT_COMPACT`: `1` forces the compact form, `0` forbids it, unset leaves it to `compact::wanted`.
+/// `XCL_DIRECT_COMPACT`: `1` forces the compact form, `0` forbids it, unset uses automatic selection.
 pub fn compact_mode() -> Option<bool> {
     match std::env::var("XCL_DIRECT_COMPACT").as_deref() {
         Ok("1") => Some(true),
@@ -130,6 +130,12 @@ pub fn translate_geometry(code: &[u8], o: KernelOptions, g: &GsInterface) -> Res
     if o.split && g.gs_start != Some(0) && crate::gpu::recomp::emit::safe_barrier_wanted() {
         return Err("split wave64 geometry: the ES phase exchanges at group barriers".into());
     }
+    translate_geometry_unrefused(code, o, g)
+}
+
+/// `translate_geometry` without the refusal of the split form's ES phase: the translation
+/// `XCL_SAFE_BARRIER=0` takes (and what tests of that form check whatever the environment).
+pub(crate) fn translate_geometry_unrefused(code: &[u8], o: KernelOptions, g: &GsInterface) -> Result<Kernel, String> {
     translate_entry(code, KernelOptions { wave64: true, ..o }, Entry::Geometry(g.clone()), None, None, 0)
 }
 
@@ -317,8 +323,12 @@ fn translate_on_this_thread(
         }
     }
 
-    let plan = if (compute || kernel) && compact.unwrap_or_else(|| super::compact::large(&cfg)) { super::compact::plan(&cfg, &lw) } else { None };
-    let plan = plan.filter(|p| compact.unwrap_or_else(|| super::compact::wanted(&cfg, p, tables)));
+    let plan = match compact {
+        _ if !compute && !kernel => None,
+        Some(false) => None,
+        Some(true) => super::compact::plan(&cfg, &lw),
+        None => super::compact::automatic_plan(&cfg, &lw, compute && split, tables),
+    };
     if let Some(p) = &plan {
         crate::xlog_info!("[SHADER] direct DXIL compact form: {} blocks of {} kinds", p.order.len(), p.rep.len());
     }
@@ -654,7 +664,7 @@ impl Lw {
                 slot = slot.max(w);
             }
         }
-        lw.static_samplers = crate::gpu::recomp::constant_samplers(insts, leaders);
+        lw.static_samplers = crate::gpu::recomp::constant_samplers(insts, leaders, matches!(entry, Entry::Vertex(_) | Entry::Pixel(_)));
         let group_threads: Option<u32> = match entry {
             Entry::Vertex(_) | Entry::Pixel(_) => None,
             Entry::Kernel => None,
@@ -1091,12 +1101,19 @@ fn geom_init(lw: &mut Lw, g: &GsInterface, _tid: Value, io: super::shader::RawUa
     let nreg = g.input_registers();
     let fetched = fetched_registers(&g.es_inputs);
     let in_nv = lw.cmp(Pred::ULt, lane, nv);
-    let mem = lw.mems[0];
+    let mut mem = None;
     for &v in used.iter().filter(|&&v| (9..256).contains(&v)) {
         let k = ((v - 9) / 4) as usize;
         if k >= fetched.len() || fetched[k] >= nreg {
             continue;
         }
+        let mem = *mem.get_or_insert_with(|| match lw.heap_mem {
+            Some(coherent) => {
+                let idx = lw.c(crate::gpu::recomp::MEM_HEAP_BASE);
+                lw.s.heap_raw_buffer_uav(idx, coherent)
+            }
+            None => lw.mems[0],
+        });
         let (r, c) = (fetched[k], ((v - 9) % 4) as u32);
         // mem.Load(vin + ((p0 * 3 + lane) * nreg + r) * 16 + 4c), 0 past the group's vertices
         let kn = lw.c(nreg);
