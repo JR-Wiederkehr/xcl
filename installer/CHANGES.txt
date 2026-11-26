@@ -1,13 +1,50 @@
-XCL - modified build 16
+XCL - modified build 17
 ======================
 
 This is NOT an official XCL release. It is XCL (https://github.com/xcl-dev/xcl, GPL-2.0-only)
 built from upstream commit b49be18 (2026-11-25) plus the changes listed below. The complete
-source of this build is at https://github.com/theaustinayers/xcl (tag v0.1.0-mod.16, branch
-build-16). The licence is in LICENSE.txt, third-party notices in THIRD_PARTY.md.
+source of this build is at https://github.com/theaustinayers/xcl (tag v0.1.0-mod.17, branch
+build-17). The licence is in LICENSE.txt, third-party notices in THIRD_PARTY.md.
 
-What changed since build 15
+What changed since build 16
 ---------------------------
+Six fixes by Prime1997 (xcl-dev pull requests #2892 to #2897, merged into nvidia-dev):
+- On a CPU without CLZERO (every Intel CPU), a title's CLZERO loops (its memset) raised one
+  illegal-instruction exception per run of the loop. They are patched once, when the image is
+  mapped, into a call of a native stand-in. In the contributor's 60-second test: 1,393 frames
+  instead of 459. AMD CPUs have CLZERO and are not affected.
+- With XCL_CS_PSO_WAIT_MS set, the whole form of a split compute program is built by a thread
+  of its own instead of on the title's thread at its first indirect dispatch (a freeze of up to
+  two minutes); its indirect dispatches are left out until it is there.
+- With a wait budget (XCL_GFX_PSO_WAIT_MS, XCL_CS_PSO_WAIT_MS), the build of a pipeline the game
+  already draws without waits for half the commit headroom (1.5 GB) instead of all of it.
+- XCL_SPARSE_LAZY=1 (off by default): a tile the game commits in a sparse window gets video
+  memory at its first use instead of at once. Less video memory on smaller cards.
+- Two log lines: mapped sparse tiles the CPU never wrote, and who holds the target pages.
+Also: the GPU test of the thread-limit fix (the "head" fix of build 16) built one of its forms
+wrongly and failed on every NVIDIA card; corrected, it passes on an RTX 5090. No runtime change.
+
+After an NVIDIA driver update
+-----------------------------
+- Every pipeline XCL saved for the old driver is refused and built again: the first start shows
+  "Preparing shaders" for 15 minutes or more. Let it finish; later starts are fast again.
+- A driver update can reset the driver profile setting 0x001ABC0F (reserve for pipeline code)
+  to 512 MiB. Set it again (it needs an administrator prompt), or the game can lose its GPU
+  device without a message.
+
+Tests of this build: the whole suite on an RTX 5090 (driver 621.40). Failing, and why:
+- four fuzz tests of the direct translator: the driver refuses a pipeline for lack of memory,
+  on xcl-dev main as well (this driver, this machine);
+- four tests that pass on xcl-dev main fail on nvidia-dev already before the six fixes (async
+  compute pipeline tracking, the offline whole pipeline of a split program, the two-pass driver
+  cache, a mesh shader in the amplification slot): to be fixed;
+- one sparse-window test failed once under the suite's parallel load and passed three times on
+  its own.
+Not run with this build: the tested game (the driver update above had just invalidated its
+pipeline cache), any AMD GPU, any Intel CPU.
+
+Build 16 (still in this build)
+------------------------------
 - Series S or Series X, asked at the start. Started from its shortcut (no command line), XCL
   asks after the game which console it should be. A game sizes its memory, resolution and
   detail by the answer. The choice is the default of the next start; XCL_DEVICE_TYPE=lockhart

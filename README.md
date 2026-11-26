@@ -43,8 +43,8 @@ XCL is a research project and this is a snapshot of it. Please read this before 
 
 - **What upstream reports as working** (see the table further down): a few retail titles are
   listed as playable. Those claims are upstream's; they were not re-tested with this build.
-- **Large, new games: do not expect them to be playable.** With build 16 the game this build
-  was tested against runs its menus and intro, reaches play and draws its world with the right
+- **Large, new games: do not expect them to be playable.** With build 16 (the last build run on it; build 17
+  adds fixes from other contributors) the game this build was tested against runs its menus and intro, reaches play and draws its world with the right
   colours; as an **Xbox Series S** (chosen in the start menu) it starts, needs less video
   memory, and its characters are drawn whole. It is **not playable**: about **5 frames a
   second**, hair is missing and soft surfaces show a dot pattern, square patches of the
