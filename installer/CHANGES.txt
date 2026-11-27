@@ -1,13 +1,22 @@
-XCL - modified build 18
+XCL - modified build 19
 ======================
 
 This is NOT an official XCL release. It is XCL (https://github.com/xcl-dev/xcl, GPL-2.0-only)
 built from upstream commit b49be18 (2026-11-25) plus the changes listed below. The complete
-source of this build is at https://github.com/theaustinayers/xcl (tag v0.1.0-mod.18, branch
-build-18). The licence is in LICENSE.txt, third-party notices in THIRD_PARTY.md.
+source of this build is at https://github.com/theaustinayers/xcl (tag v0.1.0-mod.19, branch
+build-19). The licence is in LICENSE.txt, third-party notices in THIRD_PARTY.md.
 
-What changed since build 17
+What changed since build 18
 ---------------------------
+- Fewer broken heads. Data a submit asks for is filled within 256 MB, not 16. With 16 MB a
+  close-up of a detailed mesh was drawn while part of its data was still unfilled: heads came out
+  as shards and slabs on some runs. As a Series S: shards in 3 of 3 runs with 16 MB, none in 5
+  runs with 256 MB; thin streaks across some close-up faces remain. XCL_MIRROR_FILL_MB sets it.
+- Diagnostics: XCL_DUMP_TARGETS now names the shaders of console mesh pipelines (before, a
+  G-buffer target drawn by them listed "not known") and lists up to 48 pipelines a target.
+
+Build 18 (still in this build)
+------------------------------
 - The scenes behind a game's full-screen title cards are drawn again. Builds 16 and 17 had two
   new defaults (mesh stage views reaching 1 MiB, tiles filled up to 1024 MB a submit); with
   them the tested game drew only the title text on a grey screen. Both are back to their

@@ -43,7 +43,7 @@ XCL is a research project and this is a snapshot of it. Please read this before 
 
 - **What upstream reports as working** (see the table further down): a few retail titles are
   listed as playable. Those claims are upstream's; they were not re-tested with this build.
-- **Large, new games: do not expect them to be playable.** With build 18 the game this build
+- **Large, new games: do not expect them to be playable.** With build 19 the game this build
   was tested against runs its menus and intro, reaches play and draws its world with the right
   colours; as an **Xbox Series S** (chosen in the start menu) it starts, needs less video
   memory, and its characters are drawn whole. It is **not playable**: about **5 frames a

@@ -8,8 +8,8 @@
 [Setup]
 AppId={{6B0E5C55-3B0C-4E0B-9C5E-58C1A1D0A7E2}
 AppName=XCL
-AppVersion=0.1.0-mod.18
-AppVerName=XCL 0.1.0-mod.18 (modified build)
+AppVersion=0.1.0-mod.19
+AppVerName=XCL 0.1.0-mod.19 (modified build)
 AppPublisher=XCL contributors (modified build, see CHANGES.txt)
 AppPublisherURL=https://github.com/theaustinayers/xcl
 ChangesEnvironment=yes
