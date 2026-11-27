@@ -1,13 +1,25 @@
-XCL - modified build 17
+XCL - modified build 18
 ======================
 
 This is NOT an official XCL release. It is XCL (https://github.com/xcl-dev/xcl, GPL-2.0-only)
 built from upstream commit b49be18 (2026-11-25) plus the changes listed below. The complete
-source of this build is at https://github.com/theaustinayers/xcl (tag v0.1.0-mod.17, branch
-build-17). The licence is in LICENSE.txt, third-party notices in THIRD_PARTY.md.
+source of this build is at https://github.com/theaustinayers/xcl (tag v0.1.0-mod.18, branch
+build-18). The licence is in LICENSE.txt, third-party notices in THIRD_PARTY.md.
 
-What changed since build 16
+What changed since build 17
 ---------------------------
+- The scenes behind a game's full-screen title cards are drawn again. Builds 16 and 17 had two
+  new defaults (mesh stage views reaching 1 MiB, tiles filled up to 1024 MB a submit); with
+  them the tested game drew only the title text on a grey screen. Both are back to their
+  earlier values (64 KiB, 16 MB); XCL_VIEW_REACH_MB and XCL_MIRROR_FILL_MB still set them.
+- A texture level that has lost its texels gives its video memory pages back (by Prime1997,
+  xcl-dev #2927).
+Tested with the tested game as an Xbox Series S, RTX 5090 (driver 621.40): the scenes behind
+the title cards drawn, heads whole in the scenes checked, 3 minutes in the world without a
+driver error, about 4.5 frames a second.
+
+Build 17 (still in this build)
+------------------------------
 Six fixes by Prime1997 (xcl-dev pull requests #2892 to #2897, merged into nvidia-dev):
 - On a CPU without CLZERO (every Intel CPU), a title's CLZERO loops (its memset) raised one
   illegal-instruction exception per run of the loop. They are patched once, when the image is
